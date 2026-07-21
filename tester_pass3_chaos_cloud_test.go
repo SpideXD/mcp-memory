@@ -1246,7 +1246,7 @@ func TestChaosCloud_audit_channelSend(t *testing.T) {
 		// Check if these are buffered channel sends in stopProcess (safe)
 		for _, ln := range unsafeSends {
 			// The stopProcess goroutine sends to a buffered(1) channel — safe
-			if ln >= 475 && ln <= 485 {
+			if ln >= 495 && ln <= 510 {
 				t.Logf("MECHANICAL AUDIT NOTE: services.go:%d — channel send in goroutine (buffered cap=1, safe)", ln)
 			} else {
 				t.Errorf("MECHANICAL AUDIT FAIL: services.go:%d — channel send without select (potential deadlock)", ln)

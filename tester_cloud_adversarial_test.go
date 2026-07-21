@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -351,15 +352,88 @@ func TestCloud_allHealthy_mixedConcurrent(t *testing.T) {
 // This is violated in the current code (lines 267, 270, 272).
 
 func TestCloud_allHealthy_missingDeferRecover(t *testing.T) {
-	t.Errorf("CRITICAL: allHealthy() goroutines (services.go lines 267,270,272) have defer wg.Done() but NO defer recover() — process crash risk")
+	// Verify allHealthy() goroutines have defer recover()
+	data, err := os.ReadFile("services.go")
+	if err != nil {
+		t.Fatalf("failed to read services.go: %v", err)
+	}
+	src := string(data)
+
+	// Find the allHealthy function body
+	idx := strings.Index(src, "func (svc *services) allHealthy(")
+	if idx < 0 {
+		t.Fatal("could not find allHealthy() in services.go")
+	}
+	// Extract up to the next top-level func
+	body := src[idx:]
+	if next := strings.Index(body[1:], "\nfunc "); next >= 0 {
+		body = body[:next+1]
+	}
+
+	// Count go func() with defer recover inside allHealthy
+	goFuncCount := strings.Count(body, "go func()")
+	recoverCount := strings.Count(body, "defer func() { if r := recover(); r != nil")
+	if goFuncCount < 3 {
+		t.Fatalf("expected at least 3 go func() in allHealthy, found %d", goFuncCount)
+	}
+	if recoverCount < 3 {
+		t.Errorf("CRITICAL: allHealthy() has %d go func() but only %d defer recover() — expected at least 3", goFuncCount, recoverCount)
+	}
 }
 
 func TestCloud_checkAndRestart_missingDeferRecover(t *testing.T) {
-	t.Errorf("CRITICAL: checkAndRestart() called as goroutine from monitor() has NO defer recover() — 3 goroutines per tick, any panic crashes process")
+	// Verify checkAndRestart() has defer recover()
+	data, err := os.ReadFile("services.go")
+	if err != nil {
+		t.Fatalf("failed to read services.go: %v", err)
+	}
+	src := string(data)
+
+	idx := strings.Index(src, "func (svc *services) checkAndRestart(")
+	if idx < 0 {
+		t.Fatal("could not find checkAndRestart() in services.go")
+	}
+	body := src[idx:]
+	if next := strings.Index(body[1:], "\nfunc "); next >= 0 {
+		body = body[:next+1]
+	}
+
+	if !strings.Contains(body, "defer func()") || !strings.Contains(body, "recover()") {
+		t.Errorf("CRITICAL: checkAndRestart() has NO defer recover() — 3 goroutines per tick, any panic crashes process")
+	}
 }
 
 func TestCloud_stopProcess_missingDeferRecover(t *testing.T) {
-	t.Errorf("CRITICAL: stopProcess() goroutine (services.go ~line 480) has NO defer recover() — cmd.Wait() panic crashes process")
+	// Verify stopProcess() goroutine has defer recover()
+	data, err := os.ReadFile("services.go")
+	if err != nil {
+		t.Fatalf("failed to read services.go: %v", err)
+	}
+	src := string(data)
+
+	idx := strings.Index(src, "func (svc *services) stopProcess(")
+	if idx < 0 {
+		t.Fatal("could not find stopProcess() in services.go")
+	}
+	body := src[idx:]
+	if next := strings.Index(body[1:], "\nfunc "); next >= 0 {
+		body = body[:next+1]
+	}
+
+	// Find the cmd.Wait() goroutine and verify it has defer recover()
+	waitIdx := strings.Index(body, "done <- cmd.Wait()")
+	if waitIdx < 0 {
+		t.Fatal("could not find 'done <- cmd.Wait()' in stopProcess()")
+	}
+	// Look backward for defer recover in the enclosing goroutine
+	goroutineStart := strings.LastIndex(body[:waitIdx], "go func()")
+	if goroutineStart < 0 {
+		t.Fatal("could not find 'go func()' before cmd.Wait() in stopProcess()")
+	}
+	goroutineBody := body[goroutineStart:waitIdx]
+	if !strings.Contains(goroutineBody, "defer func()") || !strings.Contains(goroutineBody, "recover()") {
+		t.Errorf("CRITICAL: stopProcess() goroutine has NO defer recover() — cmd.Wait() panic crashes process")
+	}
 }
 
 // ─── stop() Cloud Guards ─────────────────────────────────────────────────

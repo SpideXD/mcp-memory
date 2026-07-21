@@ -17,6 +17,8 @@ import (
 	"mcp-memory/logger"
 )
 
+var errProcessPanic = fmt.Errorf("process goroutine panicked")
+
 type services struct {
 	config           Config
 	llamaCmd         *exec.Cmd
@@ -145,6 +147,11 @@ func (svc *services) checkAndRestart(
 	fails *serviceFails,
 	maxRestarts int,
 ) {
+	defer func() {
+		if r := recover(); r != nil {
+			svc.log.Error("checkAndRestart panic", "name", name, "panic", fmt.Sprintf("%v", r))
+		}
+	}()
 	// Check if process exited (stronger signal than HTTP health)
 	svc.mu.Lock()
 	cmd := *cmdPtr
@@ -264,12 +271,24 @@ func (svc *services) allHealthy() (llama, reranker, hindsight bool) {
 		wg.Add(nChecks)
 
 		if !svc.config.IsCloudEmbedding() {
-			go func() { defer wg.Done(); l = svc.check(healthURL(svc.config.LlamaPort)) == nil }()
+			go func() {
+				defer func() { if r := recover(); r != nil { svc.log.Error("allHealthy panic", "service", "llama", "panic", fmt.Sprintf("%v", r)) } }()
+				defer wg.Done()
+				l = svc.check(healthURL(svc.config.LlamaPort)) == nil
+			}()
 		}
 		if !svc.config.IsCloudReranker() {
-			go func() { defer wg.Done(); r = svc.check(healthURL(svc.config.LlamaRerankerPort)) == nil }()
+			go func() {
+				defer func() { if r := recover(); r != nil { svc.log.Error("allHealthy panic", "service", "reranker", "panic", fmt.Sprintf("%v", r)) } }()
+				defer wg.Done()
+				r = svc.check(healthURL(svc.config.LlamaRerankerPort)) == nil
+			}()
 		}
-		go func() { defer wg.Done(); h = svc.check(healthURL(svc.config.HindsightPort)) == nil }()
+		go func() {
+			defer func() { if r := recover(); r != nil { svc.log.Error("allHealthy panic", "service", "hindsight", "panic", fmt.Sprintf("%v", r)) } }()
+			defer wg.Done()
+			h = svc.check(healthURL(svc.config.HindsightPort)) == nil
+		}()
 		wg.Wait()
 
 		svc.healthMu.Lock()
@@ -478,6 +497,7 @@ func (svc *services) stopProcess(cmdPtr **exec.Cmd, name string) {
 	syscall.Kill(-pid, syscall.SIGTERM)
 	done := make(chan error, 1)
 	go func() {
+		defer func() { if r := recover(); r != nil { svc.log.Error("stopProcess panic", "name", name, "panic", fmt.Sprintf("%v", r)); done <- errProcessPanic } }()
 		done <- cmd.Wait()
 	}()
 	t := time.NewTimer(svc.config.StopTimeout)
