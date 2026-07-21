@@ -35,6 +35,17 @@ mcp/memory/
 4. **New worker:** Add channel + pool in `workers.go` `start()`. Add context cancellation support.
 5. Always add corresponding tests.
 
+## Quick Reference
+
+```bash
+make setup    # Create .venv, install hindsight-api-slim
+make run      # Start server (llama.cpp + Hindsight + MCP)
+make build    # Build binary to bin/mcp-memory
+make test     # Run all tests with race detector
+make stop     # Graceful shutdown
+make clean    # Remove .venv and build artifacts
+```
+
 ## Testing
 
 ```bash

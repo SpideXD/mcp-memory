@@ -1,2 +1,12 @@
 # Local Pi runtime state
 .atl/
+
+# Python virtualenv
+.venv/
+
+# Build artifacts
+bin/*
+mcp-memory
+
+# Runtime logs
+logs/*

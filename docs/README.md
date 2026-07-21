@@ -9,10 +9,13 @@ Standalone Go MCP server that proxies memory operations to Hindsight. Supports N
 
 ```bash
 cp .env.example .env    # Edit with your OpenRouter key
-go run .                # Starts llama.cpp + Hindsight + MCP server
+make setup              # Create .venv and install hindsight-api-slim
+make run                # Starts llama.cpp + Hindsight + MCP server
 ```
 
-**Prerequisites:** llama-server (brew), hindsight-api (pip), OpenRouter API key.
+**Prerequisites:** llama-server (brew), Python 3.12+, OpenRouter API key.
+
+To stop: `make stop` or `./scripts/stop.sh`
 
 ## Architecture
 
@@ -85,15 +88,18 @@ All via environment variables. See `.env.example` for full reference.
 ## Deployment
 
 ```bash
+# Setup (one-time)
+make setup              # Creates .venv, installs hindsight-api-slim
+
 # Start
-cd mcp/memory && go run .
+make run
 
 # Stop (graceful)
-./stop.sh
+make stop
 
 # Build binary
-go build -o mcp-memory .
-./mcp-memory
+make build
+./bin/mcp-memory
 ```
 
 ## File Structure

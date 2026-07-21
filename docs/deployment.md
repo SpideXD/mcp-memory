@@ -4,7 +4,7 @@
 
 - **Go 1.26+** (build)
 - **llama-server** (`brew install llama.cpp`) -- skipped if using cloud endpoints
-- **Python 3.12+** with `hindsight-api` (`pip install hindsight-api-slim`)
+- **Python 3.12+** (install hindsight via `make setup`)
 - **OpenRouter API key** (https://openrouter.ai/keys)
 - **Model files** in `../../model/`:
   - `qwen3-embedding-0.6b-Q8_0.gguf` (~610MB) -- or use cloud endpoint
@@ -16,24 +16,25 @@
 cd mcp/memory
 cp .env.example .env
 # Edit .env: set OPENROUTER_API_KEY
+make setup              # Creates .venv, installs hindsight-api-slim
 ```
 
 ## Run
 
 ```bash
 # Development
-go run .
+make run
 
 # Production
-go build -o mcp-memory .
-./mcp-memory
+make build
+./bin/mcp-memory
 ```
 
 ## Stop
 
 ```bash
 # Graceful (preferred)
-./stop.sh
+make stop
 
 # Or
 curl -X POST http://localhost:8899/stop
@@ -169,7 +170,7 @@ When `LLAMA_MODEL_PATH` or `HINDSIGHT_RERANKER_MODEL` is an HTTP/HTTPS URL, the 
 | Problem | Fix |
 |---------|-----|
 | "model not found" | Check `LLAMA_MODEL_PATH` points to a valid `.gguf` file or HTTP URL |
-| "hindsight-api not found" | `pip install hindsight-api-slim` or set `HINDSIGHT_PATH` |
+| "hindsight-api not found" | Run `make setup` or set `HINDSIGHT_PATH` |
 | Port already in use | `./stop.sh` to kill all services, then retry |
 | Hindsight fails to start | Check `logs/hindsight-crash.log` for errors |
 | High latency | Reduce `MEMORY_RETAIN_WORKERS` to 1, check OpenRouter status |

@@ -12,7 +12,14 @@ hindsight-client:   0.8.2
 ## Install
 
 ```bash
-pip install hindsight-api-slim==0.8.2 hindsight-client==0.8.2
+make setup
+```
+
+This creates a `.venv/` virtual environment and installs the pinned versions:
+
+```
+hindsight-api-slim==0.8.2
+hindsight-client==0.8.2
 ```
 
 ## MCP Memory Configuration

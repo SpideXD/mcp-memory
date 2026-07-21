@@ -394,6 +394,7 @@ func (svc *services) startHindsight() error {
 	hindsightPath := svc.config.HindsightPath
 	if _, err := exec.LookPath(hindsightPath); err != nil {
 		for _, p := range []string{
+			filepath.Join(".venv", "bin", "hindsight-api"),
 			"/Library/Frameworks/Python.framework/Versions/3.12/bin/hindsight-api",
 			"/usr/local/bin/hindsight-api",
 			filepath.Join(os.Getenv("HOME"), ".local/bin/hindsight-api"),
