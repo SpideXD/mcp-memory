@@ -60,14 +60,18 @@ func (svc *services) start() error {
 	rerankerURL := healthURL(svc.config.LlamaRerankerPort)
 	hindsightURL := healthURL(svc.config.HindsightPort)
 
-	if svc.check(llamaURL) != nil {
+	if svc.config.IsCloudEmbedding() {
+		svc.log.Info("llama.cpp skipped (cloud embedding mode)")
+	} else if svc.check(llamaURL) != nil {
 		if err := svc.startLlama(); err != nil { return err }
 		if err := svc.wait(context.Background(), llamaURL, svc.config.StartTimeout); err != nil { return err }
 		svc.log.Info("llama.cpp started")
 	} else {
 		svc.log.Info("llama.cpp already running")
 	}
-	if svc.check(rerankerURL) != nil {
+	if svc.config.IsCloudReranker() {
+		svc.log.Info("llama reranker skipped (cloud reranker mode)")
+	} else if svc.check(rerankerURL) != nil {
 		if err := svc.startLlamaReranker(); err != nil { return err }
 		if err := svc.wait(context.Background(), rerankerURL, svc.config.StartTimeout); err != nil { return err }
 		svc.log.Info("llama reranker started")
@@ -86,8 +90,12 @@ func (svc *services) start() error {
 
 func (svc *services) stop() {
 	svc.stopProcess(&svc.hindsightCmd, "Hindsight")
-	svc.stopProcess(&svc.llamaRerankerCmd, "llama.cpp reranker")
-	svc.stopProcess(&svc.llamaCmd, "llama.cpp")
+	if !svc.config.IsCloudReranker() {
+		svc.stopProcess(&svc.llamaRerankerCmd, "llama.cpp reranker")
+	}
+	if !svc.config.IsCloudEmbedding() {
+		svc.stopProcess(&svc.llamaCmd, "llama.cpp")
+	}
 }
 
 func (svc *services) monitor(ctx context.Context, panics *atomic.Int64) {
@@ -108,11 +116,15 @@ func (svc *services) monitor(ctx context.Context, panics *atomic.Int64) {
 		case <-ticker.C:
 			// Spawn each service check in its own goroutine to prevent
 			// a slow restart on one service from blocking others.
-			go svc.checkAndRestart(ctx, "llama.cpp", healthURL(svc.config.LlamaPort),
-				&svc.llamaCmd, svc.startLlama, &svc.llamaFails, maxRestartsPerHour)
+			if !svc.config.IsCloudEmbedding() {
+				go svc.checkAndRestart(ctx, "llama.cpp", healthURL(svc.config.LlamaPort),
+					&svc.llamaCmd, svc.startLlama, &svc.llamaFails, maxRestartsPerHour)
+			}
 
-			go svc.checkAndRestart(ctx, "llama reranker", healthURL(svc.config.LlamaRerankerPort),
-				&svc.llamaRerankerCmd, svc.startLlamaReranker, &svc.rerankerFails, maxRestartsPerHour)
+			if !svc.config.IsCloudReranker() {
+				go svc.checkAndRestart(ctx, "llama reranker", healthURL(svc.config.LlamaRerankerPort),
+					&svc.llamaRerankerCmd, svc.startLlamaReranker, &svc.rerankerFails, maxRestartsPerHour)
+			}
 
 			go svc.checkAndRestart(ctx, "Hindsight", healthURL(svc.config.HindsightPort),
 				&svc.hindsightCmd, svc.startHindsight, &svc.hindsightFails, maxRestartsPerHour)
@@ -233,10 +245,30 @@ func (svc *services) allHealthy() (llama, reranker, hindsight bool) {
 	// Cache expired — deduplicate concurrent refreshes via singleflight
 	val, _, _ := svc.healthGroup.Do("health", func() (interface{}, error) {
 		var l, r, h bool
+
+		// Count how many goroutines we actually need to launch
+		nChecks := 0
+		if !svc.config.IsCloudEmbedding() { nChecks++ }
+		if !svc.config.IsCloudReranker() { nChecks++ }
+		nChecks++ // hindsight always checked
+
+		// Cloud services are always "healthy" — no local process to check
+		if svc.config.IsCloudEmbedding() {
+			l = true
+		}
+		if svc.config.IsCloudReranker() {
+			r = true
+		}
+
 		var wg sync.WaitGroup
-		wg.Add(3)
-		go func() { defer wg.Done(); l = svc.check(healthURL(svc.config.LlamaPort)) == nil }()
-		go func() { defer wg.Done(); r = svc.check(healthURL(svc.config.LlamaRerankerPort)) == nil }()
+		wg.Add(nChecks)
+
+		if !svc.config.IsCloudEmbedding() {
+			go func() { defer wg.Done(); l = svc.check(healthURL(svc.config.LlamaPort)) == nil }()
+		}
+		if !svc.config.IsCloudReranker() {
+			go func() { defer wg.Done(); r = svc.check(healthURL(svc.config.LlamaRerankerPort)) == nil }()
+		}
 		go func() { defer wg.Done(); h = svc.check(healthURL(svc.config.HindsightPort)) == nil }()
 		wg.Wait()
 
@@ -365,16 +397,41 @@ func (svc *services) startHindsight() error {
 		"HINDSIGHT_API_LLM_API_KEY="+svc.config.LLMAPIKey,
 		"HINDSIGHT_API_LLM_MODEL="+svc.config.LLMModel,
 		"HINDSIGHT_API_LLM_BASE_URL="+svc.config.LLMBaseURL,
-		"HINDSIGHT_API_EMBEDDINGS_PROVIDER="+svc.config.EmbedProvider,
-		"HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY=not-needed",
-		"HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL=http://localhost:"+svc.config.LlamaPort+"/v1",
-		"HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL="+svc.config.EmbedModel,
-		"HINDSIGHT_API_RERANKER_PROVIDER="+svc.config.RerankerProvider,
-		"HINDSIGHT_API_RERANKER_COHERE_API_KEY=not-needed",
-		"HINDSIGHT_API_RERANKER_COHERE_BASE_URL=http://localhost:"+svc.config.LlamaRerankerPort+"/v1/rerank",
-		"HINDSIGHT_API_RERANKER_COHERE_MODEL="+svc.config.RerankerModel,
-		"HINDSIGHT_API_PORT="+svc.config.HindsightPort,
 	)
+
+	// Embedding env vars: branch on cloud vs local
+	env = append(env, "HINDSIGHT_API_EMBEDDINGS_PROVIDER="+svc.config.EmbedProvider)
+	if svc.config.IsCloudEmbedding() {
+		env = append(env,
+			"HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY="+svc.config.CloudEmbeddingAPIKey,
+			"HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL="+svc.config.CloudEmbeddingURL,
+			"HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL="+svc.config.CloudEmbeddingModel,
+		)
+	} else {
+		env = append(env,
+			"HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY=not-needed",
+			"HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL=http://localhost:"+svc.config.LlamaPort+"/v1",
+			"HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL="+svc.config.EmbedModel,
+		)
+	}
+
+	// Reranker env vars: branch on cloud vs local
+	env = append(env, "HINDSIGHT_API_RERANKER_PROVIDER="+svc.config.RerankerProvider)
+	if svc.config.IsCloudReranker() {
+		env = append(env,
+			"HINDSIGHT_API_RERANKER_COHERE_API_KEY="+svc.config.CloudRerankerAPIKey,
+			"HINDSIGHT_API_RERANKER_COHERE_BASE_URL="+svc.config.CloudRerankerURL,
+			"HINDSIGHT_API_RERANKER_COHERE_MODEL="+svc.config.CloudRerankerModel,
+		)
+	} else {
+		env = append(env,
+			"HINDSIGHT_API_RERANKER_COHERE_API_KEY=not-needed",
+			"HINDSIGHT_API_RERANKER_COHERE_BASE_URL=http://localhost:"+svc.config.LlamaRerankerPort+"/v1/rerank",
+			"HINDSIGHT_API_RERANKER_COHERE_MODEL="+filepath.Base(svc.config.RerankerModel),
+		)
+	}
+
+	env = append(env, "HINDSIGHT_API_PORT="+svc.config.HindsightPort)
 	cmd := exec.Command(hindsightPath, "--port", svc.config.HindsightPort)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = env

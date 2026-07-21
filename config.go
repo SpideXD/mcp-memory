@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -26,6 +27,16 @@ type Config struct {
 
 	// llama.cpp reranker
 	LlamaRerankerPort string
+
+	// Cloud Embedding (used when ModelPath is an HTTP URL)
+	CloudEmbeddingAPIKey string // env: CLOUD_EMBEDDING_API_KEY
+	CloudEmbeddingURL    string // env: CLOUD_EMBEDDING_URL
+	CloudEmbeddingModel  string // env: CLOUD_EMBEDDING_MODEL
+
+	// Cloud Reranker (used when RerankerModel is an HTTP URL)
+	CloudRerankerAPIKey string // env: CLOUD_RERANKER_API_KEY
+	CloudRerankerURL    string // env: CLOUD_RERANKER_URL
+	CloudRerankerModel  string // env: CLOUD_RERANKER_MODEL
 
 	// Hindsight
 	HindsightPath    string
@@ -101,7 +112,7 @@ func LoadConfig() Config {
 		LlamaPath: getEnv("LLAMA_PATH", "llama-server"),
 		LlamaPort: getEnv("LLAMA_PORT", "8080"),
 		LlamaHost: getEnv("LLAMA_HOST", "0.0.0.0"),
-		ModelPath: getEnv("LLAMA_MODEL_PATH", "../../model/qwen3-embedding-0.6b-Q8_0.gguf"),
+		ModelPath: getEnv("LLAMA_MODEL_PATH", "./model/qwen3-embedding-0.6b-Q8_0.gguf"),
 		CtxSize:   getEnv("LLAMA_CTX_SIZE", "8192"),
 		GPULayers: getEnv("LLAMA_GPU_LAYERS", "999"),
 
@@ -118,7 +129,17 @@ func LoadConfig() Config {
 		EmbedProvider:    getEnv("HINDSIGHT_EMBEDDINGS_PROVIDER", "openai"),
 		EmbedModel:       getEnv("HINDSIGHT_EMBEDDINGS_MODEL", "qwen3-embedding-0.6b-Q8_0.gguf"),
 		RerankerProvider: getEnv("HINDSIGHT_RERANKER_PROVIDER", "cohere"),
-		RerankerModel:    getEnv("HINDSIGHT_RERANKER_MODEL", "../../model/bge-reranker-base-Q4_k_m.gguf"),
+		RerankerModel:    getEnv("HINDSIGHT_RERANKER_MODEL", "./model/bge-reranker-base-Q4_k_m.gguf"),
+
+		// Cloud Embedding (optional — only validated when ModelPath is HTTP URL)
+		CloudEmbeddingAPIKey: getEnv("CLOUD_EMBEDDING_API_KEY", ""),
+		CloudEmbeddingURL:    getEnv("CLOUD_EMBEDDING_URL", ""),
+		CloudEmbeddingModel:  getEnv("CLOUD_EMBEDDING_MODEL", ""),
+
+		// Cloud Reranker (optional — only validated when RerankerModel is HTTP URL)
+		CloudRerankerAPIKey: getEnv("CLOUD_RERANKER_API_KEY", ""),
+		CloudRerankerURL:    getEnv("CLOUD_RERANKER_URL", ""),
+		CloudRerankerModel:  getEnv("CLOUD_RERANKER_MODEL", ""),
 
 		// Service timeouts
 		StartTimeout:    getEnvDuration("SERVICE_START_TIMEOUT", 120*time.Second),
@@ -191,6 +212,20 @@ func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
 	return defaultValue
 }
 
+// isCloudURL returns true if s is an HTTP or HTTPS URL (i.e., a cloud
+// service endpoint rather than a local filesystem path).
+func isCloudURL(s string) bool {
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
+}
+
+// IsCloudEmbedding returns true iff ModelPath is an HTTP/HTTPS URL,
+// indicating the embedding service should use a cloud endpoint.
+func (c Config) IsCloudEmbedding() bool { return isCloudURL(c.ModelPath) }
+
+// IsCloudReranker returns true iff RerankerModel is an HTTP/HTTPS URL,
+// indicating the reranker service should use a cloud endpoint.
+func (c Config) IsCloudReranker() bool { return isCloudURL(c.RerankerModel) }
+
 // Validate checks the configuration for common mistakes.
 func (c Config) Validate() error {
 	if c.LLMAPIKey == "" {
@@ -210,8 +245,7 @@ func (c Config) Validate() error {
 	}
 	// Validate model files exist (skip for cloud endpoints)
 	for _, path := range []string{c.ModelPath, c.RerankerModel} {
-		// Skip validation for HTTP URLs (cloud embedding/reranker services)
-		if len(path) > 7 && (path[:7] == "http://" || (len(path) > 8 && path[:8] == "https://")) {
+		if isCloudURL(path) {
 			continue
 		}
 		if !filepath.IsAbs(path) {
@@ -222,5 +256,32 @@ func (c Config) Validate() error {
 			return fmt.Errorf("model file not found: %s", path)
 		}
 	}
+
+	// Cloud embedding: if configured, all three fields are required
+	if c.IsCloudEmbedding() {
+		if strings.TrimSpace(c.CloudEmbeddingAPIKey) == "" {
+			return fmt.Errorf("CLOUD_EMBEDDING_API_KEY is required when LLAMA_MODEL_PATH is a cloud URL")
+		}
+		if strings.TrimSpace(c.CloudEmbeddingURL) == "" {
+			return fmt.Errorf("CLOUD_EMBEDDING_URL is required when LLAMA_MODEL_PATH is a cloud URL")
+		}
+		if strings.TrimSpace(c.CloudEmbeddingModel) == "" {
+			return fmt.Errorf("CLOUD_EMBEDDING_MODEL is required when LLAMA_MODEL_PATH is a cloud URL")
+		}
+	}
+
+	// Cloud reranker: if configured, all three fields are required
+	if c.IsCloudReranker() {
+		if strings.TrimSpace(c.CloudRerankerAPIKey) == "" {
+			return fmt.Errorf("CLOUD_RERANKER_API_KEY is required when HINDSIGHT_RERANKER_MODEL is a cloud URL")
+		}
+		if strings.TrimSpace(c.CloudRerankerURL) == "" {
+			return fmt.Errorf("CLOUD_RERANKER_URL is required when HINDSIGHT_RERANKER_MODEL is a cloud URL")
+		}
+		if strings.TrimSpace(c.CloudRerankerModel) == "" {
+			return fmt.Errorf("CLOUD_RERANKER_MODEL is required when HINDSIGHT_RERANKER_MODEL is a cloud URL")
+		}
+	}
+
 	return nil
 }
