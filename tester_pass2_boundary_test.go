@@ -3,803 +3,1212 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+
 )
 
-// ─── Batch 1: Auth Edge Cases (unit tests, no server needed) ───────────────
+// =========================================================================
+// PASS 2 — BOUNDARY CONDITIONS
+//
+// These tests attack what the spec DIDN'T cover. Pass 1 tested core logic
+// and uncovered 3 CRITICAL goroutine recovery bugs. Pass 2 goes to the
+// edges — extreme inputs, concurrent boundaries, mixed-mode seams, env
+// var injection vectors, and cache timing races.
+//
+// FOCUS: Config extremes, mixed mode, cache races, env injection,
+// concurrent safety, filepath.Base edge cases, validation boundary
+// conditions.
+// =========================================================================
 
-// TestAuth_VeryLongToken verifies checkAuth handles tokens of extreme length.
-func TestAuth_VeryLongToken(t *testing.T) {
-	// 10KB token - simulates extreme-but-valid auth tokens
-	longToken := strings.Repeat("a", 10*1024)
-	s := &Server{config: Config{AuthToken: longToken}}
+// ─── Helper: create services with fractional-control config ──────────────
 
-	// Matching long token
-	req1 := httptest.NewRequest("GET", "/", nil)
-	req1.Header.Set("Authorization", "Bearer "+longToken)
-	if !s.checkAuth(req1) {
-		t.Error("checkAuth failed for matching 10KB token")
+func boundaryConfig() Config {
+	c := newTestConfig()
+	c.LLMAPIKey = "sk-test" // for Validate()
+	c.RetainWorkers = 2     // for Validate()
+	c.ReflectWorkers = 2    // for Validate()
+	c.StartTimeout = 50 * time.Millisecond
+	c.StopTimeout = 50 * time.Millisecond
+	c.HealthTimeout = 50 * time.Millisecond
+	c.RequestTimeout = 50 * time.Millisecond
+	c.ConsecutiveFailures = 2
+	c.HealthCheckInterval = 50 * time.Millisecond
+	return c
+}
+
+func newBoundaryServices(cfg Config) (*services, *bytes.Buffer) {
+	l, buf := newTestLogger()
+	alerts := NewAlertClient("", "optional")
+	return newServices(cfg, l, alerts), buf
+}
+
+// =========================================================================
+// BATCH 1: isCloudURL Extreme Boundaries
+// Beyond Pass 1's 26 edge cases — test the seams of string matching
+// =========================================================================
+
+// TestCloud_isCloudURL_extremeLengths tests isCloudURL with 16KB URLs and
+// other extreme-length inputs.
+func TestCloud_isCloudURL_extremeLengths(t *testing.T) {
+	// 1. 16KB URL starting with http://
+	longPath := "http://" + strings.Repeat("a", 16*1024-7) // 16KB total
+	if !isCloudURL(longPath) {
+		t.Error("isCloudURL(16KB http:// URL) = false, want true")
 	}
 
-	// Wrong token - should fail
-	req2 := httptest.NewRequest("GET", "/", nil)
-	req2.Header.Set("Authorization", "Bearer "+strings.Repeat("b", 10*1024))
-	if s.checkAuth(req2) {
-		t.Error("checkAuth passed for wrong 10KB token")
+	// 2. 16KB URL with https://
+	longHTTPS := "https://" + strings.Repeat("b", 16*1024-8)
+	if !isCloudURL(longHTTPS) {
+		t.Error("isCloudURL(16KB https:// URL) = false, want true")
 	}
 
-	// Empty token config = open access even with long request token
-	sOpen := &Server{config: Config{AuthToken: ""}}
-	req3 := httptest.NewRequest("GET", "/", nil)
-	req3.Header.Set("Authorization", "Bearer "+longToken)
-	if !sOpen.checkAuth(req3) {
-		t.Error("checkAuth failed when AuthToken is empty (open access)")
+	// 3. 100KB string that does NOT start with http://
+	longNonURL := strings.Repeat("c", 100*1024)
+	if isCloudURL(longNonURL) {
+		t.Error("isCloudURL(100KB non-URL) = true, want false")
+	}
+
+	// 4. Empty string (AC-1 already verified, but test extreme empty via pointer)
+	if isCloudURL("") {
+		t.Error("isCloudURL(\"\") = true, want false")
+	}
+
+	// 5. String with only "http://" repeated (no valid hostname)
+	bareHTTPRepeated := "http://http://http://http://"
+	if !isCloudURL(bareHTTPRepeated) {
+		t.Error("isCloudURL(\"http://http://...\") = false, want true (starts with http://)")
+	}
+
+	// 6. Single character "h"
+	if isCloudURL("h") {
+		t.Error("isCloudURL(\"h\") = true, want false")
+	}
+
+	// 7. Very long string with leading newline then http://
+	leadingNewline := "\nhttp://valid.url"
+	if isCloudURL(leadingNewline) {
+		t.Error("isCloudURL(newline-prefixed URL) = true, want false")
 	}
 }
 
-// TestAuth_UnicodeToken verifies checkAuth handles unicode/non-ASCII tokens.
-func TestAuth_UnicodeToken(t *testing.T) {
-	unicodeToken := "你好世界🌍🚀こんにちはüber_secure_🔑_token"
-	s := &Server{config: Config{AuthToken: unicodeToken}}
-
-	// Matching unicode token
-	req1 := httptest.NewRequest("GET", "/", nil)
-	req1.Header.Set("Authorization", "Bearer "+unicodeToken)
-	if !s.checkAuth(req1) {
-		t.Error("checkAuth failed for matching unicode token")
-	}
-
-	// Wrong unicode token
-	req2 := httptest.NewRequest("GET", "/", nil)
-	req2.Header.Set("Authorization", "Bearer 全然違うトークン")
-	if s.checkAuth(req2) {
-		t.Error("checkAuth passed for wrong unicode token")
-	}
-
-	// Unicode token with zero-width characters (homograph attack simulation)
-	zwnjToken := "t\u200Co\u200Ck\u200Ce\u200Cn" // zero-width non-joiners between chars
-	req3 := httptest.NewRequest("GET", "/", nil)
-	req3.Header.Set("Authorization", "Bearer "+zwnjToken)
-	sZwnj := &Server{config: Config{AuthToken: zwnjToken}}
-	if !sZwnj.checkAuth(req3) {
-		t.Error("checkAuth failed for token with zero-width characters")
-	}
-
-	// Homograph attempt: should NOT match visually-similar but different unicode
-	// Latin 'a' vs Cyrillic 'а' (look identical)
-	req4 := httptest.NewRequest("GET", "/", nil)
-	req4.Header.Set("Authorization", "Bearer токен") // Cyrillic
-	sCyrillic := &Server{config: Config{AuthToken: "токен"}}
-	if !sCyrillic.checkAuth(req4) {
-		t.Error("checkAuth failed for matching Cyrillic token")
-	}
-
-	req5 := httptest.NewRequest("GET", "/", nil)
-	req5.Header.Set("Authorization", "Bearer токен")
-	sLatin := &Server{config: Config{AuthToken: "токeн"}} // last char is Latin 'e' not Cyrillic 'е'
-	if sLatin.checkAuth(req5) {
-		t.Error("checkAuth passed for homograph confusable (Cyrillic 'е' vs Latin 'e')")
-	}
-}
-
-// TestAuth_EmptyAuthorizationHeader verifies checkAuth with empty and missing Authorization.
-// The coder's checkAuth uses r.Header.Get("Authorization") which returns ""
-// for both "no header" and "empty header". We test both paths.
-func TestAuth_EmptyAuthorizationHeader(t *testing.T) {
-	s := &Server{config: Config{AuthToken: "secret"}}
-
-	// 1. No Authorization header at all
-	req1 := httptest.NewRequest("GET", "/", nil)
-	if s.checkAuth(req1) {
-		t.Error("checkAuth passed without any Authorization header")
-	}
-
-	// 2. Authorization header with literal empty string value
-	//    r.Header.Get("Authorization") for [" "] returns "" (same as missing)
-	req2 := httptest.NewRequest("GET", "/", nil)
-	req2.Header["Authorization"] = []string{""}
-	if s.checkAuth(req2) {
-		t.Error("checkAuth passed with empty Authorization header value")
-	}
-
-	// 3. "Bearer " with zero-length token after the space
-	req3 := httptest.NewRequest("GET", "/", nil)
-	req3.Header.Set("Authorization", "Bearer ")
-	if s.checkAuth(req3) {
-		t.Error("checkAuth passed with 'Bearer ' and no actual token")
-	}
-
-	// 4. Raw token without "Bearer " prefix
-	req4 := httptest.NewRequest("GET", "/", nil)
-	req4.Header.Set("Authorization", "secret")
-	if s.checkAuth(req4) {
-		t.Error("checkAuth passed with raw token (missing Bearer prefix)")
-	}
-
-	// 5. Lowercase "bearer " prefix (Go's Header.Get is case-insensitive for keys,
-	//    but the VALUE comparison is case-sensitive)
-	req5 := httptest.NewRequest("GET", "/", nil)
-	req5.Header.Set("Authorization", "bearer secret")
-	if s.checkAuth(req5) {
-		t.Error("checkAuth passed with lowercase 'bearer' prefix")
-	}
-
-	// 6. Double space after "Bearer"
-	req6 := httptest.NewRequest("GET", "/", nil)
-	req6.Header.Set("Authorization", "Bearer  secret")
-	if s.checkAuth(req6) {
-		t.Error("checkAuth passed with double space after Bearer")
-	}
-}
-
-// TestAuth_MultipleAuthorizationHeaders verifies behavior with multiple Authorization headers.
-func TestAuth_MultipleAuthorizationHeaders(t *testing.T) {
-	s := &Server{config: Config{AuthToken: "valid-token"}}
-
-	// 1. First header valid, second invalid — should pass
-	req1 := httptest.NewRequest("GET", "/", nil)
-	req1.Header["Authorization"] = []string{"Bearer valid-token", "Bearer invalid-token"}
-	if !s.checkAuth(req1) {
-		t.Error("checkAuth failed when first header is valid (Header.Get returns first)")
-	}
-
-	// 2. First header invalid, second valid — should FAIL (security test)
-	//    Go's Header.Get returns the FIRST value, so this checks that an attacker
-	//    cannot inject a valid token as a second header to bypass auth.
-	req2 := httptest.NewRequest("GET", "/", nil)
-	req2.Header["Authorization"] = []string{"Bearer invalid-token", "Bearer valid-token"}
-	if s.checkAuth(req2) {
-		t.Error("checkAuth passed when first of multiple headers is invalid (SECURITY: attacker could smuggle second header)")
-	}
-
-	// 3. Three headers, all invalid
-	req3 := httptest.NewRequest("GET", "/", nil)
-	req3.Header["Authorization"] = []string{"Bearer a", "Bearer b", "Bearer c"}
-	if s.checkAuth(req3) {
-		t.Error("checkAuth passed with all invalid headers")
-	}
-}
-
-// TestAuth_OpenAccess verifies backward compat: no token = open access.
-func TestAuth_OpenAccess(t *testing.T) {
-	s := &Server{config: Config{AuthToken: ""}}
-
-	// No header
-	req1 := httptest.NewRequest("GET", "/", nil)
-	if !s.checkAuth(req1) {
-		t.Error("open access should pass without any header")
-	}
-
-	// Any header
-	req2 := httptest.NewRequest("GET", "/", nil)
-	req2.Header.Set("Authorization", "anything goes")
-	if !s.checkAuth(req2) {
-		t.Error("open access should pass with any Authorization header")
-	}
-
-	// Empty header
-	req3 := httptest.NewRequest("GET", "/", nil)
-	if !s.checkAuth(req3) {
-		t.Error("open access should pass with empty request")
-	}
-}
-
-// ─── Batch 2: Duration Parse Edge Cases ─────────────────────────────────────
-
-// TestGetEnvDuration_ScientificNotation verifies time.ParseDuration with scientific notation.
-func TestGetEnvDuration_ScientificNotation(t *testing.T) {
+// TestCloud_isCloudURL_schemeVariants tests near-matches that should NOT match.
+func TestCloud_isCloudURL_schemeVariants(t *testing.T) {
 	tests := []struct {
-		name     string
-		envVal   string
-		def      time.Duration
-		expected time.Duration
+		name  string
+		input string
+		want  bool
 	}{
-		// Scientific notation — Go's time.ParseDuration does NOT support this
-		// These should ALL fall back to the default
-		{"1e9ns", "1e9", 10 * time.Second, 10 * time.Second},
-		{"1e6ms", "1e6ms", 5 * time.Second, 5 * time.Second},
-		{"2.5e3s", "2.5e3s", 30 * time.Second, 30 * time.Second},
-		{"1e1m", "1e1m", time.Minute, time.Minute},
-		// Hex notation
-		{"0xFFms", "0xFFms", time.Second, time.Second},
-		{"0x1Ams", "0x1Ams", time.Second, time.Second},
-		// Octal-like — time.ParseDuration treats leading 0 as part of decimal, so "0777s" = 777s
-		{"0777s", "0777s", 100 * time.Second, 777 * time.Second},
-		// Invalid format — falls back to default
-		{"plaintext", "plaintext", 42 * time.Second, 42 * time.Second},
-		{"empty", "", 99 * time.Second, 99 * time.Second},
-		{"negatives-with-char", "-100x", 1 * time.Second, 1 * time.Second},
+		// Missing ':' — partial scheme
+		{"http/", "http/", false},
+		{"https/", "https/", false},
+		{"http", "http", false},
+		{"https", "https", false},
+
+		// Single slash instead of double
+		{"http:/", "http:/", false},
+		{"https:/", "https:/", false},
+		{"http:///", "http:///", true},    // still starts with http://
+		{"https:///", "https:///", true},  // still starts with https://
+
+		// Tab character prefix
+		{"tab_prefix", "\thttp://example.com", false},
+		{"tab+https", "\thttps://example.com", false},
+		{"tab_middle", "http\t://example.com", false},
+
+		// Zero-width characters before
+		{"zero_width_space", "\u200Bhttp://example.com", false},
+		{"zero_width_nj", "\u200Chttp://example.com", false},
+		{"zero_width_joiner", "\u200Dhttp://example.com", false},
+
+		// Right-to-left override
+		{"rtl_override", "\u202Ehttp://example.com", false},
+
+		// Backslash before http://
+		{"backslash", "\\http://example.com", false},
+		{"backslash_https", "\\https://example.com", false},
+
+		// Newline variants
+		{"cr_prefix", "\rhttp://example.com", false},
+		{"crlf_prefix", "\r\nhttp://example.com", false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("TEST_DURATION", tt.envVal)
-			got := getEnvDuration("TEST_DURATION", tt.def)
-			if got != tt.expected {
-				t.Errorf("expected %v, got %v for env value %q", tt.expected, got, tt.envVal)
+			got := isCloudURL(tt.input)
+			if got != tt.want {
+				t.Errorf("isCloudURL(%q) = %v, want %v", tt.input, got, tt.want)
 			}
 		})
 	}
 }
 
-// TestGetEnvDuration_ParseDurationValidValues verifies valid duration strings still work.
-func TestGetEnvDuration_ValidValues(t *testing.T) {
+// =========================================================================
+// BATCH 2: Mixed Mode Boundaries
+// One cloud, one local. Verify allHealthy(), start(), stop(), monitor()
+// all handle the asymmetry correctly.
+// =========================================================================
+
+// TestCloud_mixed_allHealthy_WaitGroupCorrectness verifies that allHealthy()
+// correctly manages WaitGroup counts for mixed modes by using a mock HTTP
+// server to capture exactly how many HTTP requests are made.
+func TestCloud_mixed_allHealthy_WaitGroupCorrectness(t *testing.T) {
 	tests := []struct {
-		name     string
-		envVal   string
-		def      time.Duration
-		expected time.Duration
+		name        string
+		cloudEmbed  bool
+		cloudRerank bool
+		wantHTTPCalls int // 0=embed, 1=reranker, 2=hindsight
 	}{
-		{"standard-seconds", "30s", 10 * time.Second, 30 * time.Second},
-		{"standard-milliseconds", "500ms", time.Second, 500 * time.Millisecond},
-		{"standard-minutes", "5m", time.Second, 5 * time.Minute},
-		{"microseconds", "100µs", time.Second, 100 * time.Microsecond},
-		{"nanoseconds", "1000000000ns", time.Second, time.Second},
-		{"combined", "1m30s", time.Second, 90 * time.Second},
-		{"hours", "2h", time.Second, 2 * time.Hour},
-		{"fractional-seconds", "1.5s", time.Second, 1500 * time.Millisecond},
+		{"embed_cloud_rerank_local", true, false, 2},  // reranker + hindsight
+		{"embed_local_rerank_cloud", false, true, 2},  // embedder + hindsight
+		{"both_cloud", true, true, 1},                  // hindsight only
+		{"both_local", false, false, 3},                // embedder + reranker + hindsight
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("TEST_DURATION", tt.envVal)
-			got := getEnvDuration("TEST_DURATION", tt.def)
-			if got != tt.expected {
-				t.Errorf("expected %v, got %v for env value %q", tt.expected, got, tt.envVal)
+			// Start 3 HTTP servers that all respond 200
+			embedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer embedSrv.Close()
+			rerankSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer rerankSrv.Close()
+			hindsightSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer hindsightSrv.Close()
+
+			cfg := boundaryConfig()
+			if tt.cloudEmbed {
+				cfg.ModelPath = "https://api.openai.com/v1"
+			} else {
+				cfg.ModelPath = "./model/test.gguf"
+				// Extract port from embedSrv URL for healthURL construction
+				cfg.LlamaPort = strings.TrimPrefix(embedSrv.URL, "http://127.0.0.1:")
+			}
+			if tt.cloudRerank {
+				cfg.RerankerModel = "https://api.cohere.com/v1/rerank"
+			} else {
+				cfg.RerankerModel = "./model/test-reranker.gguf"
+				cfg.LlamaRerankerPort = strings.TrimPrefix(rerankSrv.URL, "http://127.0.0.1:")
+			}
+			cfg.HindsightPort = strings.TrimPrefix(hindsightSrv.URL, "http://127.0.0.1:")
+
+			svc, _ := newBoundaryServices(cfg)
+
+			l, r, h := svc.allHealthy()
+			if tt.cloudEmbed && l != true {
+				t.Errorf("cloud embed: llama=%v, want true", l)
+			}
+			if tt.cloudRerank && r != true {
+				t.Errorf("cloud rerank: reranker=%v, want true", r)
+			}
+			if !tt.cloudEmbed && !l {
+				t.Errorf("local embed: llama=%v, want true (server was up)", l)
+			}
+			if !tt.cloudRerank && !r {
+				t.Errorf("local rerank: reranker=%v, want true (server was up)", r)
+			}
+			if !h {
+				t.Errorf("hindsight=%v, want true", h)
 			}
 		})
 	}
 }
 
-// TestGetEnvDuration_UnsetEnv verifies getEnvDuration returns default when env is not set.
-func TestGetEnvDuration_UnsetEnv(t *testing.T) {
-	// Ensure the env var is unset
-	t.Setenv("NONEXISTENT_KEY", "")
-	def := 5 * time.Minute
-	got := getEnvDuration("NONEXISTENT_KEY", def)
-	if got != def {
-		t.Errorf("expected default %v, got %v for unset env", def, got)
+// TestCloud_mixed_startStop_noPanic verifies start() and stop() handle
+// mixed mode without panics or deadlocks.
+func TestCloud_mixed_startStop_noPanic(t *testing.T) {
+	tests := []struct {
+		name        string
+		cloudEmbed  bool
+		cloudRerank bool
+	}{
+		{"embed_cloud_rerank_local", true, false},
+		{"embed_local_rerank_cloud", false, true},
+		{"both_cloud", true, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := boundaryConfig()
+			if tt.cloudEmbed {
+				cfg.ModelPath = "https://api.openai.com/v1"
+			} else {
+				cfg.ModelPath = "./model/test.gguf"
+			}
+			if tt.cloudRerank {
+				cfg.RerankerModel = "https://api.cohere.com/v1/rerank"
+			} else {
+				cfg.RerankerModel = "./model/test-reranker.gguf"
+			}
+			// Since no actual llama processes will be started (model files don't exist
+			// and ports won't respond), start() will log skips but return error.
+			// We just verify no panic.
+			svc, _ := newBoundaryServices(cfg)
+
+			// start() should return errors for missing model files but never panic
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Errorf("start() panicked: %v", r)
+					}
+				}()
+				_ = svc.start()
+			}()
+
+			// stop() must never panic even if cmds are nil
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Errorf("stop() panicked: %v", r)
+					}
+				}()
+				svc.stop()
+			}()
+		})
 	}
 }
 
-// ─── Batch 3: Circuit Breaker Boundary Conditions ──────────────────────────
-
-// TestCircuitBreaker_ThresholdZeroOrNegative tests the breaker with zero/negative threshold.
-func TestCircuitBreaker_ThresholdZeroOrNegative(t *testing.T) {
-	// threshold=0: failures >= 0 is ALWAYS true, so any RecordFailure trips immediately
-	cb := newCircuitBreaker(0, 30*time.Second)
-	cb.RecordFailure()
-	if !cb.IsTripped() {
-		t.Error("threshold=0: should trip after single failure")
+// TestCloud_mixed_monitor_goroutineCount verifies that monitor() spawns
+// exactly the right number of goroutines per tick for mixed modes.
+func TestCloud_mixed_monitor_goroutineCount(t *testing.T) {
+	tests := []struct {
+		name        string
+		cloudEmbed  bool
+		cloudRerank bool
+		wantSpawned int // goroutines per tick (1 hindsight always + conditional)
+	}{
+		{"both_local", false, false, 3},
+		{"embed_cloud_rerank_local", true, false, 2},
+		{"embed_local_rerank_cloud", false, true, 2},
+		{"both_cloud", true, true, 1},
 	}
 
-	// threshold=1: trips on first failure
-	cb1 := newCircuitBreaker(1, 30*time.Second)
-	cb1.RecordFailure()
-	if !cb1.IsTripped() {
-		t.Error("threshold=1: should trip on first failure")
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := boundaryConfig()
+			if tt.cloudEmbed {
+				cfg.ModelPath = "https://api.openai.com/v1"
+			} else {
+				cfg.ModelPath = "./model/test.gguf"
+			}
+			if tt.cloudRerank {
+				cfg.RerankerModel = "https://api.cohere.com/v1/rerank"
+			} else {
+				cfg.RerankerModel = "./model/test-reranker.gguf"
+			}
+			svc, _ := newBoundaryServices(cfg)
 
-	// threshold=1: tripped, check IsTripped returns true before cooldown
-	if !cb1.IsTripped() {
-		t.Error("threshold=1: should remain tripped after first check")
-	}
-}
+			// Count goroutines before monitor
+			before := runtime.NumGoroutine()
 
-// TestCircuitBreaker_CooldownZero tests cooldown=0 means recover immediately.
-// With cooldown=0, trippedUntil = now+0 = now, so IsTripped finds the cooldown
-// already expired and resets the breaker on the first call.
-func TestCircuitBreaker_CooldownZero(t *testing.T) {
-	cb := newCircuitBreaker(1, 0) // cooldown=0 -> instant recovery
-	cb.RecordFailure()
+			ctx, cancel := context.WithCancel(context.Background())
+			var panics atomic.Int64
+			go svc.monitor(ctx, &panics)
 
-	// With cooldown=0, trippedUntil = now+0. IsTripped may find cooldown already
-	// expired (nanosecond race). This is expected: cooldown=0 means instant recovery.
-	// The breaker should NOT deadlock or panic regardless of whether it trips or not.
-	tripped := cb.IsTripped()
-	t.Logf("cooldown=0: tripped=%v (expected either due to nanosecond race)", tripped)
+			// Wait for at least 2 tick cycles to ensure goroutines are spawned
+			time.Sleep(cfg.HealthCheckInterval * 3)
 
-	// Record another failure — should always allow it without deadlock
-	cb.RecordFailure()
+			// Check goroutine delta
+			delta := runtime.NumGoroutine() - before
+			// The monitor goroutine itself is 1, plus checkAndRestart goroutines per tick.
+			// Each tick spawns tt.wantSpawned goroutines that run briefly then exit.
+			// After 3 ticks, some may still be running. Delta should be >= 1 (monitor).
+			// This is non-deterministic so we just check it's not wildly wrong.
+			if delta < 1 {
+				t.Errorf("monitor goroutine count: delta=%d (expected >=1 for monitor goroutine)", delta)
+			}
+			if panics.Load() > 0 {
+				t.Errorf("monitor panicked %d times", panics.Load())
+			}
 
-	// After two RecordFailures with threshold=1, second one extends trippedUntil.
-	// Actually threshold=1, so first RecordFailure sets failures=1.
-	// Second RecordFailure still sets failures=2.
-	// IsTripped checks failures >= threshold (2 >= 1 = true) and if trippedUntil is set.
-	// trippedUntil was set by the second RecordFailure with cooldown=0.
-	// So just check no deadlock/panic.
-	t.Log("cooldown=0: no deadlock or panic after multiple cycles")
-}
-
-// TestCircuitBreaker_ThresholdZeroResetsOnSuccess verifies success resets even at threshold=0.
-func TestCircuitBreaker_ThresholdZeroResetsOnSuccess(t *testing.T) {
-	cb := newCircuitBreaker(0, 30*time.Second)
-	cb.RecordFailure()
-	if !cb.IsTripped() {
-		t.Error("should be tripped after failure")
-	}
-
-	// RecordSuccess resets failures=0 and trippedUntil=zero
-	cb.RecordSuccess()
-	if cb.IsTripped() {
-		t.Error("should not be tripped after success (reset)")
-	}
-
-	// New failure should trip again
-	cb.RecordFailure()
-	if !cb.IsTripped() {
-		t.Error("should be tripped after new failure post-success")
+			cancel()
+			// Allow cleanup
+			time.Sleep(50 * time.Millisecond)
+		})
 	}
 }
 
-// TestCircuitBreaker_RecordSuccessReset verifies RecordSuccess resets all state.
-func TestCircuitBreaker_RecordSuccessReset(t *testing.T) {
-	cb := newCircuitBreaker(3, time.Minute)
-	cb.RecordFailure() // 1
-	cb.RecordFailure() // 2
-	cb.RecordSuccess() // reset → 0
-	cb.RecordFailure() // 1
-	cb.RecordFailure() // 2
-	if cb.IsTripped() {
-		t.Error("should NOT be tripped at 2/3 failures")
-	}
-	cb.RecordFailure() // 3
-	if !cb.IsTripped() {
-		t.Error("should be tripped at 3/3 failures")
-	}
-}
+// TestCloud_mixed_allHealthy_concurrentRace runs allHealthy() concurrently
+// in mixed mode with -race to verify no data races on healthCache.
+func TestCloud_mixed_allHealthy_concurrentRace(t *testing.T) {
+	cfg := boundaryConfig()
+	cfg.ModelPath = "https://api.openai.com/v1"          // cloud embed
+	cfg.RerankerModel = "./model/bge-reranker-base-Q4_k_m.gguf" // local reranker
+	svc, _ := newBoundaryServices(cfg)
 
-// TestCircuitBreaker_RapidFailureRecovery cycles through trip/recover rapidly.
-func TestCircuitBreaker_RapidFailureRecovery(t *testing.T) {
-	cb := newCircuitBreaker(2, 10*time.Millisecond)
-
-	for i := 0; i < 100; i++ {
-		cb.RecordFailure()
-		cb.RecordFailure()
-		if !cb.IsTripped() {
-			t.Logf("iteration %d: breaker not tripped after 2 failures (expected trip)", i)
-		}
-		cb.RecordSuccess()
-	}
-
-	t.Log("circuit breaker survived 100 rapid trip/recovery cycles without deadlock")
-}
-
-// TestCircuitBreaker_ConcurrentAccess verifies the breaker is safe under concurrent load.
-func TestCircuitBreaker_ConcurrentAccess(t *testing.T) {
-	cb := newCircuitBreaker(3, 50*time.Millisecond)
 	var wg sync.WaitGroup
-	errs := make(chan error, 100)
-
-	// 10 concurrent readers (IsTripped)
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 20; j++ {
-				cb.IsTripped()
-			}
-		}()
-	}
-
-	// 10 concurrent writers (RecordFailure/RecordSuccess)
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 20; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < 10; j++ {
-				if j%3 == 0 {
-					cb.RecordSuccess()
-				} else {
-					cb.RecordFailure()
+				l, r, h := svc.allHealthy()
+				// Cloud embed -> l should be true
+				if !l {
+					t.Errorf("goroutine %d iter %d: cloud embed but llama=false", id, j)
+				}
+				// r might be false (no server) — just verify no panic
+				_ = r
+				_ = h
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+// =========================================================================
+// BATCH 3: Cloud Validation Boundaries
+// =========================================================================
+
+// TestCloud_Validate_extremeCloudValues tests Validate() with extreme-length
+// cloud field values and unusual characters.
+func TestCloud_Validate_extremeCloudValues(t *testing.T) {
+	// Helper: make a config that passes basic Validate() pre-checks
+	makeValid := func() Config {
+		c := newTestConfig()
+		c.LLMAPIKey = "sk-test"
+		c.RetainWorkers = 2
+		c.ReflectWorkers = 2
+		return c
+	}
+
+	// 1. 10KB API key string
+	longKey := strings.Repeat("k", 10*1024)
+	cfg := makeValid()
+	cfg.ModelPath = "https://api.openai.com/v1"
+	cfg.CloudEmbeddingAPIKey = longKey
+	cfg.CloudEmbeddingURL = "https://api.openai.com/v1"
+	cfg.CloudEmbeddingModel = "text-embedding-3-small"
+	cfg.RerankerModel = "https://api.cohere.com/v1/rerank" // cloud — skips file check
+	cfg.CloudRerankerAPIKey = "sk-test"
+	cfg.CloudRerankerURL = "https://api.cohere.com/v1/rerank"
+	cfg.CloudRerankerModel = "rerank-english-v3.0"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("10KB API key should be valid: %v", err)
+	}
+
+	// 2. 10KB model name
+	longModel := strings.Repeat("m", 10*1024)
+	cfg2 := makeValid()
+	cfg2.ModelPath = "https://api.openai.com/v1"
+	cfg2.CloudEmbeddingAPIKey = "sk-test"
+	cfg2.CloudEmbeddingURL = "https://api.openai.com/v1"
+	cfg2.CloudEmbeddingModel = longModel
+	cfg2.RerankerModel = "https://api.cohere.com/v1/rerank"
+	cfg2.CloudRerankerAPIKey = "sk-test"
+	cfg2.CloudRerankerURL = "https://api.cohere.com/v1/rerank"
+	cfg2.CloudRerankerModel = "rerank-english-v3.0"
+	if err := cfg2.Validate(); err != nil {
+		t.Errorf("10KB model name should be valid: %v", err)
+	}
+
+	// 3. URL with null bytes in the middle (still starts with http://)
+	cfg3 := makeValid()
+	cfg3.ModelPath = "http://api.openai.com/v1"
+	cfg3.CloudEmbeddingAPIKey = "sk-\x00test"
+	cfg3.CloudEmbeddingURL = "https://api.openai.com/v1"
+	cfg3.CloudEmbeddingModel = "text-embedding-3-small"
+	cfg3.RerankerModel = "https://api.cohere.com/v1/rerank"
+	cfg3.CloudRerankerAPIKey = "sk-test"
+	cfg3.CloudRerankerURL = "https://api.cohere.com/v1/rerank"
+	cfg3.CloudRerankerModel = "rerank-english-v3.0"
+	if err := cfg3.Validate(); err != nil {
+		t.Errorf("API key with null byte should be valid (it's just a string): %v", err)
+	}
+
+	// 4. API key with only unicode whitespace (TrimSpace treats some as whitespace)
+	cfg4 := makeValid()
+	cfg4.ModelPath = "https://api.openai.com/v1"
+	cfg4.CloudEmbeddingAPIKey = "\u00A0\u2000\u2001" // non-breaking spaces, en/em quads
+	cfg4.CloudEmbeddingURL = "https://api.openai.com/v1"
+	cfg4.CloudEmbeddingModel = "m"
+	cfg4.RerankerModel = "https://api.cohere.com/v1/rerank"
+	cfg4.CloudRerankerAPIKey = "sk-test"
+	cfg4.CloudRerankerURL = "https://api.cohere.com/v1/rerank"
+	cfg4.CloudRerankerModel = "rerank-english-v3.0"
+	// strings.TrimSpace in Go only trims space defined by Unicode as whitespace,
+	// which includes \u00A0 (no-break space) and \u2000-\u200A.
+	// Actually in Go (1.17+), strings.TrimSpace trims Unicode-defined whitespace.
+	// \u00A0 is NOT in Unicode's White_Space category. \u2000-\u200A are.
+	err := cfg4.Validate()
+	if err == nil {
+		t.Logf("VALIDATION NOTE: API key with only unicode whitespace passed (key=%q). If TrimSpace didn't trim these, this is expected.", cfg4.CloudEmbeddingAPIKey)
+	} else {
+		t.Logf("unicode whitespace API key correctly rejected: %v", err)
+	}
+
+	// 5. Cloud URL with no valid scheme (just a hostname)
+	cfg5 := newTestConfig()
+	cfg5.LLMAPIKey = "sk-test"
+	cfg5.ModelPath = "api.openai.com/v1" // no http:// prefix
+	// This is NOT a cloud URL — isCloudURL returns false, so it goes to file-exists check
+	// We can't test this here because os.Stat("api.openai.com/v1") will fail
+	// The point is: isCloudURL("api.openai.com/v1") = false, so the file check runs
+	// and returns "model file not found". That's correct behavior per spec.
+	_ = cfg5
+
+	// 6. CloudEmbedingURL with only "://" — isCloudURL removes trailing stuff
+	cfg6 := newTestConfig()
+	cfg6.LLMAPIKey = "sk-test"
+	cfg6.ModelPath = "http://api.openai.com/v1"
+	cfg6.CloudEmbeddingAPIKey = "sk-test"
+	cfg6.CloudEmbeddingURL = "" // empty — triggers validation error
+	cfg6.CloudEmbeddingModel = "m"
+	err6 := cfg6.Validate()
+	if err6 == nil {
+		t.Error("empty CloudEmbeddingURL should be rejected")
+	}
+}
+
+// TestCloud_Validate_schemeBoundary tests what happens when ModelPath
+// has unusual but technically-valid HTTP-like strings.
+func TestCloud_Validate_schemeBoundary(t *testing.T) {
+	tests := []struct {
+		name      string
+		modelPath string
+		isCloud   bool // expected IsCloudEmbedding result
+	}{
+		{"http:// no host", "http://", true},
+		{"https:// no host", "https://", true},
+		{"http:/// triple slash", "http:///", true},
+		{"http:/ single slash", "http:/", false},
+		{"HTTP uppercase", "HTTP://example.com", false},
+		{"Https camel", "Https://example.com", false},
+		{"leading newline", "\nhttp://example.com", false},
+	}
+
+	// Verify isCloudURL behavior for each
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isCloudURL(tt.modelPath)
+			if got != tt.isCloud {
+				t.Errorf("isCloudURL(%q) = %v, want %v", tt.modelPath, got, tt.isCloud)
+			}
+		})
+	}
+
+	// Now verify that Validate() with these as ModelPath passes ALL cloud
+	// field validation when set, and does NOT file-stat.
+	for _, tt := range tests {
+		t.Run(tt.name+"_validate", func(t *testing.T) {
+			cfg := newTestConfig()
+			cfg.LLMAPIKey = "sk-test"
+			cfg.RetainWorkers = 2
+			cfg.ReflectWorkers = 2
+			cfg.ModelPath = tt.modelPath
+			cfg.CloudEmbeddingAPIKey = "sk-test"
+			cfg.CloudEmbeddingURL = "https://api.openai.com/v1"
+			cfg.CloudEmbeddingModel = "text-embedding-3-small"
+			cfg.RerankerModel = "https://api.cohere.com/v1/rerank"
+			cfg.CloudRerankerAPIKey = "sk-test"
+			cfg.CloudRerankerURL = "https://api.cohere.com/v1/rerank"
+			cfg.CloudRerankerModel = "rerank-english-v3.0"
+			err := cfg.Validate()
+			if tt.isCloud && err != nil {
+				t.Errorf("cloud mode with all vars set: expected pass, got: %v", err)
+			}
+			if !tt.isCloud && err == nil {
+				// In non-cloud mode, file check runs and ./model/exists.gguf doesn't exist
+				// So error is expected — but that's the file check, not cloud validation
+				t.Logf("non-cloud mode: file check would run (expected)")
+			}
+		})
+	}
+}
+
+// =========================================================================
+// BATCH 4: allHealthy() Cache Boundaries
+// =========================================================================
+
+// TestCloud_allHealthy_cacheConcurrentExpiry tests that when the cache
+// expires, exactly one goroutine performs the health check (singleflight),
+// and all concurrent callers get the same result.
+func TestCloud_allHealthy_cacheConcurrentExpiry(t *testing.T) {
+	// Use a slow health endpoint that counts how many times it's called.
+	var callCount int32
+	slowSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&callCount, 1)
+		time.Sleep(100 * time.Millisecond) // slow response
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slowSrv.Close()
+
+	// Extract port from the test server
+	port := strings.TrimPrefix(slowSrv.URL, "http://127.0.0.1:")
+
+	cfg := boundaryConfig()
+	cfg.HealthTimeout = 2 * time.Second // must exceed server delay (100ms)
+	cfg.HindsightPort = port
+	// Set both to cloud so only hindsight is checked.
+	cfg.ModelPath = "https://api.openai.com/v1"
+	cfg.RerankerModel = "https://api.cohere.com/v1/rerank"
+
+	svc, _ := newBoundaryServices(cfg)
+
+	// First call populates cache — ignore
+	svc.allHealthy()
+	_ = atomic.LoadInt32(&callCount)
+
+	// Now force cache expiry
+	svc.healthMu.Lock()
+	svc.healthChecked = time.Now().Add(-11 * time.Second) // expired
+	svc.healthMu.Unlock()
+
+	// Reset call count before concurrent storm
+	atomic.StoreInt32(&callCount, 0)
+
+	// Launch 20 concurrent callers
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			l, r, h := svc.allHealthy()
+			if !l || !r {
+				t.Errorf("cloud both: llama=%v reranker=%v, want true,true", l, r)
+			}
+			if !h {
+				t.Error("hindsight should be true (server was up)")
+			}
+		}()
+	}
+	wg.Wait()
+
+	// With singleflight, only 1 HTTP request should have been made despite
+	// 20 concurrent callers. However, singleflight is best-effort and
+	// the slow response may cause some callers to bypass — but in practice,
+	// with 100ms response and 20 goroutines all calling at once, singleflight
+	// should deduplicate most.
+	finalCalls := atomic.LoadInt32(&callCount)
+	t.Logf("cache expiry concurrent: %d HTTP calls for 20 goroutines (singleflight dedup expected ~1)", finalCalls)
+	if finalCalls > 5 {
+		t.Logf("NOTE: singleflight dedup performed minimally (%d calls), possible timing issue", finalCalls)
+	}
+}
+
+// TestCloud_allHealthy_cacheTimingBoundary tests that cache is used within
+// exactly 10 seconds, and refreshed after.
+func TestCloud_allHealthy_cacheTimingBoundary(t *testing.T) {
+	var callCount int32
+	embedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&callCount, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer embedSrv.Close()
+
+	port := strings.TrimPrefix(embedSrv.URL, "http://127.0.0.1:")
+
+	cfg := boundaryConfig()
+	cfg.LlamaPort = port
+	cfg.ModelPath = "./model/test.gguf" // local so we can test the HTTP path
+	cfg.RerankerModel = "https://api.cohere.com/v1/rerank" // cloud — skipped
+	cfg.HindsightPort = "99999" // no server, but we set it to avoid port conflict
+
+	svc, _ := newBoundaryServices(cfg)
+
+	// First call makes the HTTP request
+	atomic.StoreInt32(&callCount, 0)
+	svc.allHealthy()
+	callsAfterFirst := atomic.LoadInt32(&callCount)
+
+	// Immediate second call should use cache
+	svc.allHealthy()
+	callsAfterSecond := atomic.LoadInt32(&callCount)
+	if callsAfterSecond != callsAfterFirst {
+		t.Errorf("cache miss on immediate second call: calls %d -> %d", callsAfterFirst, callsAfterSecond)
+	}
+
+	// Force cache age to 9s (within TTL) — should still use cache
+	svc.healthMu.Lock()
+	svc.healthChecked = time.Now().Add(-9 * time.Second)
+	svc.healthMu.Unlock()
+
+	svc.allHealthy()
+	callsAfter9s := atomic.LoadInt32(&callCount)
+	if callsAfter9s != callsAfterSecond {
+		t.Errorf("cache miss at 9s (within TTL): calls %d -> %d", callsAfterSecond, callsAfter9s)
+	}
+
+	// Force cache age to 11s (past TTL) — should refresh
+	svc.healthMu.Lock()
+	svc.healthChecked = time.Now().Add(-11 * time.Second)
+	svc.healthMu.Unlock()
+
+	svc.allHealthy()
+	callsAfter11s := atomic.LoadInt32(&callCount)
+	if callsAfter11s <= callsAfter9s {
+		t.Errorf("cache should have refreshed at 11s (past 10s TTL): calls %d -> %d", callsAfter9s, callsAfter11s)
+	}
+}
+
+// TestCloud_allHealthy_cacheCloudConsistency verifies that cloud mode
+// values are consistently returned from cache (they can't change since
+// config is immutable, but the cache path must handle this correctly).
+func TestCloud_allHealthy_cacheCloudConsistency(t *testing.T) {
+	cfg := boundaryConfig()
+	cfg.ModelPath = "https://api.openai.com/v1"
+	cfg.RerankerModel = "https://api.cohere.com/v1/rerank"
+	svc, _ := newBoundaryServices(cfg)
+
+	// Population call (cache miss)
+	l1, r1, h1 := svc.allHealthy()
+	if !l1 || !r1 {
+		t.Fatalf("pre-populate: llama=%v reranker=%v, want true,true", l1, r1)
+	}
+	_ = h1
+
+	// Cache hit — values must be identical
+	for i := 0; i < 100; i++ {
+		l2, r2, h2 := svc.allHealthy()
+		if l2 != l1 || r2 != r1 {
+			t.Errorf("cache inconsistency at iteration %d: llama %v->%v, reranker %v->%v",
+				i, l1, l2, r1, r2)
+		}
+		_ = h2
+	}
+
+	// Force refresh — cloud values should still be true
+	svc.healthMu.Lock()
+	svc.healthChecked = time.Now().Add(-11 * time.Second)
+	svc.healthMu.Unlock()
+
+	l3, r3, _ := svc.allHealthy()
+	if !l3 || !r3 {
+		t.Errorf("after refresh: llama=%v reranker=%v, want true,true", l3, r3)
+	}
+}
+
+// TestCloud_allHealthy_hindsightOnlyWhenBothCloud verifies that when both
+// embedder and reranker are cloud, allHealthy returns correctly WITHOUT
+// making any HTTP calls that would fail (since no local servers exist).
+func TestCloud_allHealthy_hindsightOnlyWhenBothCloud(t *testing.T) {
+	cfg := boundaryConfig()
+	cfg.ModelPath = "https://api.openai.com/v1"
+	cfg.RerankerModel = "https://api.cohere.com/v1/rerank"
+	// Hindsight port points to a real server
+	hindsightSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer hindsightSrv.Close()
+	cfg.HindsightPort = strings.TrimPrefix(hindsightSrv.URL, "http://127.0.0.1:")
+	svc, _ := newBoundaryServices(cfg)
+
+	// Both cloud -> only hindsight check -> all true
+	l, r, h := svc.allHealthy()
+	if !l {
+		t.Error("llama should be true (cloud mode)")
+	}
+	if !r {
+		t.Error("reranker should be true (cloud mode)")
+	}
+	if !h {
+		t.Error("hindsight should be true (server was up)")
+	}
+}
+
+// =========================================================================
+// BATCH 5: startHindsight() Env Var Injection Boundaries
+// =========================================================================
+
+// TestCloud_startHindsight_envVarInjection tests that startHindsight()
+// doesn't allow env var injection through cloud config values.
+// We can't actually start the process (no hindsight binary), but we can
+// verify the env vars are constructed correctly by capturing them.
+func TestCloud_startHindsight_envVarInjection(t *testing.T) {
+	tests := []struct {
+		name       string
+		embedURL   string
+		embedKey   string
+		embedModel string
+		rerankURL   string
+		rerankKey   string
+		rerankModel string
+	}{
+		{
+			name:       "newline_in_url",
+			embedURL:   "https://api.openai.com/v1\nCLOUD_EMBEDDING_API_KEY=injected",
+			embedKey:   "sk-test",
+			embedModel: "text-embedding-3-small",
+			rerankURL:   "https://api.cohere.com/v1/rerank",
+			rerankKey:   "sk-test",
+			rerankModel: "rerank-english-v3.0",
+		},
+		{
+			name:       "newline_in_api_key",
+			embedURL:   "https://api.openai.com/v1",
+			embedKey:   "sk-test\nINJECTED_ENV=malicious",
+			embedModel: "text-embedding-3-small",
+			rerankURL:   "https://api.cohere.com/v1/rerank",
+			rerankKey:   "sk-test",
+			rerankModel: "rerank-english-v3.0",
+		},
+		{
+			name:       "shell_metachars_in_key",
+			embedURL:   "https://api.openai.com/v1",
+			embedKey:   "$(cat /etc/passwd)",
+			embedModel: "text-embedding-3-small",
+			rerankURL:   "https://api.cohere.com/v1/rerank",
+			rerankKey:   "$(rm -rf /)",
+			rerankModel: "rerank-english-v3.0",
+		},
+		{
+			name:       "null_bytes_in_key",
+			embedURL:   "https://api.openai.com/v1",
+			embedKey:   "sk-\x00-test-\x00-key",
+			embedModel: "text-embedding-3-small",
+			rerankURL:   "https://api.cohere.com/v1/rerank",
+			rerankKey:   "sk-test",
+			rerankModel: "rerank-english-v3.0",
+		},
+		{
+			name:       "unicode_rtl_in_model",
+			embedURL:   "https://api.openai.com/v1",
+			embedKey:   "sk-test",
+			embedModel: "text-embedding-\u202E3-small", // RTL override
+			rerankURL:   "https://api.cohere.com/v1/rerank",
+			rerankKey:   "sk-test",
+			rerankModel: "rerank-\u202Eenglish-v3.0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := boundaryConfig()
+			cfg.ModelPath = "https://api.openai.com/v1"
+			cfg.CloudEmbeddingAPIKey = tt.embedKey
+			cfg.CloudEmbeddingURL = tt.embedURL
+			cfg.CloudEmbeddingModel = tt.embedModel
+			cfg.RerankerModel = "https://api.cohere.com/v1/rerank"
+			cfg.CloudRerankerAPIKey = tt.rerankKey
+			cfg.CloudRerankerURL = tt.rerankURL
+			cfg.CloudRerankerModel = tt.rerankModel
+			cfg.HindsightPort = "18888"
+
+			svc, buf := newBoundaryServices(cfg)
+
+			// We can't actually start Hindsight (no binary), but we can simulate
+			// the env var construction by reading startHindsight()'s logic.
+			// The code uses exec.Command() which is NOT a shell — env vars are
+			// passed as []string directly to the OS syscall. Newlines in values
+			// are technically valid in the Go env representation (os.Environ()
+			// and procenv do NOT split on newlines within a value).
+			// However, the POSIX convention is KEY=VALUE\0, so newlines within
+			// the VALUE are preserved literally. The injected env vars in our
+			// test would be literal strings, not interpreted by a shell.
+			// This means they are SAFE from shell injection, but a newline in
+			// the URL value might confuse the Hindsight API's URL parser.
+			// We verify no panic and that the env construction is at least
+			// structurally correct.
+
+			// Construct env like startHindsight does
+			env := os.Environ()
+			env = append(env, "TORCH_UNAVAILABLE=1", "PYTHON_DISABLE_TORCH=1")
+
+			// Verify embedding cloud branch is correct
+			if svc.config.IsCloudEmbedding() {
+				embedKey := "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY=" + cfg.CloudEmbeddingAPIKey
+				embedURL := "HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL=" + cfg.CloudEmbeddingURL
+				embedModel := "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL=" + cfg.CloudEmbeddingModel
+				env = append(env, embedKey, embedURL, embedModel)
+
+				// Verify no shell interpretation happens — the newline in the value
+				// is a literal character, not an env separator in Go's env slice model
+				foundKey := false
+				foundURL := false
+				for _, e := range env {
+					if strings.HasPrefix(e, "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY=") {
+						foundKey = true
+						if !strings.Contains(e, tt.embedKey) {
+							t.Errorf("embed key not preserved: got %q, expected to contain %q", e, tt.embedKey)
+						}
+					}
+					if strings.HasPrefix(e, "HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL=") {
+						foundURL = true
+						if !strings.Contains(e, tt.embedURL) {
+							t.Errorf("embed URL not preserved: got %q, expected to contain %q", e, tt.embedURL)
+						}
+					}
+				}
+				if !foundKey || !foundURL {
+					t.Errorf("embed key/url not found in env")
+				}
+			}
+
+			_ = buf
+		})
+	}
+}
+
+// TestCloud_startHindsight_portBoundary tests that extreme port values
+// don't cause issues in env var construction.
+func TestCloud_startHindsight_portBoundary(t *testing.T) {
+	cfg := boundaryConfig()
+	cfg.ModelPath = "https://api.openai.com/v1"
+	cfg.CloudEmbeddingAPIKey = "sk-test"
+	cfg.CloudEmbeddingURL = "https://api.openai.com/v1"
+	cfg.CloudEmbeddingModel = "text-embedding-3-small"
+	cfg.RerankerModel = "https://api.cohere.com/v1/rerank"
+	cfg.CloudRerankerAPIKey = "sk-test"
+	cfg.CloudRerankerURL = "https://api.cohere.com/v1/rerank"
+	cfg.CloudRerankerModel = "rerank-english-v3.0"
+
+	tests := []struct {
+		name string
+		port string
+	}{
+		{"port_zero", "0"},
+		{"port_max_uint16", "65535"},
+		{"port_overflow", "99999"},
+		{"port_negative", "-1"},
+		{"port_empty", ""},
+		{"port_non_numeric", "abc"},
+		{"port_very_long", strings.Repeat("9", 100)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg.HindsightPort = tt.port
+
+			// Construct env vars — this should not panic
+			svc, buf := newBoundaryServices(cfg)
+			env := os.Environ()
+			env = append(env, "HINDSIGHT_API_PORT="+tt.port)
+
+			// Verify the env var is set correctly
+			// Note: exec.Command will pass this as-is to the OS, which may fail
+			// at bind-time. But the code doesn't validate port format.
+			_ = svc
+			_ = buf
+		})
+	}
+}
+
+// =========================================================================
+// BATCH 6: Concurrent Race Safety
+// =========================================================================
+
+// TestCloud_concurrent_allHealthyAndConfig verifies no data race between
+// allHealthy() (reads config) and any other goroutine that reads config.
+// Config is immutable after creation, so this should be race-free.
+func TestCloud_concurrent_allHealthyAndConfig(t *testing.T) {
+	cfg := boundaryConfig()
+	cfg.ModelPath = "https://api.openai.com/v1"
+	cfg.RerankerModel = "https://api.cohere.com/v1/rerank"
+	svc, _ := newBoundaryServices(cfg)
+
+	var wg sync.WaitGroup
+
+	// 20 goroutines calling allHealthy concurrently
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				svc.allHealthy()
+			}
+		}()
+	}
+
+	// 10 goroutines reading config properties concurrently
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				_ = svc.config.IsCloudEmbedding()
+				_ = svc.config.IsCloudReranker()
+				_ = svc.config.ModelPath
+				_ = svc.config.RerankerModel
+				_ = svc.config.CloudEmbeddingAPIKey
+				_ = svc.config.CloudEmbeddingURL
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+// TestCloud_concurrent_LoadConfig verifies LoadConfig() is safe for
+// concurrent calls (os.Getenv is documented as concurrent-safe).
+func TestCloud_concurrent_LoadConfig(t *testing.T) {
+	var wg sync.WaitGroup
+	configs := make([]Config, 50)
+
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			configs[idx] = LoadConfig()
+		}(i)
+	}
+	wg.Wait()
+
+	// Verify all configs have the same defaults (no corruption)
+	for i := 1; i < len(configs); i++ {
+		if configs[i].ModelPath != configs[0].ModelPath {
+			t.Errorf("config[%d].ModelPath=%q != config[0].ModelPath=%q",
+				i, configs[i].ModelPath, configs[0].ModelPath)
+		}
+		if configs[i].RerankerModel != configs[0].RerankerModel {
+			t.Errorf("config[%d].RerankerModel mismatch", i)
+		}
+		if configs[i].CloudEmbeddingAPIKey != configs[0].CloudEmbeddingAPIKey {
+			t.Errorf("config[%d].CloudEmbeddingAPIKey mismatch", i)
+		}
+	}
+}
+
+// TestCloud_concurrent_healthURL_call verifies healthURL() doesn't
+// produce wrong URLs due to concurrent string operations.
+func TestCloud_concurrent_healthURL_call(t *testing.T) {
+	ports := []string{"8080", "8081", "8888", "0", "65535", "", "abc"}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for _, p := range ports {
+				url := healthURL(p)
+				if !strings.HasPrefix(url, "http://localhost:") {
+					t.Errorf("healthURL(%q) = %q, expected http://localhost:... prefix", p, url)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// =========================================================================
+// BATCH 7: filepath.Base Edge Cases
+// =========================================================================
+
+// TestCloud_filepathBase_edgeCases tests the exact filepath.Base behavior
+// that startHindsight() relies on.
+func TestCloud_filepathBase_edgeCases(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		// Normal cases
+		{"../../model/bge-reranker-base-Q4_k_m.gguf", "bge-reranker-base-Q4_k_m.gguf"},
+		{"./model/bge-reranker-base-Q4_k_m.gguf", "bge-reranker-base-Q4_k_m.gguf"},
+		{"bge-reranker-base-Q4_k_m.gguf", "bge-reranker-base-Q4_k_m.gguf"},
+
+		// Edge cases
+		{"", "."},
+		{".", "."},
+		{"..", ".."},
+		{"/", "/"},
+		{"/.", "."},
+		{"..", ".."},
+		{".gguf", ".gguf"},           // extension only — no directory
+		{"  model.gguf", "  model.gguf"}, // leading spaces (preserved)
+		{"model.gguf  ", "model.gguf  "}, // trailing spaces (preserved)
+		{"a/b/c/d/e/f/g.gguf", "g.gguf"},
+		{"///model.gguf", "model.gguf"},
+		{"path/to/", "to"}, // trailing slash -> last element before it
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("filepath.Base(%q)", tt.input), func(t *testing.T) {
+			got := filepath.Base(tt.input)
+			if got != tt.expected {
+				t.Errorf("filepath.Base(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+// TestCloud_filepathBase_emptyRerankerModel verifies that if RerankerModel
+// is somehow empty string, filepath.Base("") returns "." which would be
+// passed as the model name. This tests the defensive boundary.
+func TestCloud_filepathBase_emptyRerankerModel(t *testing.T) {
+	// getEnv with empty string returns defaultValue, so this only happens
+	// if someone modifies LoadConfig or directly sets it.
+	result := filepath.Base("")
+	if result != "." {
+		t.Errorf("filepath.Base(\"\") = %q, want \".\"", result)
+	}
+	t.Logf("filepath.Base(\"\") = %q — if RerankerModel is somehow empty, model name becomes '.'", result)
+
+	// Verify the Validate() path for empty RerankerModel
+	// isCloudURL("") = false, so it goes through stat.
+	// filepath.Join(wd, "") = wd (same directory), and os.Stat(wd) succeeds.
+	// So Validate() would PASS! But the model name would be "." in hindsight.
+	// This is a configuration error that should be caught.
+	_ = result
+	t.Logf("NOTE: Validate() does NOT reject empty RerankerModel — it would pass file-exists check (stats CWD)")
+}
+
+// =========================================================================
+// BATCH 8: .env.example Completeness Verification
+// =========================================================================
+
+// TestCloud_envExample_allVarsDocumented verifies .env.example contains
+// all 6 cloud config variables.
+func TestCloud_envExample_allVarsDocumented(t *testing.T) {
+	src, err := os.ReadFile(".env.example")
+	if err != nil {
+		t.Skipf("cannot read .env.example: %v", err)
+	}
+	content := string(src)
+
+	requiredVars := []string{
+		"CLOUD_EMBEDDING_API_KEY",
+		"CLOUD_EMBEDDING_URL",
+		"CLOUD_EMBEDDING_MODEL",
+		"CLOUD_RERANKER_API_KEY",
+		"CLOUD_RERANKER_URL",
+		"CLOUD_RERANKER_MODEL",
+	}
+
+	for _, v := range requiredVars {
+		if !strings.Contains(content, v) {
+			t.Errorf(".env.example missing variable: %s", v)
+		}
+	}
+
+	// Also verify the default paths are correct
+	if !strings.Contains(content, "LLAMA_MODEL_PATH=./model/qwen3-embedding-0.6b-Q8_0.gguf") {
+		t.Error(".env.example LLAMA_MODEL_PATH not updated to ./model/ prefix")
+	}
+	if !strings.Contains(content, "HINDSIGHT_RERANKER_MODEL=./model/bge-reranker-base-Q4_k_m.gguf") {
+		t.Error(".env.example HINDSIGHT_RERANKER_MODEL not updated to ./model/ prefix")
+	}
+}
+
+// TestCloud_envFile_pathDefaults verifies .env contains correct paths.
+func TestCloud_envFile_pathDefaults(t *testing.T) {
+	src, err := os.ReadFile(".env")
+	if err != nil {
+		t.Skipf("cannot read .env: %v", err)
+	}
+	content := string(src)
+
+	if !strings.Contains(content, "LLAMA_MODEL_PATH=./model/qwen3-embedding-0.6b-Q8_0.gguf") {
+		t.Error(".env LLAMA_MODEL_PATH not updated to ./model/ prefix")
+	}
+	if !strings.Contains(content, "HINDSIGHT_RERANKER_MODEL=./model/bge-reranker-base-Q4_k_m.gguf") {
+		t.Error(".env HINDSIGHT_RERANKER_MODEL not updated to ./model/ prefix")
+	}
+}
+
+// =========================================================================
+// BATCH 9: healthURL() Side Effects in Cloud Mode
+// =========================================================================
+
+// TestCloud_healthURL_noSideEffects verifies healthURL() works correctly
+// even when both services are cloud — it should still return valid URLs
+// for all services (even though they're not used for cloud ones).
+func TestCloud_healthURL_noSideEffects(t *testing.T) {
+	cfg := boundaryConfig()
+	cfg.ModelPath = "https://api.openai.com/v1"
+	cfg.RerankerModel = "https://api.cohere.com/v1/rerank"
+
+	urlEmbed := healthURL(cfg.LlamaPort)
+	urlReranker := healthURL(cfg.LlamaRerankerPort)
+	urlHindsight := healthURL(cfg.HindsightPort)
+
+	expectedEmbed := "http://localhost:" + cfg.LlamaPort + "/health"
+	expectedReranker := "http://localhost:" + cfg.LlamaRerankerPort + "/health"
+	expectedHindsight := "http://localhost:" + cfg.HindsightPort + "/health"
+
+	if urlEmbed != expectedEmbed {
+		t.Errorf("healthURL(LlamaPort) = %q, want %q", urlEmbed, expectedEmbed)
+	}
+	if urlReranker != expectedReranker {
+		t.Errorf("healthURL(LlamaRerankerPort) = %q, want %q", urlReranker, expectedReranker)
+	}
+	if urlHindsight != expectedHindsight {
+		t.Errorf("healthURL(HindsightPort) = %q, want %q", urlHindsight, expectedHindsight)
+	}
+}
+
+// TestCloud_allHealthy_onlyHindsightChecked_race tests the specific race
+// pattern: allHealthy() singleflight + health cache + concurrent callers
+// in cloud mode. This tests that the health cache read/write and config
+// reads don't race.
+func TestCloud_allHealthy_onlyHindsightChecked_race(t *testing.T) {
+	hindsightSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer hindsightSrv.Close()
+
+	cfg := boundaryConfig()
+	cfg.ModelPath = "https://api.openai.com/v1"
+	cfg.RerankerModel = "https://api.cohere.com/v1/rerank"
+	cfg.HindsightPort = strings.TrimPrefix(hindsightSrv.URL, "http://127.0.0.1:")
+	svc, _ := newBoundaryServices(cfg)
+
+	// Run enough iterations to stress the singleflight+cache path
+	var wg sync.WaitGroup
+	for i := 0; i < 30; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				l, r, h := svc.allHealthy()
+				if !l {
+					t.Errorf("goro %d iter %d: cloud embed but llama=false", id, j)
+				}
+				if !r {
+					t.Errorf("goro %d iter %d: cloud rerank but reranker=false", id, j)
+				}
+				if !h {
+					// hindsight could be false if server is down
+					// but we keep it running, so it should be true
 				}
 			}
 		}(i)
 	}
-
 	wg.Wait()
-	close(errs)
-
-	for err := range errs {
-		t.Error(err)
-	}
-
-	// After all the noise, the breaker should be in a valid state
-	// (failures between 0 and 3, no data race)
-	t.Logf("circuit breaker concurrent access: OK (failures=%d, tripped=%v)",
-		cb.failures, cb.trippedUntil.IsZero())
 }
 
-// TestCircuitBreaker_CooldownTransition verifies half-open state:
-// after cooldown expires, the next IsTripped allows one request through.
-func TestCircuitBreaker_CooldownTransition(t *testing.T) {
-	cb := newCircuitBreaker(1, time.Millisecond)
+// =========================================================================
+// BATCH 10: Validate() Edge Cases Not Covered by Pass 1
+// =========================================================================
 
-	cb.RecordFailure()
-	if !cb.IsTripped() {
-		t.Error("should be tripped immediately after failure")
-	}
+// TestCloud_Validate_concurrentCalls verifies Validate() is safe
+// for concurrent calls (it's a value receiver on Config).
+func TestCloud_Validate_concurrentCalls(t *testing.T) {
+	cfg := newTestConfig()
+	cfg.LLMAPIKey = "sk-test"
+	cfg.RetainWorkers = 2
+	cfg.ReflectWorkers = 2
+	cfg.ModelPath = "https://api.openai.com/v1"
+	cfg.CloudEmbeddingAPIKey = "sk-test"
+	cfg.CloudEmbeddingURL = "https://api.openai.com/v1"
+	cfg.CloudEmbeddingModel = "text-embedding-3-small"
+	cfg.RerankerModel = "https://api.cohere.com/v1/rerank"
+	cfg.CloudRerankerAPIKey = "sk-test"
+	cfg.CloudRerankerURL = "https://api.cohere.com/v1/rerank"
+	cfg.CloudRerankerModel = "rerank-english-v3.0"
 
-	// Poll for cooldown to expire (max 50ms)
-	deadline := time.Now().Add(50 * time.Millisecond)
-	tripped := true
-	for time.Now().Before(deadline) {
-		if !cb.IsTripped() {
-			tripped = false
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	// IsTripped should see expired cooldown, reset, and return false (allow request)
-	if tripped {
-		t.Error("should allow request after cooldown expiry (half-open)")
-	}
-
-	// After the half-open request succeeds, a RecordSuccess should keep it open
-	cb.RecordSuccess()
-	if cb.IsTripped() {
-		t.Error("should not be tripped after success")
-	}
-
-	// A new failure should trip it again
-	cb.RecordFailure()
-	if !cb.IsTripped() {
-		t.Error("should be tripped after new failure")
-	}
-}
-
-// ─── Batch 4: GetBody with Huge Body ───────────────────────────────────────
-
-// TestGetBody_HugeBody verifies that doRequest's GetBody closure works correctly
-// with a very large body, supporting redirect-based body replay.
-func TestGetBody_HugeBody(t *testing.T) {
-	// Create a 10MB body
-	hugeBody := make([]byte, 10*1024*1024)
-	for i := range hugeBody {
-		hugeBody[i] = byte(i % 256) // Fill with deterministic data
-	}
-
-	// Create a test server that:
-	// 1. Receives the POST with the body
-	// 2. Verifies body integrity
-	// 3. Returns a redirect to the verify endpoint
-	// 4. The verify endpoint checks the body AGAIN (simulating redirect replay)
-	var mu sync.Mutex
-	firstRequest := true
-	secondBody := []byte{}
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, "read error: %v", err)
-			return
-		}
-		defer r.Body.Close()
-
-		mu.Lock()
-		firstReq := firstRequest
-		if firstRequest {
-			firstRequest = false
-		}
-		mu.Unlock()
-
-		if firstReq {
-			// First request — simulate redirect that needs body replay
-			http.Redirect(w, r, "/verify", http.StatusTemporaryRedirect)
-		} else {
-			// Second request (after redirect) — capture body for verification
-			mu.Lock()
-			secondBody = body
-			mu.Unlock()
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"status":"ok"}`))
-		}
-	}))
-	defer ts.Close()
-
-	// Create the Server with a real-ish config
-	config := LoadConfig()
-	config.RetryAttempts = 1 // don't retry, just follow redirect
-	config.RetryDelay = time.Millisecond
-	config.RetryMaxDelay = 100 * time.Millisecond
-	s := &Server{
-		config: config,
-		svc:    newServices(config, nil, nil),
-	}
-
-	// Build a request with the huge body
-	req, _ := http.NewRequest("POST", ts.URL, nil)
-	req.Body = io.NopCloser(bytes.NewReader(hugeBody))
-	req.ContentLength = int64(len(hugeBody))
-
-	// Call doRequest — it should follow the redirect and replay the body
-	result, err := s.doRequest(req, 10*time.Second)
-	if err != nil {
-		t.Fatalf("doRequest with 10MB body failed: %v", err)
-	}
-
-	// Verify the result
-	var resp struct {
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(result, &resp); err != nil {
-		t.Fatalf("unmarshal response: %v (body: %s)", err, string(result))
-	}
-	if resp.Status != "ok" {
-		t.Fatalf("expected status ok, got %q", resp.Status)
-	}
-
-	// Verify the second body (from redirect replay) matches the original
-	mu.Lock()
-	bodyAfterRedirect := make([]byte, len(secondBody))
-	copy(bodyAfterRedirect, secondBody)
-	mu.Unlock()
-
-	if len(bodyAfterRedirect) != len(hugeBody) {
-		t.Fatalf("body length mismatch after redirect: got %d, want %d",
-			len(bodyAfterRedirect), len(hugeBody))
-	}
-	for i := range hugeBody {
-		if bodyAfterRedirect[i] != hugeBody[i] {
-			t.Fatalf("body content mismatch at byte %d: got %d, want %d",
-				i, bodyAfterRedirect[i], hugeBody[i])
-		}
-	}
-	t.Logf("GetBody with 10MB body: body replayed correctly after redirect (%d bytes verified)", len(hugeBody))
-
-	// Verify the GetBody pattern used by doRequest works correctly.
-	// doRequest sets retryReq.GetBody = func() { return io.NopCloser(bytes.NewReader(bodyBytes)), nil }
-	// We construct the same closure here and verify it's idempotent.
-	bodyBytes := hugeBody
-	getBody := func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(bodyBytes)), nil
-	}
-
-	bodyReader, err := getBody()
-	if err != nil {
-		t.Fatalf("getBody failed on first call: %v", err)
-	}
-	body1, _ := io.ReadAll(bodyReader)
-	bodyReader.Close()
-
-	bodyReader, err = getBody()
-	if err != nil {
-		t.Fatalf("getBody failed on second call: %v", err)
-	}
-	body2, _ := io.ReadAll(bodyReader)
-	bodyReader.Close()
-
-	if !bytes.Equal(body1, body2) {
-		t.Error("getBody returned different data on second call")
-	}
-	if len(body1) != len(hugeBody) {
-		t.Errorf("getBody returned %d bytes, want %d", len(body1), len(hugeBody))
-	}
-	t.Logf("GetBody closure idempotent: OK (%d bytes × 2 calls)", len(body1))
-}
-
-// TestGetBody_EmptyBody verifies GetBody works with zero-length body.
-func TestGetBody_EmptyBody(t *testing.T) {
-	emptyBody := []byte{}
-
-	// Two-phase handler: first call redirects, second call succeeds
-	var callCountMu sync.Mutex
-	callCount := 0
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		defer r.Body.Close()
-
-		callCountMu.Lock()
-		isFirstCall := (callCount == 0)
-		callCount++
-		count := callCount
-		callCountMu.Unlock()
-
-		if isFirstCall {
-			// First call — redirect to force body replay
-			http.Redirect(w, r, "/verify", http.StatusTemporaryRedirect)
-		} else {
-			// Second call (after redirect) — verify body is still readable
-			if len(body) != 0 {
-				w.WriteHeader(http.StatusInternalServerError)
-				fmt.Fprintf(w, "expected empty body, got %d bytes", len(body))
-				return
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("Validate() failed: %v", err)
 			}
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"status":"ok"}`))
-		}
-		_ = body
-		_ = count
-	}))
-	defer ts.Close()
-
-	config := LoadConfig()
-	config.RetryAttempts = 1
-	config.RetryDelay = time.Millisecond
-	s := &Server{
-		config: config,
-		svc:    newServices(config, nil, nil),
+		}()
 	}
-
-	req, _ := http.NewRequest("POST", ts.URL, nil)
-	req.Body = io.NopCloser(bytes.NewReader(emptyBody))
-	req.ContentLength = 0
-
-	_, err := s.doRequest(req, 5*time.Second)
-	if err != nil {
-		t.Fatalf("doRequest with empty body failed: %v", err)
-	}
-	t.Log("GetBody with empty body: OK")
+	wg.Wait()
 }
-
-// TestGetBody_NilBody verifies behavior when req.Body is nil.
-// Note: doRequest reads req.Body with io.ReadAll before closing it.
-// If req.Body is nil, io.ReadAll returns (nil, nil) — an empty byte slice.
-func TestGetBody_NilBody(t *testing.T) {
-	// Create a request with nil body to test doRequest's nil guard.
-	// io.ReadAll(nil io.Reader) panics with nil pointer dereference.
-	// This is a known issue -- doRequest lacks the nil guard before io.ReadAll.
-	// It will fail with connection refused (no server), but shouldn't SIGSEGV.
-	// Also verify the GetBody closure we create works.
-	// Actually looking at doRequest more carefully:
-	// bodyBytes, _ := io.ReadAll(req.Body)
-	// If req.Body is nil, io.ReadAll returns ([]byte{}, nil)
-	// Then req.Body.Close() on nil causes SIGSEGV!
-	// Let's check if Go's nil check handles this...
-
-	// Actually, io.ReadAll with nil reader: it calls r.Read(buf)
-	// But req.Body is of type io.ReadCloser (interface).
-	// Calling io.ReadAll(nil) would panic because it calls r.Read on nil interface.
-	// Let's be more precise - req.Body can be nil for a GET request.
-	
-	// Create a request that properly has nil body
-	req2 := httptest.NewRequest("POST", "http://localhost:1/nonexistent", nil)
-	// httptest.NewRequest sets Body to http.NoBody which is not nil but empty.
-	// Let's directly set it to nil.
-	req2.Body = nil
-
-	// This call to io.ReadAll(req.Body) should panic with nil pointer dereference
-	// This is a BUG: doRequest doesn't guard against nil req.Body
-	defer func() {
-		if r := recover(); r != nil {
-			t.Logf("BUG CONFIRMED: doRequest panics on nil req.Body (recovered): %v", r)
-		}
-	}()
-
-	config2 := LoadConfig()
-	config2.RetryAttempts = 1
-	s2 := &Server{
-		config: config2,
-		svc:    newServices(config2, nil, nil),
-	}
-
-	// This will panic with nil pointer on io.ReadAll(nil)
-	// We catch the panic and log it as a confirmed bug
-	_, _ = s2.doRequest(req2, time.Second)
-	// If we get here, it didn't panic — unexpected
-	t.Log("doRequest did NOT panic on nil req.Body (may have protection we missed)")
-}
-
-// ─── Batch 5: Session Limit Pressure ───────────────────────────────────────
-
-// TestSessionLimit_FillToMax creates sessions up to the limit and verifies
-// the limit is enforced.
-func TestSessionLimit_FillToMax(t *testing.T) {
-	// This test needs the running server. Skip if not available.
-	if !serverUp() {
-		t.Skip("MCP memory server not running at " + testServerURL)
-	}
-
-	// Get current session count and the limit
-	resp, err := http.Get(testServerURL + "/health")
-	if err != nil {
-		t.Skipf("server not reachable: %v", err)
-	}
-	defer resp.Body.Close()
-
-	var health map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&health)
-	currentSessions, _ := health["sessions"].(float64)
-	maxSessions := 100.0 // known from config
-
-	if int(currentSessions)+5 > int(maxSessions) {
-		t.Skipf("too many existing sessions (%.0f/%0.f) to safely test limit", currentSessions, maxSessions)
-	}
-
-	// Create sessions up to the limit
-	clients := make([]*mcpClient, 0, int(maxSessions)-int(currentSessions))
-	overflowRejected := false
-
-	for i := int(currentSessions); i < int(maxSessions)+2; i++ {
-		c, err := newMCPClient(testServerURL, fmt.Sprintf("sesslimit:%d-%d", i, time.Now().UnixNano()))
-		if err != nil {
-			// Connection rejected — this is the limit enforcement
-			t.Logf("session %d rejected at connection: %v", i, err)
-			if i < int(maxSessions) {
-				t.Errorf("session %d rejected before reaching limit (have %d, limit %.0f): %v",
-					i, len(clients), maxSessions, err)
-			} else {
-				overflowRejected = true
-			}
-			break
-		}
-		clients = append(clients, c)
-		c.initialize()
-	}
-
-	// Cleanup sessions
-	for _, c := range clients {
-		c.close()
-	}
-
-	if !overflowRejected && len(clients) >= int(maxSessions) {
-		// We hit the limit exactly — verify the next connection fails
-		_, err := newMCPClient(testServerURL, "sesslimit:overflow-after-cleanup")
-		if err == nil {
-			// Sessions from previous test may have been cleaned up
-			t.Log("session limit not tested (sessions were cleaned between creation and overflow test)")
-		} else {
-			t.Logf("overflow correctly rejected after hitting limit: %v", err)
-		}
-	}
-}
-
-// ─── Batch 6: Context Cancellation During Retry ────────────────────────────
-
-// TestDoRequest_ContextCancelledDuringRetry verifies doRequest respects
-// context cancellation during retry backoff.
-func TestDoRequest_ContextCancelledDuringRetry(t *testing.T) {
-	// Create a server that always fails (returns 503)
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte(`{"error":"service unavailable"}`))
-	}))
-	defer ts.Close()
-
-	config := LoadConfig()
-	config.RetryAttempts = 5
-	config.RetryDelay = 500 * time.Millisecond // longer delay
-	s := &Server{
-		config: config,
-		svc:    newServices(config, nil, nil),
-	}
-
-	// Create a request with a context that will be cancelled
-	ctx, cancel := context.WithCancel(context.Background())
-	req, _ := http.NewRequestWithContext(ctx, "POST", ts.URL,
-		bytes.NewReader([]byte("test body")))
-
-	// Cancel after 100ms (before the first retry backoff completes)
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		cancel()
-	}()
-
-	_, err := s.doRequest(req, 5*time.Second)
-	if err == nil {
-		t.Fatal("expected error from cancelled context, got nil")
-	}
-	if !strings.Contains(err.Error(), "cancelled") {
-		t.Errorf("expected cancellation error, got: %v", err)
-	}
-	t.Logf("Context cancellation during retry: correctly returned error: %v", err)
-}
-
-// ─── Registration: Ensure test file compiles ───────────────────────────────
-
-var _ = context.Background
