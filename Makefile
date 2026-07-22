@@ -28,12 +28,13 @@ vet:
 	go vet ./...
 
 download-llama:
-	@if [ -x vendor/bin/llama-server ]; then \
+	@set -eo pipefail; \
+	if [ -x vendor/bin/llama-server ]; then \
 		echo "llama-server already downloaded."; \
 		exit 0; \
-	fi
-	@echo "Downloading llama-server $(LLAMA_VERSION)..."
-	@case $$(uname -s) in \
+	fi; \
+	echo "Downloading llama-server $(LLAMA_VERSION)..."; \
+	case $$(uname -s) in \
 		Darwin) OSNAME=macos ;; \
 		Linux)  OSNAME=ubuntu ;; \
 		*)      echo "Unsupported platform: $$(uname -s). Install llama-server manually or set LLAMA_PATH."; exit 1 ;; \
