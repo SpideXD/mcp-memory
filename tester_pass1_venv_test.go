@@ -493,7 +493,7 @@ func TestVenv_Gitignore_Patterns(t *testing.T) {
 	expectedPatterns := []string{
 		".venv/",
 		"bin/*",
-		"mcp-memory",
+		"/mcp-memory",
 		"logs/*",
 	}
 	for _, exp := range expectedPatterns {

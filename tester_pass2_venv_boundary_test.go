@@ -82,13 +82,30 @@ func TestVenv_Boundary_Makefile_PipFails(t *testing.T) {
 	lines := strings.Split(mkStr, "\n")
 	var pipLine string
 	foundSetup := false
+	var continuation strings.Builder
+	inContinuation := false
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "setup:" {
 			foundSetup = true
 			continue
 		}
+		if foundSetup && inContinuation {
+			// Accumulate continuation lines (lines after \)
+			continuation.WriteString(" ")
+			continuation.WriteString(trimmed)
+			if !strings.HasSuffix(trimmed, "\\") {
+				pipLine = continuation.String()
+				break
+			}
+			continue
+		}
 		if foundSetup && strings.Contains(trimmed, "pip install") {
+			if strings.HasSuffix(trimmed, "\\") {
+				continuation.WriteString(strings.TrimSuffix(trimmed, "\\"))
+				inContinuation = true
+				continue
+			}
 			pipLine = trimmed
 			break
 		}
