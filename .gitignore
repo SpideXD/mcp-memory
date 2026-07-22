@@ -19,3 +19,7 @@ logs/*
 
 # macOS
 .DS_Store
+
+# SDLC development artifacts
+.agents/
+state/
