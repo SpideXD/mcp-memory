@@ -16,14 +16,23 @@ mcp/memory/
 +-- mcp.go             MCP protocol helpers (SSE write)
 +-- errors.go          Error constructors
 +-- alerts.go          Alert client (webhook notifications)
-+-- stop.sh            Graceful shutdown script
 +-- deep_test.go       Deep integration tests
 +-- e2e_test.go        End-to-end tests
++-- tester_pass1_venv_test.go        Vendor .venv discovery tests
++-- tester_pass1_download_test.go    llama-server download tests
++-- tester_pass2_boundary_test.go    Boundary tests
++-- tester_pass2_venv_boundary_test.go       Venv boundary tests
++-- tester_pass2_download_boundary_test.go   Download boundary tests
++-- tester_cloud_adversarial_test.go  Cloud adversarial tests
++-- tester_adversarial_test.go       Adversarial tests
++-- Makefile           Build, test, setup, download targets
++-- scripts/           start.sh, stop.sh convenience scripts
 +-- worker/            Worker pool package
 +-- logger/            Structured logging
 +-- metrics/           Counters, timers, gauges
 +-- logs/              Runtime logs (gitignored)
 +-- .env.example       Config template
++-- .gitignore         Git ignore rules
 +-- docs/              Documentation
 ```
 
@@ -38,19 +47,23 @@ mcp/memory/
 ## Quick Reference
 
 ```bash
-make setup    # Create .venv, install hindsight-api-slim
-make run      # Start server (llama.cpp + Hindsight + MCP)
-make build    # Build binary to bin/mcp-memory
-make test     # Run all tests with race detector
-make stop     # Graceful shutdown
-make clean    # Remove .venv and build artifacts
+make setup           # Create .venv, install Hindsight, download llama-server + models
+make run             # Start server (auto-starts llama.cpp + Hindsight + MCP)
+make build           # Build binary to bin/mcp-memory
+make test            # Run all tests with race detector (-race -timeout 240s)
+make vet             # Run go vet static analysis
+make stop            # Graceful shutdown
+make clean           # Remove .venv, build artifacts, and bin/llama/
+make download-llama  # Download platform-specific llama-server binary
+make download-models # Download GGUF model files from Hugging Face
 ```
 
 ## Testing
 
 ```bash
-# All tests
-go test ./...
+# All tests (race detector + 240s timeout) — primary
+make test
+# Expands to: go test -race -count=1 -timeout 240s ./...
 
 # Specific package
 go test ./worker/...
@@ -58,11 +71,14 @@ go test ./worker/...
 # E2E (requires running server)
 go test -v -run "TestStress" -count=1
 
-# Race detector
+# Race detector (single test)
 go test -race -run "TestConcurrent" -count=1
 
 # Single test
 go test -run "TestSingleAgent" -v
+
+# Static analysis
+make vet
 ```
 
 ## Conventions
@@ -138,9 +154,16 @@ worker.Start():
 ### Cloud Embedding Detection
 ```
 Validate():
+  if c.IsCloudEmbedding() {
+    // Requires 3 env vars: CLOUD_EMBEDDING_API_KEY, CLOUD_EMBEDDING_URL, CLOUD_EMBEDDING_MODEL
+  }
+  if c.IsCloudReranker() {
+    // Requires 3 env vars: CLOUD_RERANKER_API_KEY, CLOUD_RERANKER_URL, CLOUD_RERANKER_MODEL
+  }
   for _, path := range []string{c.ModelPath, c.RerankerModel} {
     if len(path) > 7 && (path[:7] == "http://" || path[:8] == "https://") {
-      continue  // skip file existence check for cloud endpoints
+      // Cloud mode: skip local file existence check, validate cloud vars instead
+      continue
     }
     // check file exists
   }

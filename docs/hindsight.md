@@ -15,12 +15,14 @@ hindsight-client:   0.8.2
 make setup
 ```
 
-This creates a `.venv/` virtual environment and installs the pinned versions:
+This creates a `.venv/` virtual environment, installs the pinned versions, and downloads llama-server + GGUF model files:
 
 ```
 hindsight-api-slim==0.8.2
 hindsight-client==0.8.2
 ```
+
+llama-server is downloaded to `bin/llama/`. Models are downloaded to `model/`.
 
 ## MCP Memory Configuration
 
@@ -40,6 +42,22 @@ HINDSIGHT_API_RERANKER_PROVIDER=cohere
 HINDSIGHT_API_RERANKER_COHERE_API_KEY=not-needed
 HINDSIGHT_API_RERANKER_COHERE_BASE_URL=http://localhost:8081/v1/rerank
 HINDSIGHT_API_RERANKER_COHERE_MODEL=bge-reranker-base-Q4_k_m.gguf
+```
+
+### Cloud Mode Configuration
+
+When using cloud endpoints (`LLAMA_MODEL_PATH` or `HINDSIGHT_RERANKER_MODEL` set to HTTP/HTTPS URLs), the following environment variables change:
+
+```bash
+# Embedding: cloud API key and URL instead of local llama.cpp
+HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY=$CLOUD_EMBEDDING_API_KEY
+HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL=$CLOUD_EMBEDDING_URL
+HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL=$CLOUD_EMBEDDING_MODEL
+
+# Reranker: cloud API key and URL instead of local llama.cpp
+HINDSIGHT_API_RERANKER_COHERE_API_KEY=$CLOUD_RERANKER_API_KEY
+HINDSIGHT_API_RERANKER_COHERE_BASE_URL=$CLOUD_RERANKER_URL
+HINDSIGHT_API_RERANKER_COHERE_MODEL=$CLOUD_RERANKER_MODEL
 ```
 
 ## Key Design Decisions

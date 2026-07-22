@@ -9,11 +9,11 @@ Standalone Go MCP server that proxies memory operations to Hindsight. Supports N
 
 ```bash
 cp .env.example .env    # Edit with your OpenRouter key
-make setup              # Create .venv and install hindsight-api-slim
-make run                # Starts llama.cpp + Hindsight + MCP server
+make setup              # Creates .venv, installs Hindsight, downloads llama-server + models
+make run                # Starts server (auto-starts llama.cpp + Hindsight + MCP as child processes)
 ```
 
-**Prerequisites:** llama-server (brew), Python 3.12+, OpenRouter API key.
+**Prerequisites:** Python 3.12+, Go 1.26+, OpenRouter API key. `make setup` handles everything else (llama-server download, model download, Hindsight .venv).
 
 To stop: `make stop` or `./scripts/stop.sh`
 
@@ -27,7 +27,7 @@ Reranking: llama.cpp (bge-reranker-base, q8_0 cache) or cloud endpoint
 LLM:       DeepSeek V4 Flash via OpenRouter
 ```
 
-Three independent services managed as child processes with health watchdog and auto-restart. Cloud embedding/reranker endpoints (HTTP/HTTPS URLs) skip local process management.
+Three independent services managed as child processes with health watchdog and auto-restart. Cloud embedding/reranker endpoints (HTTP/HTTPS URLs) skip local process management, using the 6 `CLOUD_*` env vars (see Configuration below).
 
 ## Endpoints
 
@@ -75,8 +75,8 @@ All via environment variables. See `.env.example` for full reference.
 | Key groups | Examples |
 |-----------|---------|
 | Server | `MCP_PORT=8899`, `MCP_HOST=0.0.0.0` |
-| llama.cpp | `LLAMA_PORT=8080`, `LLAMA_MODEL_PATH=...`, `LLAMA_GPU_LAYERS=999` |
-| Hindsight | `HINDSIGHT_PORT=8888`, `HINDSIGHT_LLM_PROVIDER=openrouter` |
+| llama.cpp | `LLAMA_PATH=./bin/llama/llama-server`, `LLAMA_PORT=8080`, `LLAMA_MODEL_PATH=...`, `LLAMA_GPU_LAYERS=999` |
+| Hindsight | `HINDSIGHT_PATH=hindsight-api`, `HINDSIGHT_PORT=8888`, `HINDSIGHT_LLM_PROVIDER=openrouter` |
 | Workers | `MEMORY_RETAIN_WORKERS=2`, `MEMORY_REFLECT_WORKERS=2` |
 | Sessions | `MCP_MAX_SESSIONS=100`, `MCP_SESSION_IDLE=30m` |
 | Health | `HEALTH_CHECK_INTERVAL=5s`, `HEALTH_CONSECUTIVE_FAILURES=2` |
@@ -84,15 +84,18 @@ All via environment variables. See `.env.example` for full reference.
 | Circuit Breaker | `HINDSIGHT_CIRCUIT_BREAKER_THRESHOLD=5`, `HINDSIGHT_CIRCUIT_BREAKER_COOLDOWN=30s` |
 | Content | `MAX_CONTENT_BYTES=1048576` |
 | Retry | `MCP_RETRY_MAX_DELAY=30s` |
+| Cloud Embedding | `CLOUD_EMBEDDING_API_KEY`, `CLOUD_EMBEDDING_URL`, `CLOUD_EMBEDDING_MODEL` |
+| Cloud Reranker | `CLOUD_RERANKER_API_KEY`, `CLOUD_RERANKER_URL`, `CLOUD_RERANKER_MODEL` |
 
 ## Deployment
 
 ```bash
-# Setup (one-time)
-make setup              # Creates .venv, installs hindsight-api-slim
+# One-command setup & run (primary)
+make setup && make run
 
-# Start
-make run
+# Or step by step:
+make setup              # Creates .venv, installs Hindsight, downloads llama-server + models
+make run                # Starts server (auto-starts llama.cpp + Hindsight + MCP)
 
 # Stop (graceful)
 make stop
@@ -100,6 +103,9 @@ make stop
 # Build binary
 make build
 ./bin/mcp-memory
+
+# Convenience scripts (secondary)
+./scripts/start.sh
 ```
 
 ## File Structure
@@ -118,27 +124,34 @@ mcp/memory/
 +-- mcp.go             MCP protocol helpers (SSE write)
 +-- errors.go          Error types
 +-- alerts.go          Alert client (webhook notifications)
-+-- stop.sh            Graceful shutdown script
++-- Makefile           Build, test, setup, download targets
++-- scripts/           Start and stop convenience scripts
 +-- worker/            Tested worker pool package
 +-- logger/            Structured logging
 +-- metrics/           Counters, timers, gauges
 +-- logs/              Runtime logs (gitignored)
++-- bin/               Downloaded llama-server binary
++-- model/             Downloaded GGUF model files
 +-- .env               Secrets (gitignored)
 +-- .env.example       Config template
++-- .gitignore         Git ignore rules
 +-- docs/              This folder
 ```
 
 ## Testing
 
 ```bash
-# Unit tests
-go test ./...
+# All tests (race detector, 240s timeout) -- primary
+make test
+
+# Equivalent to:
+go test -race -count=1 -timeout 240s ./...
 
 # E2E tests (requires running server)
 go test -v -run "TestConcurrent|TestStress|TestRace"
 
-# With race detector
-go test -race -run "TestStress" -count=1
+# Static analysis
+make vet
 ```
 
 ## Health & Observability
@@ -149,8 +162,13 @@ curl http://localhost:8899/health
 # Returns:
 {
   "status": "running",
+  "version": "dev",
+  "built": "unknown",
   "hindsight": true, "llama": true, "reranker": true,
+  "down": [],
   "queue_depth": 0, "sessions": 2,
+  "panics_total": 0,
+  "uptime": "5m30s",
   "metrics": {
     "memory.recall_count": 142, "memory.retain_count": 23,
     "memory.retain_duration_p99": "30s",

@@ -86,9 +86,10 @@
 
 ### Cloud Embedding/Reranker Support (`services.go`, `config.go`)
 - `LLAMA_MODEL_PATH` and `HINDSIGHT_RERANKER_MODEL` accept HTTP/HTTPS URLs
-- When URL detected: skips local llama.cpp process management
-- Hindsight configured to use remote endpoint directly
-- Useful for cloud embedding services (OpenAI, Cohere, etc.)
+- When URL detected: `IsCloudEmbedding()` / `IsCloudReranker()` validate the 6 `CLOUD_*` env vars are set
+- Required embedding vars: `CLOUD_EMBEDDING_API_KEY`, `CLOUD_EMBEDDING_URL`, `CLOUD_EMBEDDING_MODEL`
+- Required reranker vars: `CLOUD_RERANKER_API_KEY`, `CLOUD_RERANKER_URL`, `CLOUD_RERANKER_MODEL`
+- Skips local llama.cpp process management, Hindsight configured to use remote endpoint directly
 
 ### Orphan Recovery (`pids.go`)
 - `savePids()` runs after services start, writes `logs/.mcp-pids.json`
@@ -123,6 +124,13 @@ Agent -> POST /mcp/message -> goroutine -> s.queueJob(retainJobs, ...)
 ```
 Same as retain but through reflectJobs channel and /reflect endpoint.
 ```
+
+### Cloud Mode Data Flow
+When `LLAMA_MODEL_PATH` or `HINDSIGHT_RERANKER_MODEL` is an HTTP/HTTPS URL:
+- Local llama.cpp processes are not started
+- Embedding requests go directly to `CLOUD_EMBEDDING_URL` with `CLOUD_EMBEDDING_API_KEY`
+- Reranker requests go directly to `CLOUD_RERANKER_URL` with `CLOUD_RERANKER_API_KEY`
+- Hindsight is configured with cloud endpoint URLs at startup
 
 ## Memory Budget
 

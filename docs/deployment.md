@@ -2,13 +2,13 @@
 
 ## Prerequisites
 
+- **Python 3.12+**
 - **Go 1.26+** (build)
-- **llama-server** (`brew install llama.cpp`) -- skipped if using cloud endpoints
-- **Python 3.12+** (install hindsight via `make setup`)
 - **OpenRouter API key** (https://openrouter.ai/keys)
-- **Model files** in `../../model/`:
-  - `qwen3-embedding-0.6b-Q8_0.gguf` (~610MB) -- or use cloud endpoint
-  - `bge-reranker-base-Q4_k_m.gguf` (~209MB) -- or use cloud endpoint
+- **llama-server** — downloaded automatically by `make setup` to `bin/llama/` (brew is a fallback). Skipped if using cloud endpoints.
+- **Model files** — downloaded automatically by `make setup` to `./model/`:
+  - `qwen3-embedding-0.6b-Q8_0.gguf` (~610MB) — or use cloud endpoint
+  - `bge-reranker-base-Q4_k_m.gguf` (~209MB) — or use cloud endpoint
 
 ## Setup
 
@@ -16,18 +16,21 @@
 cd mcp/memory
 cp .env.example .env
 # Edit .env: set OPENROUTER_API_KEY
-make setup              # Creates .venv, installs hindsight-api-slim
+make setup              # Creates .venv, installs Hindsight, downloads llama-server + models
 ```
 
 ## Run
 
 ```bash
-# Development
+# Primary: one-command development run
 make run
 
-# Production
+# Production build
 make build
 ./bin/mcp-memory
+
+# Convenience script (secondary)
+./scripts/start.sh
 ```
 
 ## Stop
@@ -36,7 +39,10 @@ make build
 # Graceful (preferred)
 make stop
 
-# Or
+# Or via script
+./scripts/stop.sh
+
+# Or via API
 curl -X POST http://localhost:8899/stop
 ```
 
@@ -67,7 +73,8 @@ All configuration via `.env` or environment variables. See `.env.example` for al
 |----------|---------|-------------|
 | `LLAMA_PORT` | `8080` | Embedding server port |
 | `LLAMA_RERANKER_PORT` | `8081` | Reranker server port |
-| `LLAMA_MODEL_PATH` | `../../model/qwen3-embedding-0.6b-Q8_0.gguf` | Embedding model (or HTTP URL for cloud) |
+| `LLAMA_PATH` | `./bin/llama/llama-server` | llama-server binary path (brew on PATH is fallback) |
+| `LLAMA_MODEL_PATH` | `./model/qwen3-embedding-0.6b-Q8_0.gguf` | Embedding model (or HTTP URL for cloud) |
 | `LLAMA_GPU_LAYERS` | `999` | GPU layers (0=CPU only) |
 | `LLAMA_CTX_SIZE` | `8192` | Context size |
 
@@ -79,7 +86,8 @@ All configuration via `.env` or environment variables. See `.env.example` for al
 | `OPENROUTER_API_KEY` | (required) | LLM API key |
 | `HINDSIGHT_LLM_MODEL` | `deepseek/deepseek-v4-flash` | LLM model |
 | `HINDSIGHT_EMBEDDINGS_MODEL` | `qwen3-embedding-0.6b-Q8_0.gguf` | Embedding model name |
-| `HINDSIGHT_RERANKER_MODEL` | `../../model/bge-reranker-base-Q4_k_m.gguf` | Reranker model (or HTTP URL for cloud) |
+| `HINDSIGHT_PATH` | `hindsight-api` | Path to hindsight-api binary (falls back to `.venv/bin/hindsight-api`) |
+| `HINDSIGHT_RERANKER_MODEL` | `./model/bge-reranker-base-Q4_k_m.gguf` | Reranker model (or HTTP URL for cloud) |
 
 ### Hindsight API Timeouts
 
@@ -150,12 +158,29 @@ To use cloud embedding or reranker services instead of local llama.cpp:
 ```bash
 # Use OpenAI-compatible embedding endpoint
 LLAMA_MODEL_PATH=https://api.openai.com/v1
+CLOUD_EMBEDDING_API_KEY=sk-...
+CLOUD_EMBEDDING_URL=https://api.openai.com/v1
+CLOUD_EMBEDDING_MODEL=text-embedding-3-small
 
 # Use Cohere-compatible reranker endpoint
 HINDSIGHT_RERANKER_MODEL=https://api.cohere.com/v1/rerank
+CLOUD_RERANKER_API_KEY=...
+CLOUD_RERANKER_URL=https://api.cohere.com/v1/rerank
+CLOUD_RERANKER_MODEL=rerank-english-v3.0
 ```
 
-When `LLAMA_MODEL_PATH` or `HINDSIGHT_RERANKER_MODEL` is an HTTP/HTTPS URL, the server skips local process management and configures Hindsight to use the remote endpoint directly.
+When `LLAMA_MODEL_PATH` or `HINDSIGHT_RERANKER_MODEL` is an HTTP/HTTPS URL, the server skips local process management and configures Hindsight to use the remote endpoint directly. The 6 `CLOUD_*` variables are required when using cloud mode.
+
+### Cloud Configuration Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `CLOUD_EMBEDDING_API_KEY` | When cloud embedding active | API key for embedding service |
+| `CLOUD_EMBEDDING_URL` | When cloud embedding active | Base URL for embedding endpoint |
+| `CLOUD_EMBEDDING_MODEL` | When cloud embedding active | Model name for embedding requests |
+| `CLOUD_RERANKER_API_KEY` | When cloud reranker active | API key for reranker service |
+| `CLOUD_RERANKER_URL` | When cloud reranker active | Base URL for reranker endpoint |
+| `CLOUD_RERANKER_MODEL` | When cloud reranker active | Model name for reranker requests |
 
 ## Production Notes
 
@@ -170,8 +195,8 @@ When `LLAMA_MODEL_PATH` or `HINDSIGHT_RERANKER_MODEL` is an HTTP/HTTPS URL, the 
 | Problem | Fix |
 |---------|-----|
 | "model not found" | Check `LLAMA_MODEL_PATH` points to a valid `.gguf` file or HTTP URL |
-| "hindsight-api not found" | Run `make setup` or set `HINDSIGHT_PATH` |
-| Port already in use | `./stop.sh` to kill all services, then retry |
+| "hindsight-api not found" | Run `make setup` or set `HINDSIGHT_PATH` (default: `hindsight-api`, falls back to `.venv/bin/hindsight-api`) |
+| Port already in use | `./scripts/stop.sh` to kill all services, then retry |
 | Hindsight fails to start | Check `logs/hindsight-crash.log` for errors |
 | High latency | Reduce `MEMORY_RETAIN_WORKERS` to 1, check OpenRouter status |
 | Circuit breaker open | Check Hindsight health, wait for cooldown (30s), or increase threshold |
