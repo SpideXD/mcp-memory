@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -393,13 +394,32 @@ func (svc *services) startHindsight() error {
 	svc.mu.Unlock()
 	hindsightPath := svc.config.HindsightPath
 	if _, err := exec.LookPath(hindsightPath); err != nil {
+		// Build platform-aware fallback candidates
+		venvBin := filepath.Join(".venv", "bin", "hindsight-api")
+		if runtime.GOOS == "windows" {
+			venvBin = filepath.Join(".venv", "Scripts", "hindsight-api.exe")
+		}
 		for _, p := range []string{
-			filepath.Join(".venv", "bin", "hindsight-api"),
+			venvBin,
 			"/Library/Frameworks/Python.framework/Versions/3.12/bin/hindsight-api",
 			"/usr/local/bin/hindsight-api",
 			filepath.Join(os.Getenv("HOME"), ".local/bin/hindsight-api"),
 		} {
-			if _, err := os.Stat(p); err == nil { hindsightPath = p; break }
+			info, err := os.Stat(p)
+			if err != nil {
+				continue
+			}
+			if !info.Mode().IsRegular() {
+				continue
+			}
+			if info.Size() == 0 {
+				continue
+			}
+			if info.Mode()&0111 == 0 {
+				continue
+			}
+			hindsightPath = p
+			break
 		}
 		if hindsightPath == svc.config.HindsightPath { return errBinaryNotFound }
 	}
