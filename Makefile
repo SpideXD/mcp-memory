@@ -14,7 +14,7 @@ RERANK_URL := https://huggingface.co/sinjab/bge-reranker-base-Q4_K_M-GGUF/resolv
 setup:
 	@command -v python3 >/dev/null 2>&1 || { echo "Error: python3 is required but not installed."; exit 1; }
 	@test -d .venv || python3 -m venv .venv
-	.venv/bin/pip install hindsight-api-slim==0.8.2 && \
+	.venv/bin/pip install 'hindsight-api-slim[embedded-db]==0.8.2' && \
 	.venv/bin/pip install hindsight-client==0.8.2
 	@$(MAKE) download-llama
 	@$(MAKE) download-models
