@@ -47,9 +47,9 @@ download-llama:
 	PLATFORM="$${OSNAME}-$${ARCH}"; \
 	URL="https://github.com/ggml-org/llama.cpp/releases/download/$(LLAMA_VERSION)/llama-$(LLAMA_VERSION)-bin-$${PLATFORM}.tar.gz"; \
 	TMPDIR=$$(mktemp -d /tmp/llama-download-XXXXXX); \
-	curl -fSL --connect-timeout 30 --max-time 300 "$${URL}" | tar xz -C "$${TMPDIR}"; \
+	curl -fSL --connect-timeout 30 --max-time 300 "$${URL}" | tar xz --strip-components=1 -C "$${TMPDIR}"; \
 	mkdir -p vendor/bin; \
-	mv "$${TMPDIR}/build/bin/llama-server" vendor/bin/llama-server; \
+	mv "$${TMPDIR}"/* vendor/bin/; \
 	chmod +x vendor/bin/llama-server; \
 	rm -rf "$${TMPDIR}"; \
 	echo "llama-server $(LLAMA_VERSION) downloaded to vendor/bin/llama-server."
