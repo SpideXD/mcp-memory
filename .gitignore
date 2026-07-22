@@ -10,3 +10,6 @@ bin/*
 
 # Runtime logs
 logs/*
+
+# Third-party binaries
+vendor/

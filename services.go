@@ -332,6 +332,31 @@ func (svc *services) wait(ctx context.Context, url string, timeout time.Duration
 	return errTimeout
 }
 
+// resolveLlamaPath resolves the llama-server binary path using a fallback chain:
+// 1. config.LlamaPath (default: ./vendor/bin/llama-server)
+// 2. exec.LookPath("llama-server") — system PATH (brew, system package, etc.)
+// Returns the resolved path or an error if no valid executable is found.
+func (svc *services) resolveLlamaPath() (string, error) {
+	// Candidate 1: configured path
+	if svc.config.LlamaPath != "" {
+		info, err := os.Stat(svc.config.LlamaPath)
+		if err == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Mode()&0111 != 0 {
+			return svc.config.LlamaPath, nil
+		}
+	}
+
+	// Candidate 2: system PATH lookup
+	lp, err := exec.LookPath("llama-server")
+	if err == nil {
+		info, statErr := os.Stat(lp)
+		if statErr == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Mode()&0111 != 0 {
+			return lp, nil
+		}
+	}
+
+	return "", fmt.Errorf("llama-server not found at %q or on system PATH", svc.config.LlamaPath)
+}
+
 func (svc *services) startLlama() error {
 	modelPath := svc.config.ModelPath
 	if !filepath.IsAbs(modelPath) {
@@ -340,7 +365,11 @@ func (svc *services) startLlama() error {
 	if _, err := os.Stat(modelPath); os.IsNotExist(err) {
 		return errModelNotFound(modelPath)
 	}
-	cmd := svc.spawn(svc.config.LlamaPath,
+	llamaPath, err := svc.resolveLlamaPath()
+	if err != nil {
+		return err
+	}
+	cmd := svc.spawn(llamaPath,
 		"--model", modelPath, "--embedding",
 		"--ctx-size", svc.config.CtxSize,
 		"--parallel", "1", // Embeddings are single-request — only 1 slot needed
@@ -365,7 +394,11 @@ func (svc *services) startLlamaReranker() error {
 	if _, err := os.Stat(modelPath); os.IsNotExist(err) {
 		return errModelNotFound(modelPath)
 	}
-	cmd := svc.spawn(svc.config.LlamaPath,
+	llamaPath, err := svc.resolveLlamaPath()
+	if err != nil {
+		return err
+	}
+	cmd := svc.spawn(llamaPath,
 		"--model", modelPath, "--reranking",
 		"--ctx-size", svc.config.CtxSize,
 		"--parallel", "1",
