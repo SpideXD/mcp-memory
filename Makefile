@@ -1,4 +1,5 @@
 LLAMA_VERSION ?= b10085
+LLAMA_DIR := bin/llama
 
 .PHONY: setup run build clean test stop vet download-llama download-models
 
@@ -19,7 +20,7 @@ setup:
 	@$(MAKE) download-models
 
 run:
-	@if [ ! -x vendor/bin/llama-server ]; then \
+	@if [ ! -x $(LLAMA_DIR)/llama-server ]; then \
 		echo "Hint: run 'make setup' to download llama-server, or install it system-wide and ensure it's on PATH."; \
 	fi
 	go run .
@@ -28,7 +29,7 @@ build:
 	go build -o bin/mcp-memory .
 
 clean:
-	rm -rf .venv bin/mcp-memory mcp-memory vendor/bin/llama-server
+	rm -rf .venv bin/mcp-memory mcp-memory $(LLAMA_DIR)
 
 test:
 	go test -race -count=1 -timeout 240s ./...
@@ -38,7 +39,7 @@ vet:
 
 download-llama:
 	@set -eo pipefail; \
-	if [ -x vendor/bin/llama-server ]; then \
+	if [ -x $(LLAMA_DIR)/llama-server ]; then \
 		echo "llama-server already downloaded."; \
 		exit 0; \
 	fi; \
@@ -57,11 +58,11 @@ download-llama:
 	URL="https://github.com/ggml-org/llama.cpp/releases/download/$(LLAMA_VERSION)/llama-$(LLAMA_VERSION)-bin-$${PLATFORM}.tar.gz"; \
 	TMPDIR=$$(mktemp -d /tmp/llama-download-XXXXXX); \
 	curl -fSL --connect-timeout 30 --max-time 300 "$${URL}" | tar xz --strip-components=1 -C "$${TMPDIR}"; \
-	mkdir -p vendor/bin; \
-	mv "$${TMPDIR}"/* vendor/bin/; \
-	chmod +x vendor/bin/llama-server; \
+	mkdir -p $(LLAMA_DIR); \
+	mv "$${TMPDIR}"/* $(LLAMA_DIR)/; \
+	chmod +x $(LLAMA_DIR)/llama-server; \
 	rm -rf "$${TMPDIR}"; \
-	echo "llama-server $(LLAMA_VERSION) downloaded to vendor/bin/llama-server."
+	echo "llama-server $(LLAMA_VERSION) downloaded to $(LLAMA_DIR)/llama-server."
 
 download-models:
 	@mkdir -p $(MODEL_DIR)

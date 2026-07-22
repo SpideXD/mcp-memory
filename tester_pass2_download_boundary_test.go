@@ -25,9 +25,9 @@ import (
 //   - resolveLlamaPath: LookPath finds a directory (not a file)
 //   - resolveLlamaPath: device file (/dev/null) bypasses IsRegular check
 //   - resolveLlamaPath: symlink to a directory
-//   - Config: LLAMA_PATH set to vendor/bin/llama-server (redundant but valid)
+//   - Config: LLAMA_PATH set to bin/llama/llama-server (redundant but valid)
 //   - Makefile curl --connect-timeout 30: does failure produce visible error
-//   - .gitignore: vendor/bin/llama-server correctly covered by vendor/
+//   - .gitignore: bin/llama/llama-server correctly covered by bin/llama/
 //
 // NO process spawning. NO real binary download. Test the Go logic
 // and Makefile shells only.
@@ -44,7 +44,7 @@ import (
 // continues to print "downloaded" despite tar and mv both failing.
 func TestMakefile_MktempFailure(t *testing.T) {
 	dir := t.TempDir()
-	vendorBin := filepath.Join(dir, "vendor", "bin")
+	llamaBin := filepath.Join(dir, "bin", "llama")
 
 	// Override mktemp to fail. Then run the Makefile's download pipeline.
 	// Without set -o pipefail or explicit error checks, the recipe continues
@@ -59,8 +59,8 @@ mkdir -p "%s"
 mv "${TMPDIR}/build/bin/llama-server" "%s/llama-server" 2>/dev/null
 chmod +x "%s/llama-server" 2>/dev/null
 rm -rf "${TMPDIR}" 2>/dev/null
-echo "llama-server downloaded to vendor/bin/llama-server."
-`, vendorBin, vendorBin, vendorBin)
+echo "llama-server downloaded to bin/llama/llama-server."
+`, llamaBin, llamaBin, llamaBin)
 
 	cmd := exec.Command("bash", "-c", script)
 	out, err := cmd.CombinedOutput()
@@ -79,9 +79,9 @@ echo "llama-server downloaded to vendor/bin/llama-server."
 		"Output: %s", output)
 
 	// Verify no binary was created despite the success message
-	if _, statErr := os.Stat(filepath.Join(vendorBin, "llama-server")); statErr == nil {
+	if _, statErr := os.Stat(filepath.Join(llamaBin, "llama-server")); statErr == nil {
 		t.Errorf("BUG: binary created despite mktemp failure! Partial artifact at %s",
-			filepath.Join(vendorBin, "llama-server"))
+			filepath.Join(llamaBin, "llama-server"))
 	}
 }
 
@@ -90,7 +90,7 @@ echo "llama-server downloaded to vendor/bin/llama-server."
 // ===================================================================
 
 // TestMakefile_ConcurrentGuardRace demonstrates that two concurrent
-// processes can both pass the [ -x ] idempotency guard when vendor/bin/
+// processes can both pass the [ -x ] idempotency guard when bin/llama/
 // does not yet have the llama-server binary. This is a TOCTOU race:
 // both see "not executable", both proceed to download.
 //
@@ -99,15 +99,15 @@ echo "llama-server downloaded to vendor/bin/llama-server."
 // binary is valid (both processes download the same release).
 func TestMakefile_ConcurrentGuardRace(t *testing.T) {
 	dir := t.TempDir()
-	vendorBin := filepath.Join(dir, "vendor", "bin")
-	if err := os.MkdirAll(vendorBin, 0755); err != nil {
+	llamaBin := filepath.Join(dir, "bin", "llama")
+	if err := os.MkdirAll(llamaBin, 0755); err != nil {
 		t.Fatal(err)
 	}
 
 	// Simulate the download-llama idempotency logic that TWO concurrent
 	// processes run simultaneously. Both check [ -x ] on a path that
 	// does NOT exist yet, so both proceed.
-	bin := filepath.Join(vendorBin, "llama-server")
+	bin := filepath.Join(llamaBin, "llama-server")
 
 	var wg sync.WaitGroup
 	results := make([]bool, 2)
@@ -214,15 +214,15 @@ func TestMakefile_Platform_Armv8lPlus(t *testing.T) {
 // a failed download) passes the [ -x ] guard, causing the Makefile to
 // incorrectly skip the download and leave a broken binary in place.
 //
-// The spec's idempotency check is: `[ -x vendor/bin/llama-server ]`
+// The spec's idempotency check is: `[ -x bin/llama/llama-server ]`
 // This ONLY checks existence+executable, NOT content validity.
 func TestMakefile_TruncatedExecutable_BypassesIdempotency(t *testing.T) {
 	dir := t.TempDir()
-	vendorBin := filepath.Join(dir, "vendor", "bin")
-	if err := os.MkdirAll(vendorBin, 0755); err != nil {
+	llamaBin := filepath.Join(dir, "bin", "llama")
+	if err := os.MkdirAll(llamaBin, 0755); err != nil {
 		t.Fatal(err)
 	}
-	bin := filepath.Join(vendorBin, "llama-server")
+	bin := filepath.Join(llamaBin, "llama-server")
 
 	// Create a 10-byte executable file — this is NOT a valid llama-server
 	// binary, but the Makefile's [ -x ] check does NOT validate content.
@@ -264,11 +264,11 @@ echo "need download"
 // that even a non-empty but clearly invalid binary passes [ -x ].
 func TestMakefile_TruncatedExecutable_SizeAboveZero(t *testing.T) {
 	dir := t.TempDir()
-	vendorBin := filepath.Join(dir, "vendor", "bin")
-	if err := os.MkdirAll(vendorBin, 0755); err != nil {
+	llamaBin := filepath.Join(dir, "bin", "llama")
+	if err := os.MkdirAll(llamaBin, 0755); err != nil {
 		t.Fatal(err)
 	}
-	bin := filepath.Join(vendorBin, "llama-server")
+	bin := filepath.Join(llamaBin, "llama-server")
 
 	// A 100-byte file that is executable — too small to be a real binary
 	// (real llama-server is ~15MB), but passes [ -x ]
@@ -653,37 +653,37 @@ curl -fSL --connect-timeout 2 --max-time 5 "http://192.0.2.4/nonexistent.tar.gz"
 }
 
 // ===================================================================
-// .gitignore — vendor/ pattern correctly covers vendor/bin/
+// .gitignore — bin/llama/ pattern correctly covers bin/llama/
 // ===================================================================
 
 // TestGitignore_VendorPatternMatchesSubdirectory verifies that the
-// `vendor/` gitignore pattern correctly ignores the full path
-// vendor/bin/llama-server. Git's .gitignore treats `vendor/` as
+// `bin/llama/` gitignore pattern correctly ignores the full path
+// bin/llama/llama-server. Git's .gitignore treats `bin/llama/` as
 // matching the directory and all its contents recursively.
 func TestGitignore_VendorPatternMatchesSubdirectory(t *testing.T) {
-	// Check that .gitignore contains `vendor/` (already tested in Pass 1)
+	// Check that .gitignore contains `bin/llama/` (already tested in Pass 1)
 	data, err := os.ReadFile(".gitignore")
 	if err != nil {
 		t.Fatal(err)
 	}
 	content := string(data)
 
-	if !strings.Contains(content, "vendor/") {
-		t.Fatal("vendor/ not in .gitignore — cannot verify pattern matching")
+	if !strings.Contains(content, "bin/llama/") {
+		t.Fatal("bin/llama/ not in .gitignore — cannot verify pattern matching")
 	}
 
 	// According to gitignore(5), a pattern ending with / matches
-	// directories and everything below them. So `vendor/` matches:
-	//   vendor/
-	//   vendor/bin/
-	//   vendor/bin/llama-server
+	// directories and everything below them. So `bin/llama/` matches:
+	//   bin/llama/
+	//   bin/llama/
+	//   bin/llama/llama-server
 	//
-	// Verify that git would ignore vendor/bin/llama-server by checking
+	// Verify that git would ignore bin/llama/llama-server by checking
 	// the parsing rules. We can check with `git check-ignore` if git
 	// is available.
 	cmd := exec.Command("git", "check-ignore", "--no-index",
 		"--stdin")
-	cmd.Stdin = strings.NewReader("vendor/bin/llama-server\nvendor/bin/\n")
+	cmd.Stdin = strings.NewReader("bin/llama/llama-server\nbin/llama/\n")
 	out, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -700,40 +700,40 @@ func TestGitignore_VendorPatternMatchesSubdirectory(t *testing.T) {
 		matched[line] = true
 	}
 
-	if !matched["vendor/bin/llama-server"] {
-		t.Error("git check-ignore: vendor/bin/llama-server is NOT ignored")
+	if !matched["bin/llama/llama-server"] {
+		t.Error("git check-ignore: bin/llama/llama-server is NOT ignored")
 	} else {
-		t.Log("vendor/bin/llama-server is correctly gitignored")
+		t.Log("bin/llama/llama-server is correctly gitignored")
 	}
 
-	if !matched["vendor/bin/"] {
-		t.Error("git check-ignore: vendor/bin/ is NOT ignored")
+	if !matched["bin/llama/"] {
+		t.Error("git check-ignore: bin/llama/ is NOT ignored")
 	} else {
-		t.Log("vendor/bin/ is correctly gitignored")
+		t.Log("bin/llama/ is correctly gitignored")
 	}
 }
 
 // ===================================================================
-// Config — LLAMA_PATH set to vendor/bin/llama-server (redundant but valid)
+// Config — LLAMA_PATH set to bin/llama/llama-server (redundant but valid)
 // ===================================================================
 
 // TestResolve_LlamaPathSetToVendorBin verifies that when the user sets
-// LLAMA_PATH to vendor/bin/llama-server (the same as the default),
+// LLAMA_PATH to bin/llama/llama-server (the same as the default),
 // or any valid executable, resolution works correctly.
 func TestResolve_LlamaPathSetToVendorBin(t *testing.T) {
 	dir := t.TempDir()
-	vendorBin := filepath.Join(dir, "vendor", "bin")
-	if err := os.MkdirAll(vendorBin, 0755); err != nil {
+	llamaBin := filepath.Join(dir, "bin", "llama")
+	if err := os.MkdirAll(llamaBin, 0755); err != nil {
 		t.Fatal(err)
 	}
-	bin := filepath.Join(vendorBin, "llama-server")
+	bin := filepath.Join(llamaBin, "llama-server")
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho llama-server"), 0755); err != nil {
 		t.Fatal(err)
 	}
 
 	svc, _ := newTestServices()
 
-	// Set LlamaPath to the absolute vendor/bin/llama-server path
+	// Set LlamaPath to the absolute bin/llama/llama-server path
 	svc.config.LlamaPath = bin
 
 	got, err := svc.resolveLlamaPath()

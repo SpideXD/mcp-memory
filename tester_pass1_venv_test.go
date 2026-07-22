@@ -392,7 +392,8 @@ func TestVenv_Makefile_SetupIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Chdir("/Users/agentswarm/Desktop/freelancing/memory")
+	projectDir, _ := os.Getwd()
+	defer os.Chdir(projectDir)
 
 	// Verify the Makefile has no idempotency guard
 	t.Log("BUG: make setup is NOT idempotent.")
@@ -471,7 +472,8 @@ func TestVenv_Makefile_CleanRemovesCorrectFiles(t *testing.T) {
 // the correct paths using git check-ignore.
 func TestVenv_Gitignore_Patterns(t *testing.T) {
 	// Read the ACTUAL project .gitignore file
-	gitignoreContent, err := os.ReadFile(filepath.Join("/Users/agentswarm/Desktop/freelancing/memory", ".gitignore"))
+	projectDir, _ := os.Getwd()
+	gitignoreContent, err := os.ReadFile(filepath.Join(projectDir, ".gitignore"))
 	if err != nil {
 		t.Fatalf("failed to read .gitignore: %v", err)
 	}
@@ -532,7 +534,7 @@ func TestVenv_Gitignore_Patterns(t *testing.T) {
 	// NOTE: git check-ignore only works for untracked files. Already-tracked
 	// files (logs/hindsight-crash.log, bin/mcp-memory, mcp-memory) are never
 	// reported as ignored. We verify NEW untrackable paths instead.
-	projectDir := "/Users/agentswarm/Desktop/freelancing/memory"
+	projectDir, _ = os.Getwd()
 	if err := os.Chdir(projectDir); err != nil {
 		t.Fatal(err)
 	}

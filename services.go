@@ -333,7 +333,7 @@ func (svc *services) wait(ctx context.Context, url string, timeout time.Duration
 }
 
 // resolveLlamaPath resolves the llama-server binary path using a fallback chain:
-// 1. config.LlamaPath (default: ./vendor/bin/llama-server)
+// 1. config.LlamaPath (default: ./bin/llama/llama-server)
 // 2. exec.LookPath("llama-server") — system PATH (brew, system package, etc.)
 // Returns the resolved path or an error if no valid executable is found.
 func (svc *services) resolveLlamaPath() (string, error) {

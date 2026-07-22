@@ -109,7 +109,7 @@ func LoadConfig() Config {
 		AlertMode: getEnv("ALERT_MODE", "optional"),
 
 		// llama.cpp embedder
-		LlamaPath: getEnv("LLAMA_PATH", "./vendor/bin/llama-server"),
+		LlamaPath: getEnv("LLAMA_PATH", "./bin/llama/llama-server"),
 		LlamaPort: getEnv("LLAMA_PORT", "8080"),
 		LlamaHost: getEnv("LLAMA_HOST", "0.0.0.0"),
 		ModelPath: getEnv("LLAMA_MODEL_PATH", "./model/qwen3-embedding-0.6b-Q8_0.gguf"),

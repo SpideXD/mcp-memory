@@ -215,10 +215,10 @@ func TestResolve_SymlinkToNonExecutable(t *testing.T) {
 	}
 }
 
-// TestResolve_RelativePath: relative path like "./vendor/bin/llama-server"
+// TestResolve_RelativePath: relative path like "./bin/llama/llama-server"
 func TestResolve_RelativePath(t *testing.T) {
 	dir := t.TempDir()
-	sub := filepath.Join(dir, "vendor", "bin")
+	sub := filepath.Join(dir, "bin", "llama")
 	if err := os.MkdirAll(sub, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func TestResolve_RelativePath(t *testing.T) {
 	defer os.Chdir(origWd)
 
 	svc, _ := newTestServices()
-	svc.config.LlamaPath = "./vendor/bin/llama-server"
+	svc.config.LlamaPath = "./bin/llama/llama-server"
 
 	got, err := svc.resolveLlamaPath()
 	if err != nil {
@@ -687,7 +687,7 @@ func TestMakefile_Platform_DarwinAarch64(t *testing.T) {
 // TestMakefile_Idempotency_SkipExecutable: [ -x ] skips when executable file exists
 func TestMakefile_Idempotency_SkipExecutable(t *testing.T) {
 	dir := t.TempDir()
-	binDir := filepath.Join(dir, "vendor", "bin")
+	binDir := filepath.Join(dir, "bin", "llama")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -718,7 +718,7 @@ echo "need download"
 // TestMakefile_Idempotency_NotExecutable: [ -x ] rejects non-executable file
 func TestMakefile_Idempotency_NotExecutable(t *testing.T) {
 	dir := t.TempDir()
-	binDir := filepath.Join(dir, "vendor", "bin")
+	binDir := filepath.Join(dir, "bin", "llama")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -750,7 +750,7 @@ echo "need download"
 // This is a known/acceptable limitation (spec E9). Verify the behavior.
 func TestMakefile_Idempotency_VersionMismatch(t *testing.T) {
 	dir := t.TempDir()
-	binDir := filepath.Join(dir, "vendor", "bin")
+	binDir := filepath.Join(dir, "bin", "llama")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -794,7 +794,7 @@ func TestMakefile_Pipefail_TarFailureSilentlyIgnored(t *testing.T) {
 	if err := os.MkdirAll(tmpDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	vendorBin := filepath.Join(dir, "vendor", "bin")
+	llamaBin := filepath.Join(dir, "bin", "llama")
 
 	// Simulate the download pipeline: invalid data piped to tar (fails),
 	// then Makefile blindly continues to mkdir, mv, chmod, rm, echo.
@@ -807,8 +807,8 @@ mkdir -p "${VENDOR_BIN}"
 mv "${TMPDIR}/build/bin/llama-server" "${VENDOR_BIN}/llama-server" 2>/dev/null
 chmod +x "${VENDOR_BIN}/llama-server" 2>/dev/null
 rm -rf "${TMPDIR}"
-echo "llama-server downloaded to vendor/bin/llama-server."
-`, tmpDir, vendorBin)
+echo "llama-server downloaded to bin/llama/llama-server."
+`, tmpDir, llamaBin)
 
 	cmd := exec.Command("bash", "-c", script)
 	out, err := cmd.CombinedOutput()
@@ -824,9 +824,9 @@ echo "llama-server downloaded to vendor/bin/llama-server."
 		"Output: %s", output)
 
 	// Verify no binary was created
-	if _, statErr := os.Stat(filepath.Join(vendorBin, "llama-server")); statErr == nil {
+	if _, statErr := os.Stat(filepath.Join(llamaBin, "llama-server")); statErr == nil {
 		t.Errorf("BUG: binary was created despite tar failure! Partial artifact at %s",
-			filepath.Join(vendorBin, "llama-server"))
+			filepath.Join(llamaBin, "llama-server"))
 	}
 }
 
@@ -836,7 +836,7 @@ echo "llama-server downloaded to vendor/bin/llama-server."
 
 func TestConfig_LlamaPathDefault(t *testing.T) {
 	cfg := LoadConfig()
-	expected := "./vendor/bin/llama-server"
+	expected := "./bin/llama/llama-server"
 	if cfg.LlamaPath != expected {
 		t.Errorf("LlamaPath default = %q, want %q", cfg.LlamaPath, expected)
 	}
@@ -858,7 +858,7 @@ func TestConfig_LLAMAPathEmptyString(t *testing.T) {
 	defer os.Unsetenv("LLAMA_PATH")
 
 	cfg := LoadConfig()
-	expected := "./vendor/bin/llama-server"
+	expected := "./bin/llama/llama-server"
 	if cfg.LlamaPath != expected {
 		t.Errorf("LLAMA_PATH=\"\" -> LlamaPath = %q, want %q", cfg.LlamaPath, expected)
 	}
@@ -894,7 +894,7 @@ func TestBackwardCompat_BrewInstallOnPATH(t *testing.T) {
 	defer os.Setenv("PATH", origPath)
 
 	svc, _ := newTestServices()
-	svc.config.LlamaPath = "./vendor/bin/llama-server"
+	svc.config.LlamaPath = "./bin/llama/llama-server"
 
 	got, err := svc.resolveLlamaPath()
 	if err != nil {
@@ -930,7 +930,7 @@ func TestBackwardCompat_NoLlamaAnywhere(t *testing.T) {
 	defer os.Setenv("PATH", origPath)
 
 	svc, _ := newTestServices()
-	svc.config.LlamaPath = "./vendor/bin/llama-server"
+	svc.config.LlamaPath = "./bin/llama/llama-server"
 
 	_, err := svc.resolveLlamaPath()
 	if err == nil {
@@ -955,7 +955,7 @@ func TestSpawn_UnchangedSignature(t *testing.T) {
 }
 
 // ===================================================================
-// .gitignore — vendor/ pattern
+// .gitignore — bin/llama/ pattern
 // ===================================================================
 
 func TestGitignore_VendorIgnored(t *testing.T) {
@@ -965,8 +965,8 @@ func TestGitignore_VendorIgnored(t *testing.T) {
 	}
 	content := string(data)
 
-	if !strings.Contains(content, "vendor/") {
-		t.Error(".gitignore does not contain 'vendor/' pattern")
+	if !strings.Contains(content, "bin/llama/") {
+		t.Error(".gitignore does not contain 'bin/llama/' pattern")
 	}
 }
 
@@ -979,7 +979,7 @@ func TestMakefile_RunConditionalHint(t *testing.T) {
 
 	// Test 1: No binary exists -> hint should print
 	script1 := fmt.Sprintf(`
-VENDOR_BIN="%s/vendor/bin/llama-server"
+VENDOR_BIN="%s/bin/llama/llama-server"
 if [ ! -x "$VENDOR_BIN" ]; then
 	echo "Hint: run 'make setup' to download llama-server"
 fi
@@ -998,7 +998,7 @@ echo "go run ."
 	}
 
 	// Test 2: Binary exists and is executable -> no hint
-	binDir := filepath.Join(dir, "vendor", "bin")
+	binDir := filepath.Join(dir, "bin", "llama")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -1008,7 +1008,7 @@ echo "go run ."
 	}
 
 	script2 := fmt.Sprintf(`
-VENDOR_BIN="%s/vendor/bin/llama-server"
+VENDOR_BIN="%s/bin/llama/llama-server"
 if [ ! -x "$VENDOR_BIN" ]; then
 	echo "Hint: run 'make setup' to download llama-server"
 fi

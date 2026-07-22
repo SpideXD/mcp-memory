@@ -576,7 +576,7 @@ func TestVenv_Boundary_Gitignore_AccidentalMatch(t *testing.T) {
 			t.Log("NOTE: 'mcp-memory' pattern matches ANY path named mcp-memory,")
 			t.Log("not just the root-level binary. E.g.:")
 			t.Log("  - ./mcp-memory (intended)")
-			t.Log("  - ./vendor/mcp-memory (unintended)")
+			t.Log("  - ./bin/llama/mcp-memory (unintended)")
 			t.Log("  - ./internal/mcp-memory (unintended)")
 			t.Log("If subdirectories contain files named mcp-memory,")
 			t.Log("they would be unexpectedly ignored.")
@@ -1087,7 +1087,8 @@ func TestVenv_Boundary_Gitignore_NeedsGitRmCached(t *testing.T) {
 	// Run git ls-files to find files that match the new .gitignore patterns
 	// but are still tracked by git
 	cmd := exec.Command("git", "ls-files", ".venv/", "bin/", "mcp-memory", "logs/")
-	cmd.Dir = "/Users/agentswarm/Desktop/freelancing/memory"
+	projectDir, _ := os.Getwd()
+	cmd.Dir = projectDir
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Logf("git ls-files error (may not be in git repo): %v", err)
@@ -1133,7 +1134,8 @@ func TestVenv_Boundary_Gitignore_NeedsGitRmCached(t *testing.T) {
 // doesn't have a dedicated 'vet' target, leaving static analysis to manual
 // invocation.
 func TestVenv_Boundary_Makefile_VetTargetMissing(t *testing.T) {
-	mk, err := os.ReadFile("Makefile")
+	projectDir, _ := os.Getwd()
+	mk, err := os.ReadFile(filepath.Join(projectDir, "Makefile"))
 	if err != nil {
 		t.Fatal(err)
 	}

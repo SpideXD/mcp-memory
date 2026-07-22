@@ -7,12 +7,9 @@
 # Python virtual environment
 .venv/
 
-# Built binaries
+# Built binaries and downloaded tools
 bin/*
 /mcp-memory
-
-# Downloaded third-party binaries
-vendor/
 
 # Downloaded models (managed by make download-models)
 model/
