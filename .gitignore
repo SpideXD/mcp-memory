@@ -1,15 +1,24 @@
 # Local Pi runtime state
 .atl/
 
-# Python virtualenv
+# Secrets
+.env
+
+# Python virtual environment
 .venv/
 
-# Build artifacts
+# Built binaries
 bin/*
 /mcp-memory
+
+# Downloaded third-party binaries
+vendor/
+
+# Downloaded models (managed by make download-models)
+model/
 
 # Runtime logs
 logs/*
 
-# Third-party binaries
-vendor/
+# macOS
+.DS_Store
