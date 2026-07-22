@@ -1,6 +1,14 @@
 LLAMA_VERSION ?= b10085
 
-.PHONY: setup run build clean test stop vet download-llama
+.PHONY: setup run build clean test stop vet download-llama download-models
+
+MODEL_DIR := model
+EMBED_MODEL := $(MODEL_DIR)/qwen3-embedding-0.6b-Q8_0.gguf
+RERANK_MODEL := $(MODEL_DIR)/bge-reranker-base-Q4_k_m.gguf
+
+# Hugging Face download URLs
+EMBED_URL := https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf
+RERANK_URL := https://huggingface.co/sinjab/bge-reranker-base-Q4_K_M-GGUF/resolve/main/bge-reranker-base-Q4_K_M.gguf
 
 setup:
 	@command -v python3 >/dev/null 2>&1 || { echo "Error: python3 is required but not installed."; exit 1; }
@@ -8,6 +16,7 @@ setup:
 	.venv/bin/pip install hindsight-api-slim==0.8.2 && \
 	.venv/bin/pip install hindsight-client==0.8.2
 	@$(MAKE) download-llama
+	@$(MAKE) download-models
 
 run:
 	@if [ ! -x vendor/bin/llama-server ]; then \
@@ -53,6 +62,23 @@ download-llama:
 	chmod +x vendor/bin/llama-server; \
 	rm -rf "$${TMPDIR}"; \
 	echo "llama-server $(LLAMA_VERSION) downloaded to vendor/bin/llama-server."
+
+download-models:
+	@mkdir -p $(MODEL_DIR)
+	@if [ ! -f $(EMBED_MODEL) ]; then \
+		echo "Downloading embedding model (610MB)..."; \
+		curl -fSL --connect-timeout 30 --max-time 900 -o $(EMBED_MODEL) "$(EMBED_URL)"; \
+		echo "Embedding model downloaded."; \
+	else \
+		echo "Embedding model already present: $(EMBED_MODEL)"; \
+	fi
+	@if [ ! -f $(RERANK_MODEL) ]; then \
+		echo "Downloading reranker model (209MB)..."; \
+		curl -fSL --connect-timeout 30 --max-time 600 -o $(RERANK_MODEL) "$(RERANK_URL)"; \
+		echo "Reranker model downloaded."; \
+	else \
+		echo "Reranker model already present: $(RERANK_MODEL)"; \
+	fi
 
 stop:
 	./scripts/stop.sh
