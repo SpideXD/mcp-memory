@@ -393,36 +393,45 @@ func (svc *services) startHindsight() error {
 	}
 	svc.mu.Unlock()
 	hindsightPath := svc.config.HindsightPath
-	if _, err := exec.LookPath(hindsightPath); err != nil {
-		// Build platform-aware fallback candidates
-		venvBin := filepath.Join(".venv", "bin", "hindsight-api")
-		if runtime.GOOS == "windows" {
-			venvBin = filepath.Join(".venv", "Scripts", "hindsight-api.exe")
-		}
-		for _, p := range []string{
-			venvBin,
-			"/Library/Frameworks/Python.framework/Versions/3.12/bin/hindsight-api",
-			"/usr/local/bin/hindsight-api",
-			filepath.Join(os.Getenv("HOME"), ".local/bin/hindsight-api"),
-		} {
-			info, err := os.Stat(p)
+
+	// Try project-local .venv first (make setup), fall back to system PATH and hardcoded locations
+	venvBin := filepath.Join(".venv", "bin", "hindsight-api")
+	if runtime.GOOS == "windows" {
+		venvBin = filepath.Join(".venv", "Scripts", "hindsight-api.exe")
+	}
+	found := false
+	for _, p := range []string{
+		venvBin,
+		hindsightPath,
+		"/Library/Frameworks/Python.framework/Versions/3.12/bin/hindsight-api",
+		"/usr/local/bin/hindsight-api",
+		filepath.Join(os.Getenv("HOME"), ".local/bin/hindsight-api"),
+	} {
+		if p == svc.config.HindsightPath {
+			lp, err := exec.LookPath(p)
 			if err != nil {
 				continue
 			}
-			if !info.Mode().IsRegular() {
-				continue
-			}
-			if info.Size() == 0 {
-				continue
-			}
-			if info.Mode()&0111 == 0 {
-				continue
-			}
-			hindsightPath = p
-			break
+			p = lp
 		}
-		if hindsightPath == svc.config.HindsightPath { return errBinaryNotFound }
+		info, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		if info.Size() == 0 {
+			continue
+		}
+		if info.Mode()&0111 == 0 {
+			continue
+		}
+		hindsightPath = p
+		found = true
+		break
 	}
+	if !found { return errBinaryNotFound }
 	env := os.Environ()
 	// Block torch/sklearn from being importable — these 400MB+ libraries
 	// get lazy-loaded by Hindsight's query_analyzer and local-ml backends
