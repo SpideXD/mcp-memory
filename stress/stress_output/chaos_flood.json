@@ -3,13 +3,13 @@
   "scenario": "flood",
   "metrics": {
     "flood_size": 100,
-    "submitted_in_ms": 60010.225,
+    "submitted_in_ms": 60008.425,
     "successful": 14,
     "overloaded": 0,
     "timeouts": 0,
     "other_errors": 86
   },
-  "passed": true,
-  "timestamp": "2026-07-23T16:02:45.91139+05:30",
-  "duration_ms": 80011
+  "passed": false,
+  "timestamp": "2026-07-23T17:28:23.460406+05:30",
+  "duration_ms": 66450
 }
