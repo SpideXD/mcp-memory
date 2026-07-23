@@ -19,7 +19,10 @@ import (
 	"time"
 
 	"mcp-memory/logger"
+	"mcp-memory/internal/testutil"
 )
+
+type mcpResponse = testutil.Response
 
 // ─── Test Infrastructure Helpers ─────────────────────────────────────────
 

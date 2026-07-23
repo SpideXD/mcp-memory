@@ -10,17 +10,19 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"mcp-memory/internal/testutil"
 )
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-func mustConnect(t *testing.T, bank string) *mcpClient {
+func mustConnect(t *testing.T, bank string) *testutil.Client {
 	t.Helper()
-	c, err := newMCPClient(testServerURL, bank)
+	c, err := testutil.NewClient(testutil.DefaultServerURL, bank)
 	if err != nil {
 		t.Fatalf("connect bank=%q: %v", bank, err)
 	}
-	if err := c.initialize(); err != nil {
+	if err := c.Initialize(); err != nil {
 		t.Fatalf("initialize bank=%q: %v", bank, err)
 	}
 	return c
@@ -41,7 +43,7 @@ func rawMCPRequest(method string, params interface{}) string {
 
 // postMessage sends a raw JSON-RPC message and returns status + body.
 func postMessage(sessionID, body string) (int, string) {
-	url := fmt.Sprintf("%s/mcp/message?session_id=%s", testServerURL, sessionID)
+	url := fmt.Sprintf("%s/mcp/message?session_id=%s", testutil.DefaultServerURL, sessionID)
 	resp, err := http.Post(url, "application/json", strings.NewReader(body))
 	if err != nil {
 		return 0, err.Error()
@@ -53,7 +55,7 @@ func postMessage(sessionID, body string) (int, string) {
 
 // connectSSERaw opens an SSE connection and returns the response (unclosed).
 func connectSSERaw(bank string) (*http.Response, error) {
-	url := testServerURL + "/mcp/sse"
+	url := testutil.DefaultServerURL + "/mcp/sse"
 	if bank != "" {
 		url += "?bank=" + bank
 	}
@@ -72,9 +74,9 @@ func connectSSERaw(bank string) (*http.Response, error) {
 func TestProtocol_Initialize(t *testing.T) {
 	requireServerUp(t)
 	c := mustConnect(t, "proto:init")
-	defer c.close()
+	defer c.Close()
 
-	result, err := c.callJSONRPC("initialize", nil)
+	result, err := c.CallJSONRPC("initialize", nil)
 	if err != nil {
 		t.Fatalf("initialize failed: %v", err)
 	}
@@ -108,13 +110,12 @@ func TestProtocol_Initialize(t *testing.T) {
 func TestProtocol_Ping(t *testing.T) {
 	requireServerUp(t)
 	c := mustConnect(t, "proto:ping")
-	defer c.close()
+	defer c.Close()
 
-	result, err := c.callJSONRPC("ping", nil)
+	result, err := c.CallJSONRPC("ping", nil)
 	if err != nil {
 		t.Fatalf("ping failed: %v", err)
 	}
-	// ping should return empty result
 	if result != "{}" && result != "null" {
 		t.Errorf("ping expected empty result, got: %s", result)
 	}
@@ -123,9 +124,9 @@ func TestProtocol_Ping(t *testing.T) {
 func TestProtocol_ToolsList(t *testing.T) {
 	requireServerUp(t)
 	c := mustConnect(t, "proto:tools")
-	defer c.close()
+	defer c.Close()
 
-	result, err := c.callJSONRPC("tools/list", nil)
+	result, err := c.CallJSONRPC("tools/list", nil)
 	if err != nil {
 		t.Fatalf("tools/list failed: %v", err)
 	}
@@ -161,10 +162,9 @@ func TestProtocol_ToolsList(t *testing.T) {
 func TestProtocol_UnknownMethod(t *testing.T) {
 	requireServerUp(t)
 	c := mustConnect(t, "proto:unknown")
-	defer c.close()
+	defer c.Close()
 
-	_, err := c.callJSONRPC("nonexistent/method", nil)
-	// Should get an error response, not hang
+	_, err := c.CallJSONRPC("nonexistent/method", nil)
 	if err != nil {
 		t.Logf("unknown method returned error (expected): %v", err)
 	}
@@ -173,15 +173,13 @@ func TestProtocol_UnknownMethod(t *testing.T) {
 func TestProtocol_DoubleInitialize(t *testing.T) {
 	requireServerUp(t)
 	c := mustConnect(t, "proto:double")
-	defer c.close()
+	defer c.Close()
 
-	// Initialize once (already done in mustConnect)
-	// Try again — should be idempotent
-	result, err := c.callJSONRPC("initialize", nil)
+	result, err := c.CallJSONRPC("initialize", nil)
 	if err != nil {
 		t.Fatalf("double initialize failed: %v", err)
 	}
-	t.Logf("Double initialize result: %s", result[:min(len(result), 100)])
+	t.Logf("Double initialize result: %s", result[:testutil.Min(len(result), 100)])
 }
 
 // ─── 2. Tool Validation ────────────────────────────────────────────────────
@@ -189,120 +187,113 @@ func TestProtocol_DoubleInitialize(t *testing.T) {
 func TestTool_UnknownTool(t *testing.T) {
 	requireServerUp(t)
 	c := mustConnect(t, "tool:unknown")
-	defer c.close()
+	defer c.Close()
 
 	params := map[string]interface{}{
 		"name":      "nonexistent_tool",
 		"arguments": map[string]interface{}{},
 	}
-	result, err := c.callJSONRPC("tools/call", params)
-	// Server returns error via SSE for unknown tools.
-	// Note: test client doesn't propagate JSON-RPC errors (only reads .result),
-	// so we get empty result instead of error. The server IS rejecting it.
+	result, err := c.CallJSONRPC("tools/call", params)
 	if err != nil {
 		t.Logf("Unknown tool error: %v", err)
 	} else {
-		t.Logf("Unknown tool result (test client limitation — error in SSE but not parsed): %q", result)
+		t.Logf("Unknown tool result: %q", result)
 	}
 }
 
 func TestTool_Recall_MissingQuery(t *testing.T) {
 	requireServerUp(t)
 	c := mustConnect(t, "tool:missing")
-	defer c.close()
+	defer c.Close()
 
 	params := map[string]interface{}{
 		"name":      "memory_recall",
 		"arguments": map[string]interface{}{},
 	}
-	// Server accepts empty arguments — query defaults to empty string
-	result, err := c.callJSONRPC("tools/call", params)
+	result, err := c.CallJSONRPC("tools/call", params)
 	if err != nil {
 		t.Logf("Missing query error: %v", err)
 	} else {
-		t.Logf("Missing query accepted (empty string sent to Hindsight): %s", result[:min(len(result), 200)])
+		t.Logf("Missing query accepted: %s", result[:testutil.Min(len(result), 200)])
 	}
 }
 
 func TestTool_Retain_MissingContent(t *testing.T) {
 	requireServerUp(t)
 	c := mustConnect(t, "tool:retmiss")
-	defer c.close()
+	defer c.Close()
 
 	params := map[string]interface{}{
 		"name":      "memory_retain",
 		"arguments": map[string]interface{}{},
 	}
-	// Server accepts empty arguments — content defaults to empty string
-	result, err := c.callJSONRPC("tools/call", params)
+	result, err := c.CallJSONRPC("tools/call", params)
 	if err != nil {
 		t.Logf("Missing content error: %v", err)
 	} else {
-		t.Logf("Missing content accepted (empty string sent to Hindsight): %s", result[:min(len(result), 200)])
+		t.Logf("Missing content accepted: %s", result[:testutil.Min(len(result), 200)])
 	}
 }
 
 func TestTool_Reflect_MissingQuery(t *testing.T) {
 	requireServerUp(t)
 	c := mustConnect(t, "tool:refmiss")
-	defer c.close()
+	defer c.Close()
 
 	params := map[string]interface{}{
 		"name":      "memory_reflect",
 		"arguments": map[string]interface{}{},
 	}
-	// Server accepts empty arguments — query defaults to empty string
-	result, err := c.callJSONRPC("tools/call", params)
+	result, err := c.CallJSONRPC("tools/call", params)
 	if err != nil {
 		t.Logf("Missing query error: %v", err)
 	} else {
-		t.Logf("Missing query accepted (empty string sent to Hindsight): %s", result[:min(len(result), 200)])
+		t.Logf("Missing query accepted: %s", result[:testutil.Min(len(result), 200)])
 	}
 }
 
 func TestTool_Recall_EmptyQuery(t *testing.T) {
 	requireServerUp(t)
 	c := mustConnect(t, "tool:emptyq")
-	defer c.close()
+	defer c.Close()
 
-	result, err := c.recall("")
+	result, err := c.Recall("")
 	if err != nil {
 		t.Logf("empty query: %v", err)
 	} else {
-		t.Logf("empty query result: %s", result[:min(len(result), 200)])
+		t.Logf("empty query result: %s", result[:testutil.Min(len(result), 200)])
 	}
 }
 
 func TestTool_Retain_EmptyContent(t *testing.T) {
 	requireServerUp(t)
 	c := mustConnect(t, "tool:emptyc")
-	defer c.close()
+	defer c.Close()
 
-	result, err := c.retain("")
+	result, err := c.Retain("")
 	if err != nil {
 		t.Logf("empty content: %v", err)
 	} else {
-		t.Logf("empty content result: %s", result[:min(len(result), 200)])
+		t.Logf("empty content result: %s", result[:testutil.Min(len(result), 200)])
 	}
 }
 
 func TestTool_WrongArgumentTypes(t *testing.T) {
 	requireServerUp(t)
 	c := mustConnect(t, "tool:wrongtype")
-	defer c.close()
+	defer c.Close()
 
-	// Pass int instead of string
 	params := map[string]interface{}{
 		"name":      "memory_recall",
 		"arguments": map[string]interface{}{"query": 12345},
 	}
-	result, err := c.callJSONRPC("tools/call", params)
+	result, err := c.CallJSONRPC("tools/call", params)
 	if err != nil {
 		t.Logf("Wrong type error (expected): %v", err)
 	} else if strings.Contains(result, "error") {
-		t.Logf("Wrong type error in result (expected): %s", result[:min(len(result), 200)])
+		t.Logf("Wrong type error in result (expected): %s", result[:testutil.Min(len(result), 200)])
 	} else {
-		t.Logf("Wrong type result: %s", result[:min(len(result), 200)])
+		t.Logf("Wrong type result: %s", result[:testutil.Min(len(result), 200)])
 	}
 }
 
@@ -324,18 +315,18 @@ func TestBank_ValidFormats(t *testing.T) {
 	}
 
 	for _, bank := range validBanks {
-		c, err := newMCPClient(testServerURL, bank)
+		c, err := testutil.NewClient(testutil.DefaultServerURL, bank)
 		if err != nil {
 			t.Errorf("bank=%q: connect failed: %v", bank, err)
 			continue
 		}
-		if err := c.initialize(); err != nil {
+		if err := c.Initialize(); err != nil {
 			t.Errorf("bank=%q: init failed: %v", bank, err)
-			c.close()
+			c.Close()
 			continue
 		}
 		t.Logf("bank=%q: OK", bank)
-		c.close()
+		c.Close()
 	}
 }
 
@@ -367,11 +358,10 @@ func TestBank_InvalidFormats(t *testing.T) {
 		if resp.StatusCode == 200 {
 			t.Errorf("bank=%q: expected rejection, got 200", bank)
 		} else {
-			t.Logf("bank=%q: correctly rejected (status %d): %s", bank, resp.StatusCode, string(body)[:min(len(body), 80)])
+			t.Logf("bank=%q: correctly rejected (status %d): %s", bank, resp.StatusCode, string(body)[:testutil.Min(len(body), 80)])
 		}
 	}
 
-	// # is interpreted as URL fragment — server receives empty bank (allowed)
 	resp, err := connectSSERaw("with#hash")
 	if err == nil && resp != nil {
 		resp.Body.Close()
@@ -382,7 +372,6 @@ func TestBank_InvalidFormats(t *testing.T) {
 func TestBank_VeryLongName(t *testing.T) {
 	requireServerUp(t)
 
-	// 500 chars — should be rejected or accepted gracefully
 	longBank := strings.Repeat("a", 500)
 	resp, err := connectSSERaw(longBank)
 	if err != nil {
@@ -395,20 +384,19 @@ func TestBank_VeryLongName(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	t.Logf("long bank (500 chars): status %d, body: %s", resp.StatusCode, string(body)[:min(len(body), 80)])
+	t.Logf("long bank (500 chars): status %d, body: %s", resp.StatusCode, string(body)[:testutil.Min(len(body), 80)])
 }
 
 func TestBank_URLDecoding(t *testing.T) {
 	requireServerUp(t)
 
-	// "outreach:spidex_owner" URL-encoded
 	encoded := "outreach%3Aspidex_owner"
-	c, err := newMCPClient(testServerURL, encoded)
+	c, err := testutil.NewClient(testutil.DefaultServerURL, encoded)
 	if err != nil {
 		t.Fatalf("URL-encoded bank connect failed: %v", err)
 	}
-	defer c.close()
-	if err := c.initialize(); err != nil {
+	defer c.Close()
+	if err := c.Initialize(); err != nil {
 		t.Fatalf("URL-encoded bank init failed: %v", err)
 	}
 	t.Logf("URL-encoded bank %q: OK", encoded)
@@ -417,24 +405,21 @@ func TestBank_URLDecoding(t *testing.T) {
 func TestBank_Isolation(t *testing.T) {
 	requireServerUp(t)
 
-	// Retain in bank A, verify bank B can't recall it
 	bankA := "iso:" + fmt.Sprintf("%d", time.Now().UnixNano())
 	bankB := "iso:" + fmt.Sprintf("%d", time.Now().UnixNano()+1)
 
 	ca := mustConnect(t, bankA)
-	defer ca.close()
+	defer ca.Close()
 	cb := mustConnect(t, bankB)
-	defer cb.close()
+	defer cb.Close()
 
-	// Retain unique content in A
 	uniqueContent := fmt.Sprintf("isolation test %d", time.Now().UnixNano())
-	_, err := ca.retain(uniqueContent)
+	_, err := ca.Retain(uniqueContent)
 	if err != nil {
 		t.Fatalf("retain in A failed: %v", err)
 	}
 
-	// Try to recall from B — should NOT find A's content
-	result, err := cb.recall(uniqueContent)
+	result, err := cb.Recall(uniqueContent)
 	if err != nil {
 		t.Fatalf("recall from B failed: %v", err)
 	}
@@ -456,7 +441,6 @@ func TestSession_SSEEndpointEvent(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	// Read first event — should be "endpoint" with session_id
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)
 
@@ -472,7 +456,6 @@ func TestSession_SSEEndpointEvent(t *testing.T) {
 		}
 		line := scanner.Text()
 		if strings.HasPrefix(line, "event: endpoint") {
-			// Next line should be data
 			if !scanner.Scan() {
 				t.Fatal("no data line after endpoint event")
 			}
@@ -518,10 +501,9 @@ func TestSession_WrongMethod(t *testing.T) {
 	requireServerUp(t)
 
 	c := mustConnect(t, "sess:method")
-	defer c.close()
+	defer c.Close()
 
-	// GET instead of POST
-	url := fmt.Sprintf("%s/mcp/message?session_id=%s", testServerURL, c.sessionID)
+	url := fmt.Sprintf("%s/mcp/message?session_id=%s", testutil.DefaultServerURL, c.SessionID())
 	resp, err := http.Get(url)
 	if err != nil {
 		t.Fatalf("GET request failed: %v", err)
@@ -538,10 +520,9 @@ func TestSession_MalformedJSON(t *testing.T) {
 	requireServerUp(t)
 
 	c := mustConnect(t, "sess:malformed")
-	defer c.close()
+	defer c.Close()
 
-	status, _ := postMessage(c.sessionID, "this is not json")
-	// Should get parse error, not crash
+	status, _ := postMessage(c.SessionID(), "this is not json")
 	if status == 202 || status == 200 {
 		t.Logf("Malformed JSON: accepted (async processing)")
 	} else {
@@ -553,19 +534,13 @@ func TestSession_OversizedBody(t *testing.T) {
 	requireServerUp(t)
 
 	c := mustConnect(t, "sess:oversize")
-	defer c.close()
+	defer c.Close()
 
-	// 2MB body — limit is 1MB
-	bigContent := strings.Repeat("x", 2*1024*1024)
-	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_retain","arguments":{"content":"%s"}}}`, bigContent[:100]) // just use a portion for the JSON
-	_ = body
-
-	// Actually test via retain with very large content
-	result, err := c.retain(strings.Repeat("large content ", 10000))
+	result, err := c.Retain(strings.Repeat("large content ", 10000))
 	if err != nil {
 		t.Logf("Large content: %v", err)
 	} else {
-		t.Logf("Large content result: %s", result[:min(len(result), 100)])
+		t.Logf("Large content result: %s", result[:testutil.Min(len(result), 100)])
 	}
 }
 
@@ -584,16 +559,14 @@ func TestConcurrent_SameBank(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			c := mustConnect(t, bank)
-			defer c.close()
+			defer c.Close()
 
-			// Each agent retains
-			_, err := c.retain(fmt.Sprintf("agent %d entry at %s", id, time.Now().Format(time.RFC3339Nano)))
+			_, err := c.Retain(fmt.Sprintf("agent %d entry at %s", id, time.Now().Format(time.RFC3339Nano)))
 			if err != nil {
 				errs <- fmt.Errorf("agent%d retain: %w", id, err)
 			}
 
-			// Each agent recalls
-			_, err = c.recall("agent entry")
+			_, err = c.Recall("agent entry")
 			if err != nil {
 				errs <- fmt.Errorf("agent%d recall: %w", id, err)
 			}
@@ -623,22 +596,22 @@ func TestConcurrent_DifferentBanks(t *testing.T) {
 			start := time.Now()
 
 			c := mustConnect(t, bank)
-			defer c.close()
+			defer c.Close()
 
-			_, err := c.retain(fmt.Sprintf("unique content for agent %d", id))
+			_, err := c.Retain(fmt.Sprintf("unique content for agent %d", id))
 			if err != nil {
 				errs <- fmt.Errorf("agent%d retain: %w", id, err)
 				return
 			}
 
-			result, err := c.recall(fmt.Sprintf("unique content for agent %d", id))
+			result, err := c.Recall(fmt.Sprintf("unique content for agent %d", id))
 			if err != nil {
 				errs <- fmt.Errorf("agent%d recall: %w", id, err)
 				return
 			}
 
 			if !strings.Contains(result, fmt.Sprintf("agent %d", id)) {
-				t.Logf("agent%d: recall didn't contain expected text (may be empty on fresh bank)", id)
+				t.Logf("agent%d: recall didn't contain expected text", id)
 			}
 
 			durations <- time.Since(start)
@@ -665,32 +638,29 @@ func TestConcurrent_DifferentBanks(t *testing.T) {
 func TestConcurrent_RecallDoesNotBlockOnRetain(t *testing.T) {
 	requireServerUp(t)
 
-	// Fill retain queue with slow operations, then verify recall still works fast
 	var wg sync.WaitGroup
 	retainStarted := make(chan struct{})
 	recallDone := make(chan time.Duration, 1)
 
-	// Start a retain
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		c := mustConnect(t, "conc:block")
-		defer c.close()
+		defer c.Close()
 		close(retainStarted)
-		c.retain("slow retain operation")
+		c.Retain("slow retain operation")
 	}()
 
 	<-retainStarted
-	time.Sleep(100 * time.Millisecond) // let retain start
+	time.Sleep(100 * time.Millisecond)
 
-	// Now do a recall — should be fast
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		c := mustConnect(t, "conc:fast")
-		defer c.close()
+		defer c.Close()
 		start := time.Now()
-		c.recall("fast recall")
+		c.Recall("fast recall")
 		recallDone <- time.Since(start)
 	}()
 
@@ -709,9 +679,6 @@ func TestConcurrent_RecallDoesNotBlockOnRetain(t *testing.T) {
 func TestWorkerPool_QueueFull(t *testing.T) {
 	requireServerUp(t)
 
-	// Fire many retains simultaneously to saturate the queue
-	// Buffer is 100, workers are 2, each retain takes ~6s
-	// So 50 concurrent retains should fill the queue
 	const count = 20
 	var wg sync.WaitGroup
 	errs := make(chan error, count)
@@ -722,9 +689,9 @@ func TestWorkerPool_QueueFull(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			c := mustConnect(t, fmt.Sprintf("pool:%d-%d", id, time.Now().UnixNano()))
-			defer c.close()
+			defer c.Close()
 
-			_, err := c.retain(fmt.Sprintf("pool saturation test %d", id))
+			_, err := c.Retain(fmt.Sprintf("pool saturation test %d", id))
 			if err != nil {
 				errs <- fmt.Errorf("retain %d: %w", id, err)
 			} else {
@@ -756,25 +723,21 @@ func TestIntegrity_RetainThenRecall(t *testing.T) {
 
 	bank := fmt.Sprintf("integ:%d", time.Now().UnixNano())
 	c := mustConnect(t, bank)
-	defer c.close()
+	defer c.Close()
 
-	// Retain specific content
 	unique := fmt.Sprintf("integrity test at %s with value %d", time.Now().Format(time.RFC3339), time.Now().UnixNano())
-	_, err := c.retain(unique)
+	_, err := c.Retain(unique)
 	if err != nil {
 		t.Fatalf("retain failed: %v", err)
 	}
 
-	// Give Hindsight a moment to index
 	time.Sleep(1 * time.Second)
 
-	// Recall — should find it
-	result, err := c.recall("integrity test value")
+	result, err := c.Recall("integrity test value")
 	if err != nil {
 		t.Fatalf("recall failed: %v", err)
 	}
-	t.Logf("Recall after retain: %s", result[:min(len(result), 300)])
-	// Note: Hindsight may return empty if indexing is async — this is informational
+	t.Logf("Recall after retain: %s", result[:testutil.Min(len(result), 300)])
 }
 
 func TestIntegrity_MultipleRetainsSameBank(t *testing.T) {
@@ -782,7 +745,7 @@ func TestIntegrity_MultipleRetainsSameBank(t *testing.T) {
 
 	bank := fmt.Sprintf("integ:multi-%d", time.Now().UnixNano())
 	c := mustConnect(t, bank)
-	defer c.close()
+	defer c.Close()
 
 	items := []string{
 		"The quick brown fox jumps over the lazy dog",
@@ -791,20 +754,19 @@ func TestIntegrity_MultipleRetainsSameBank(t *testing.T) {
 	}
 
 	for i, item := range items {
-		_, err := c.retain(item)
+		_, err := c.Retain(item)
 		if err != nil {
 			t.Fatalf("retain %d failed: %v", i, err)
 		}
 		t.Logf("Retained item %d", i)
 	}
 
-	// Recall for a keyword from item 2
 	time.Sleep(1 * time.Second)
-	result, err := c.recall("answer life universe everything")
+	result, err := c.Recall("answer life universe everything")
 	if err != nil {
 		t.Fatalf("recall failed: %v", err)
 	}
-	t.Logf("Recall for 'answer life universe everything': %s", result[:min(len(result), 300)])
+	t.Logf("Recall for 'answer life universe everything': %s", result[:testutil.Min(len(result), 300)])
 }
 
 func TestIntegrity_ReflectAfterRetain(t *testing.T) {
@@ -812,24 +774,22 @@ func TestIntegrity_ReflectAfterRetain(t *testing.T) {
 
 	bank := fmt.Sprintf("integ:reflect-%d", time.Now().UnixNano())
 	c := mustConnect(t, bank)
-	defer c.close()
+	defer c.Close()
 
-	// Retain some data first
-	_, err := c.retain("Go is a statically typed, compiled programming language designed at Google")
+	_, err := c.Retain("Go is a statically typed, compiled programming language designed at Google")
 	if err != nil {
 		t.Fatalf("retain 1 failed: %v", err)
 	}
-	_, err = c.retain("Go is known for its simplicity, concurrency support with goroutines, and fast compilation")
+	_, err = c.Retain("Go is known for its simplicity, concurrency support with goroutines, and fast compilation")
 	if err != nil {
 		t.Fatalf("retain 2 failed: %v", err)
 	}
 
-	// Reflect — should synthesize insights
-	result, err := c.reflect("What do you know about Go programming language?")
+	result, err := c.Reflect("What do you know about Go programming language?")
 	if err != nil {
 		t.Fatalf("reflect failed: %v", err)
 	}
-	t.Logf("Reflect result: %s", result[:min(len(result), 500)])
+	t.Logf("Reflect result: %s", result[:testutil.Min(len(result), 500)])
 }
 
 // ─── 8. SSE Edge Cases ─────────────────────────────────────────────────────
@@ -871,19 +831,16 @@ func TestSSE_ContentType(t *testing.T) {
 func TestSSE_ConnectionDrop(t *testing.T) {
 	requireServerUp(t)
 
-	// Connect, then immediately close — server should handle gracefully
-	c, err := newMCPClient(testServerURL, "sse:drop")
+	c, err := testutil.NewClient(testutil.DefaultServerURL, "sse:drop")
 	if err != nil {
 		t.Fatalf("connect failed: %v", err)
 	}
-	c.initialize()
-	c.close()
+	c.Initialize()
+	c.Close()
 
-	// Give server time to detect the drop
 	time.Sleep(1 * time.Second)
 
-	// Server should still be healthy
-	resp, err := http.Get(testServerURL + "/health")
+	resp, err := http.Get(testutil.DefaultServerURL + "/health")
 	if err != nil {
 		t.Fatalf("health check failed after drop: %v", err)
 	}
@@ -903,7 +860,7 @@ func TestSSE_MultipleConnectionsSameBank(t *testing.T) {
 
 	bank := fmt.Sprintf("sse:multi-%d", time.Now().UnixNano())
 	const conns = 5
-	clients := make([]*mcpClient, conns)
+	clients := make([]*testutil.Client, conns)
 
 	for i := 0; i < conns; i++ {
 		c := mustConnect(t, bank)
@@ -911,13 +868,12 @@ func TestSSE_MultipleConnectionsSameBank(t *testing.T) {
 	}
 	defer func() {
 		for _, c := range clients {
-			c.close()
+			c.Close()
 		}
 	}()
 
-	// All should work
 	for i, c := range clients {
-		_, err := c.recall(fmt.Sprintf("test %d", i))
+		_, err := c.Recall(fmt.Sprintf("test %d", i))
 		if err != nil {
 			t.Errorf("client %d recall failed: %v", i, err)
 		}
@@ -930,8 +886,7 @@ func TestSSE_MultipleConnectionsSameBank(t *testing.T) {
 func TestHTTP_InvalidMethod(t *testing.T) {
 	requireServerUp(t)
 
-	// DELETE on health
-	req, _ := http.NewRequest("DELETE", testServerURL+"/health", nil)
+	req, _ := http.NewRequest("DELETE", testutil.DefaultServerURL+"/health", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("DELETE health: %v", err)
@@ -939,8 +894,7 @@ func TestHTTP_InvalidMethod(t *testing.T) {
 	resp.Body.Close()
 	t.Logf("DELETE /health: %d", resp.StatusCode)
 
-	// PUT on mcp/sse
-	req, _ = http.NewRequest("PUT", testServerURL+"/mcp/sse", nil)
+	req, _ = http.NewRequest("PUT", testutil.DefaultServerURL+"/mcp/sse", nil)
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("PUT mcp/sse: %v", err)
@@ -952,7 +906,7 @@ func TestHTTP_InvalidMethod(t *testing.T) {
 func TestHTTP_HealthContainsAllFields(t *testing.T) {
 	requireServerUp(t)
 
-	resp, err := http.Get(testServerURL + "/health")
+	resp, err := http.Get(testutil.DefaultServerURL + "/health")
 	if err != nil {
 		t.Fatalf("health: %v", err)
 	}
@@ -978,8 +932,7 @@ func TestHTTP_HealthContainsAllFields(t *testing.T) {
 func TestStartStop_AlreadyRunning(t *testing.T) {
 	requireServerUp(t)
 
-	// /start when already running
-	resp, err := http.Post(testServerURL+"/start", "", nil)
+	resp, err := http.Post(testutil.DefaultServerURL+"/start", "", nil)
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -990,8 +943,6 @@ func TestStartStop_AlreadyRunning(t *testing.T) {
 
 func TestStopEndpoint_DontActuallyStop(t *testing.T) {
 	requireServerUp(t)
-	// NOTE: We don't actually call /stop because it would kill the server
-	// and other tests would fail. Just verify the endpoint exists.
 	t.Skip("skipping /stop to keep server alive for other tests")
 }
 
@@ -1008,14 +959,13 @@ func TestStress_RapidConnectDisconnect(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			c, err := newMCPClient(testServerURL, fmt.Sprintf("stress:rapid-%d", id))
+			c, err := testutil.NewClient(testutil.DefaultServerURL, fmt.Sprintf("stress:rapid-%d", id))
 			if err != nil {
 				errs <- fmt.Errorf("connect %d: %w", id, err)
 				return
 			}
-			c.initialize()
-			// Immediately close
-			c.close()
+			c.Initialize()
+			c.Close()
 		}(i)
 	}
 
@@ -1035,8 +985,7 @@ func TestStress_RapidConnectDisconnect(t *testing.T) {
 func TestMetrics_IncrementOnCalls(t *testing.T) {
 	requireServerUp(t)
 
-	// Get initial metrics
-	resp, _ := http.Get(testServerURL + "/health")
+	resp, _ := http.Get(testutil.DefaultServerURL + "/health")
 	var before map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&before)
 	resp.Body.Close()
@@ -1046,14 +995,12 @@ func TestMetrics_IncrementOnCalls(t *testing.T) {
 	beforeRetain, _ := beforeMetrics["memory.retain_count"].(float64)
 
 	c := mustConnect(t, "metrics:test")
-	defer c.close()
+	defer c.Close()
 
-	// Do 1 recall + 1 retain
-	c.recall("metrics test")
-	c.retain("metrics test content")
+	c.Recall("metrics test")
+	c.Retain("metrics test content")
 
-	// Check metrics incremented
-	resp, _ = http.Get(testServerURL + "/health")
+	resp, _ = http.Get(testutil.DefaultServerURL + "/health")
 	var after map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&after)
 	resp.Body.Close()
@@ -1068,7 +1015,7 @@ func TestMetrics_IncrementOnCalls(t *testing.T) {
 	if afterRetain <= beforeRetain {
 		t.Errorf("retain count didn't increment: before=%.0f after=%.0f", beforeRetain, afterRetain)
 	}
-	t.Logf("Metrics: recall %.0f→%.0f, retain %.0f→%.0f", beforeRecall, afterRecall, beforeRetain, afterRetain)
+	t.Logf("Metrics: recall %.0f->%.0f, retain %.0f->%.0f", beforeRecall, afterRecall, beforeRetain, afterRetain)
 }
 
 // ─── 13. JSON-RPC Compliance ───────────────────────────────────────────────
@@ -1077,12 +1024,10 @@ func TestJSONRPC_VersionField(t *testing.T) {
 	requireServerUp(t)
 
 	c := mustConnect(t, "rpc:version")
-	defer c.close()
+	defer c.Close()
 
-	// Send request without jsonrpc field
 	body := `{"id":1,"method":"ping"}`
-	status, _ := postMessage(c.sessionID, body)
-	// Should still work or return parse error, not crash
+	status, _ := postMessage(c.SessionID(), body)
 	t.Logf("Missing jsonrpc field: status %d", status)
 }
 
@@ -1090,10 +1035,10 @@ func TestJSONRPC_NegativeID(t *testing.T) {
 	requireServerUp(t)
 
 	c := mustConnect(t, "rpc:negid")
-	defer c.close()
+	defer c.Close()
 
 	body := `{"jsonrpc":"2.0","id":-1,"method":"ping"}`
-	status, _ := postMessage(c.sessionID, body)
+	status, _ := postMessage(c.SessionID(), body)
 	t.Logf("Negative ID: status %d", status)
 }
 
@@ -1101,10 +1046,10 @@ func TestJSONRPC_StringID(t *testing.T) {
 	requireServerUp(t)
 
 	c := mustConnect(t, "rpc:strid")
-	defer c.close()
+	defer c.Close()
 
 	body := `{"jsonrpc":"2.0","id":"abc-123","method":"ping"}`
-	status, _ := postMessage(c.sessionID, body)
+	status, _ := postMessage(c.SessionID(), body)
 	t.Logf("String ID: status %d", status)
 }
 
@@ -1112,10 +1057,10 @@ func TestJSONRPC_NullID(t *testing.T) {
 	requireServerUp(t)
 
 	c := mustConnect(t, "rpc:nullid")
-	defer c.close()
+	defer c.Close()
 
 	body := `{"jsonrpc":"2.0","id":null,"method":"ping"}`
-	status, _ := postMessage(c.sessionID, body)
+	status, _ := postMessage(c.SessionID(), body)
 	t.Logf("Null ID: status %d", status)
 }
 
@@ -1125,11 +1070,10 @@ func TestNotification_Initialized(t *testing.T) {
 	requireServerUp(t)
 
 	c := mustConnect(t, "notif:init")
-	defer c.close()
+	defer c.Close()
 
-	// notifications/initialized should not return a result
 	body := `{"jsonrpc":"2.0","method":"notifications/initialized"}`
-	status, _ := postMessage(c.sessionID, body)
+	status, _ := postMessage(c.SessionID(), body)
 	t.Logf("notifications/initialized: status %d", status)
 }
 
@@ -1139,15 +1083,14 @@ func TestEdgeCase_VeryLongRetainContent(t *testing.T) {
 	requireServerUp(t)
 
 	c := mustConnect(t, "edge:long")
-	defer c.close()
+	defer c.Close()
 
-	// 100KB of content
 	longContent := strings.Repeat("This is a test sentence for long content retention. ", 2000)
-	result, err := c.retain(longContent)
+	result, err := c.Retain(longContent)
 	if err != nil {
 		t.Logf("100KB retain: %v", err)
 	} else {
-		t.Logf("100KB retain result: %s", result[:min(len(result), 100)])
+		t.Logf("100KB retain result: %s", result[:testutil.Min(len(result), 100)])
 	}
 }
 
@@ -1155,14 +1098,14 @@ func TestEdgeCase_UnicodeContent(t *testing.T) {
 	requireServerUp(t)
 
 	c := mustConnect(t, "edge:unicode")
-	defer c.close()
+	defer c.Close()
 
 	unicodeContent := "日本語テスト: こんにちは世界 🌍🚀 Émojis and àccénts über alles"
-	result, err := c.retain(unicodeContent)
+	result, err := c.Retain(unicodeContent)
 	if err != nil {
 		t.Logf("Unicode retain: %v", err)
 	} else {
-		t.Logf("Unicode retain result: %s", result[:min(len(result), 100)])
+		t.Logf("Unicode retain result: %s", result[:testutil.Min(len(result), 100)])
 	}
 }
 
@@ -1170,10 +1113,10 @@ func TestEdgeCase_JSONInContent(t *testing.T) {
 	requireServerUp(t)
 
 	c := mustConnect(t, "edge:json")
-	defer c.close()
+	defer c.Close()
 
 	jsonContent := `{"nested":"json","array":[1,2,3],"special":"quotes \\\" and \\\\ backslash"}`
-	_, err := c.retain(jsonContent)
+	_, err := c.Retain(jsonContent)
 	if err != nil {
 		t.Logf("JSON retain: %v", err)
 	} else {
@@ -1186,7 +1129,7 @@ func TestEdgeCase_JSONInContent(t *testing.T) {
 func TestAtomic_PanicsCounter(t *testing.T) {
 	requireServerUp(t)
 
-	resp, _ := http.Get(testServerURL + "/health")
+	resp, _ := http.Get(testutil.DefaultServerURL + "/health")
 	var health map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&health)
 	resp.Body.Close()
@@ -1207,7 +1150,7 @@ func TestAtomic_PanicsCounter(t *testing.T) {
 func TestQueue_DepthReported(t *testing.T) {
 	requireServerUp(t)
 
-	resp, _ := http.Get(testServerURL + "/health")
+	resp, _ := http.Get(testutil.DefaultServerURL + "/health")
 	var health map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&health)
 	resp.Body.Close()
@@ -1215,7 +1158,6 @@ func TestQueue_DepthReported(t *testing.T) {
 	depth, _ := health["queue_depth"].(float64)
 	t.Logf("Queue depth: %.0f", depth)
 
-	// After all tests, queue should be drained
 	if depth > 0 {
 		t.Logf("Warning: queue not fully drained (depth=%.0f)", depth)
 	}
@@ -1226,19 +1168,16 @@ func TestQueue_DepthReported(t *testing.T) {
 func TestSession_CountIncreases(t *testing.T) {
 	requireServerUp(t)
 
-	// Get initial count
-	resp, _ := http.Get(testServerURL + "/health")
+	resp, _ := http.Get(testutil.DefaultServerURL + "/health")
 	var before map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&before)
 	resp.Body.Close()
 	beforeCount, _ := before["sessions"].(float64)
 
-	// Create a new session
 	c := mustConnect(t, "sess:count")
-	defer c.close()
+	defer c.Close()
 
-	// Check count increased
-	resp, _ = http.Get(testServerURL + "/health")
+	resp, _ = http.Get(testutil.DefaultServerURL + "/health")
 	var after map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&after)
 	resp.Body.Close()
@@ -1247,6 +1186,6 @@ func TestSession_CountIncreases(t *testing.T) {
 	if afterCount <= beforeCount {
 		t.Errorf("session count didn't increase: before=%.0f after=%.0f", beforeCount, afterCount)
 	} else {
-		t.Logf("Session count: %.0f → %.0f", beforeCount, afterCount)
+		t.Logf("Session count: %.0f -> %.0f", beforeCount, afterCount)
 	}
 }
