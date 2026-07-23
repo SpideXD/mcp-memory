@@ -1,0 +1,230 @@
+{
+  "dimension": "scale",
+  "tier": "200",
+  "results": [
+    {
+      "query": "What is my name?",
+      "expected_concept": "Alex",
+      "actual_output": "",
+      "latency_ms": 2.313,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "Where do I live?",
+      "expected_concept": "San Francisco",
+      "actual_output": "",
+      "latency_ms": 1.191,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What is my job?",
+      "expected_concept": "software engineer",
+      "actual_output": "",
+      "latency_ms": 0.759,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What company do I work for?",
+      "expected_concept": "Stripe",
+      "actual_output": "",
+      "latency_ms": 0.689,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What programming languages do I know?",
+      "expected_concept": "Go",
+      "actual_output": "",
+      "latency_ms": 0.814,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What is my favorite food?",
+      "expected_concept": "sushi",
+      "actual_output": "",
+      "latency_ms": 0.742,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What are my hobbies?",
+      "expected_concept": "rock climbing",
+      "actual_output": "",
+      "latency_ms": 0.683,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "Do I have siblings?",
+      "expected_concept": "younger sister",
+      "actual_output": "",
+      "latency_ms": 0.673,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "Where did I go to school?",
+      "expected_concept": "MIT",
+      "actual_output": "",
+      "latency_ms": 0.679,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What is my pet's name?",
+      "expected_concept": "Luna",
+      "actual_output": "",
+      "latency_ms": 0.725,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "Where did I go on vacation?",
+      "expected_concept": "Kyoto",
+      "actual_output": "",
+      "latency_ms": 0.63,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What award did I win?",
+      "expected_concept": "best paper",
+      "actual_output": "",
+      "latency_ms": 0.661,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "Do I have any allergies?",
+      "expected_concept": "peanuts",
+      "actual_output": "",
+      "latency_ms": 0.694,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What bank do I use?",
+      "expected_concept": "Chase",
+      "actual_output": "",
+      "latency_ms": 0.585,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What car do I drive?",
+      "expected_concept": "Tesla",
+      "actual_output": "",
+      "latency_ms": 0.586,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What phone do I use?",
+      "expected_concept": "iPhone",
+      "actual_output": "",
+      "latency_ms": 0.618,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What is my favorite movie?",
+      "expected_concept": "Inception",
+      "actual_output": "",
+      "latency_ms": 0.565,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What book am I reading?",
+      "expected_concept": "Dune",
+      "actual_output": "",
+      "latency_ms": 0.615,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What is my favorite band?",
+      "expected_concept": "Radiohead",
+      "actual_output": "",
+      "latency_ms": 0.805,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What sports do I play?",
+      "expected_concept": "tennis",
+      "actual_output": "",
+      "latency_ms": 0.652,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What is my height?",
+      "expected_concept": "6 feet",
+      "actual_output": "",
+      "latency_ms": 0.567,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What coffee do I drink?",
+      "expected_concept": "oat milk latte",
+      "actual_output": "",
+      "latency_ms": 0.558,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What is my favorite season?",
+      "expected_concept": "autumn",
+      "actual_output": "",
+      "latency_ms": 0.574,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What instrument do I play?",
+      "expected_concept": "guitar",
+      "actual_output": "",
+      "latency_ms": 0.588,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What is my birth month?",
+      "expected_concept": "March",
+      "actual_output": "",
+      "latency_ms": 0.577,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What neighborhood do I live in?",
+      "expected_concept": "Mission District",
+      "actual_output": "",
+      "latency_ms": 0.563,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What is my favorite restaurant?",
+      "expected_concept": "La Taqueria",
+      "actual_output": "",
+      "latency_ms": 0.601,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What is my preferred IDE?",
+      "expected_concept": "VS Code",
+      "actual_output": "",
+      "latency_ms": 0.554,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What is my morning routine?",
+      "expected_concept": "meditation",
+      "actual_output": "",
+      "latency_ms": 0.582,
+      "note": "recall error: MCP call tools/call: status 400"
+    },
+    {
+      "query": "What is my favorite color?",
+      "expected_concept": "deep blue",
+      "actual_output": "",
+      "latency_ms": 0.489,
+      "note": "recall error: MCP call tools/call: status 400"
+    }
+  ],
+  "metrics": {
+    "tier": 200,
+    "total_retains": 200,
+    "retain_errors": 168,
+    "total_retain_duration_sec": 238.6488205,
+    "total_probe_duration_sec": 0.021786334,
+    "precision_at_1": 0,
+    "mrr": 0,
+    "latency_p50_ms": 0.624,
+    "latency_p99_ms": 1.9876199999999997
+  },
+  "passed": true,
+  "timestamp": "2026-07-23T16:09:48.666269+05:30",
+  "duration_ms": 238673
+}

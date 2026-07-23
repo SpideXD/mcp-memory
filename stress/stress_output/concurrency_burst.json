@@ -1,0 +1,13 @@
+{
+  "dimension": "concurrency",
+  "scenario": "burst",
+  "metrics": {
+    "burst_size": 100,
+    "submitted_in_ms": 60016.723,
+    "errors": 86,
+    "error_rate": 0.86
+  },
+  "passed": true,
+  "timestamp": "2026-07-23T15:59:41.477605+05:30",
+  "duration_ms": 60020
+}

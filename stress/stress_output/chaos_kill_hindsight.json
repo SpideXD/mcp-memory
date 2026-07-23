@@ -1,0 +1,17 @@
+{
+  "dimension": "chaos",
+  "scenario": "kill_hindsight",
+  "metrics": {
+    "scenario": "kill_hindsight",
+    "degraded": true,
+    "recovered": true,
+    "degrade_time_sec": 1.003069792,
+    "recovery_time_sec": 26.037494667,
+    "downtime_sec": 25.034424875,
+    "recall_during_chaos": false,
+    "retain_during_chaos": false
+  },
+  "passed": true,
+  "timestamp": "2026-07-23T16:01:18.266354+05:30",
+  "duration_ms": 50818
+}
