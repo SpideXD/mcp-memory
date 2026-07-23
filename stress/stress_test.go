@@ -1813,10 +1813,11 @@ func TestStressEdge_All(t *testing.T) {
 		edgeClient.Close()
 	}
 
-	// Edge cases: passed if all probes have actual content (no errors)
+	// Edge cases: passed if all probes have actual content (no unexpected errors)
+	// Expected errors (empty-string probe, etc.) have "(expected)" in the note
 	edgeProbeErrors := 0
 	for _, r := range allResults {
-		if r.Note != "" {
+		if r.Note != "" && !strings.Contains(r.Note, "(expected)") {
 			edgeProbeErrors++
 		}
 	}

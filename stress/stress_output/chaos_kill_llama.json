@@ -3,15 +3,15 @@
   "scenario": "kill_llama",
   "metrics": {
     "scenario": "kill_llama",
-    "degraded": true,
-    "recovered": true,
-    "degrade_time_sec": 4.010605459,
-    "recovery_time_sec": 16.067010084,
-    "downtime_sec": 12.056404624999999,
-    "recall_during_chaos": true,
-    "retain_during_chaos": true
+    "degraded": false,
+    "recovered": false,
+    "degrade_time_sec": 0,
+    "recovery_time_sec": 0,
+    "downtime_sec": 0,
+    "recall_during_chaos": false,
+    "retain_during_chaos": false
   },
-  "passed": true,
-  "timestamp": "2026-07-23T16:00:18.521968+05:30",
-  "duration_ms": 28780
+  "passed": false,
+  "timestamp": "2026-07-23T17:27:08.916497+05:30",
+  "duration_ms": 10045
 }
