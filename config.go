@@ -359,7 +359,10 @@ func (c Config) Validate() error {
 		// Validate Cognee Python path is resolvable
 		if c.CogneePythonPath != "" {
 			info, err := os.Stat(c.CogneePythonPath)
-			if err == nil && (!info.Mode().IsRegular() || info.Size() == 0 || info.Mode()&0111 == 0) {
+			if err != nil {
+				return fmt.Errorf("COGNEE_PYTHON_PATH not found: %s: %w", c.CogneePythonPath, err)
+			}
+			if !info.Mode().IsRegular() || info.Size() == 0 || info.Mode()&0111 == 0 {
 				return fmt.Errorf("COGNEE_PYTHON_PATH is not a valid executable: %s", c.CogneePythonPath)
 			}
 		}
@@ -375,10 +378,10 @@ func (c Config) Validate() error {
 		if c.CogneeBinary == "" {
 			return fmt.Errorf("COGNEE_BINARY is required for cognee-rust backend")
 		}
-		if info, err := os.Stat(c.CogneeBinary); err == nil {
-			if !info.Mode().IsRegular() || info.Size() == 0 || info.Mode()&0111 == 0 {
-				return fmt.Errorf("COGNEE_BINARY is not a valid executable: %s", c.CogneeBinary)
-			}
+		if info, err := os.Stat(c.CogneeBinary); err != nil {
+			return fmt.Errorf("COGNEE_BINARY not found: %s: %w", c.CogneeBinary, err)
+		} else if !info.Mode().IsRegular() || info.Size() == 0 || info.Mode()&0111 == 0 {
+			return fmt.Errorf("COGNEE_BINARY is not a valid executable: %s", c.CogneeBinary)
 		}
 		if c.CogneeMaxConcurrentRetains < 1 {
 			return fmt.Errorf("COGNEE_MAX_CONCURRENT_RETAINS must be >= 1, got %d", c.CogneeMaxConcurrentRetains)

@@ -91,12 +91,3 @@ func cleanupOrphans() {
 
 	os.Remove(path)
 }
-
-func (svc *services) savePidsOnStartup() {
-	// Save PIDs immediately after starting all services
-	svc.savePids()
-}
-
-func (svc *services) clearPidsOnShutdown() {
-	svc.clearPids()
-}

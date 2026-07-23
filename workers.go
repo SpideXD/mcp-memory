@@ -120,10 +120,15 @@ func (ws *workerSystem) start(s *Server) {
 				if !ok {
 					return
 				}
-				_, err := s.backend.Reflect(ctx, job.Bank, "") // empty query = full improve
+				result, err := s.backend.Reflect(ctx, job.Bank, "") // empty query = full improve
 				ws.improve.mu.Lock()
 				delete(ws.improve.pending, job.Bank)
 				ws.improve.mu.Unlock()
+				// Send result back if caller wants it (handleImprove)
+				select {
+				case job.Result <- MemoryResult{Data: result, Err: err}:
+				default:
+				}
 				if err != nil {
 					ws.log.Warn("auto-improve failed", "bank", job.Bank, logger.Error(err))
 				} else {
@@ -198,10 +203,12 @@ func (s *Server) sessionCleaner() {
 	defer func() {
 		if r := recover(); r != nil {
 			s.panics.Add(1)
-			s.log.Error("session cleaner panic", "panic", fmt.Sprintf("%v", r))
+			s.log.Error("session cleaner goroutine panicked", "panic", fmt.Sprintf("%v", r))
 			s.alerts.Send(AlertCritical, fmt.Sprintf("Session cleaner panicked: %v", r), nil)
 		}
 	}()
+	s.log.Info("goroutine_started", "name", "session_cleaner")
+	defer s.log.Info("goroutine_stopped", "name", "session_cleaner")
 	ticker := time.NewTicker(s.config.SessionCleanInterval)
 	defer ticker.Stop()
 	for {

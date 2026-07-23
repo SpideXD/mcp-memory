@@ -591,22 +591,17 @@ func (svc *services) startHindsight() error {
 	return nil
 }
 
-// startCogneePython spawns uvicorn serving the Cognee Python API.
-func (svc *services) startCogneePython() error {
-	pythonPath := svc.resolveCogneePythonPath()
-	cmd := exec.Command(pythonPath, "-m", "uvicorn", "cognee.api.client:app",
-		"--host", "0.0.0.0", "--port", svc.config.CogneePort)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	// Env var translation: Hindsight env var names → Cognee env var names
-	cmd.Env = append(os.Environ(),
-		// LLM config (translated from Hindsight env var names)
-		"LLM_API_KEY="+svc.config.LLMAPIKey,
-		"LLM_MODEL="+svc.config.LLMModel,
-		"LLM_ENDPOINT="+svc.config.LLMBaseURL,
+// cogneeEnv returns the shared env var block for Cognee subprocesses.
+// Deduplicates the mapping between startCogneePython and startCogneeRust.
+func (svc *services) cogneeEnv() []string {
+	return append(os.Environ(),
+		// LLM config — uses Cognee-specific config fields (P2-C5 fix)
+		"LLM_API_KEY="+svc.config.CogneeLLMApiKey,
+		"LLM_MODEL="+svc.config.CogneeLLMModel,
+		"LLM_ENDPOINT="+svc.config.CogneeLLMEndpoint,
 		"LLM_PROVIDER=openai",
-		// Embedding config (points at our llama-server :8080)
-		"EMBEDDING_ENDPOINT=http://localhost:"+svc.config.LlamaPort+"/v1",
+		// Embedding config
+		"EMBEDDING_ENDPOINT="+svc.config.CogneeEmbeddingEndpoint,
 		"EMBEDDING_PROVIDER="+svc.config.CogneeEmbeddingProvider,
 		"EMBEDDING_API_KEY=not-needed",
 		// Data isolation
@@ -617,6 +612,15 @@ func (svc *services) startCogneePython() error {
 		"COGNEE_VECTOR_DB_PROVIDER="+getEnvOrDefault("COGNEE_VECTOR_DB_PROVIDER", "lancedb"),
 		"COGNEE_GRAPH_DB_PROVIDER="+getEnvOrDefault("COGNEE_GRAPH_DB_PROVIDER", "ladybug"),
 	)
+}
+
+// startCogneePython spawns uvicorn serving the Cognee Python API.
+func (svc *services) startCogneePython() error {
+	pythonPath := svc.resolveCogneePythonPath()
+	cmd := exec.Command(pythonPath, "-m", "uvicorn", "cognee.api.client:app",
+		"--host", "0.0.0.0", "--port", svc.config.CogneePort)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = svc.cogneeEnv()
 
 	wd, _ := os.Getwd()
 	f, _ := os.OpenFile(filepath.Join(wd, "logs", "cognee-crash.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -641,22 +645,7 @@ func (svc *services) startCogneeRust() error {
 
 	cmd := exec.Command(binaryPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	// Same env var translation as Python Cognee
-	cmd.Env = append(os.Environ(),
-		"LLM_API_KEY="+svc.config.LLMAPIKey,
-		"LLM_MODEL="+svc.config.LLMModel,
-		"LLM_ENDPOINT="+svc.config.LLMBaseURL,
-		"LLM_PROVIDER=openai",
-		"EMBEDDING_ENDPOINT=http://localhost:"+svc.config.LlamaPort+"/v1",
-		"EMBEDDING_PROVIDER="+svc.config.CogneeEmbeddingProvider,
-		"EMBEDDING_API_KEY=not-needed",
-		"COGNEE_DATA_DIR="+svc.config.CogneeDataDir,
-		"HTTP_API_PORT="+svc.config.CogneePort,
-		"COGNEE_DB_PROVIDER="+getEnvOrDefault("COGNEE_DB_PROVIDER", "sqlite"),
-		"COGNEE_VECTOR_DB_PROVIDER="+getEnvOrDefault("COGNEE_VECTOR_DB_PROVIDER", "lancedb"),
-		"COGNEE_GRAPH_DB_PROVIDER="+getEnvOrDefault("COGNEE_GRAPH_DB_PROVIDER", "ladybug"),
-	)
+	cmd.Env = svc.cogneeEnv()
 
 	wd, _ := os.Getwd()
 	f, _ := os.OpenFile(filepath.Join(wd, "logs", "cognee-crash.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)

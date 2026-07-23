@@ -129,10 +129,12 @@ func (s *Server) jobTrackerCleanup() {
 	defer func() {
 		if r := recover(); r != nil {
 			s.panics.Add(1)
-			s.log.Error("job tracker cleanup panic", "panic", fmt.Sprintf("%v", r))
+			s.log.Error("job tracker cleanup goroutine panicked", "panic", fmt.Sprintf("%v", r))
 		}
 	}()
+	s.log.Info("goroutine_started", "name", "job_tracker_cleanup")
 	s.log.Info("job tracker cleanup goroutine started")
+	defer s.log.Info("goroutine_stopped", "name", "job_tracker_cleanup")
 	defer s.log.Info("job tracker cleanup goroutine stopped")
 
 	ticker := time.NewTicker(5 * time.Minute)
