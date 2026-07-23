@@ -120,7 +120,7 @@ func (ws *workerSystem) start(s *Server) {
 				if !ok {
 					return
 				}
-				result, err := s.backend.Reflect(ctx, job.Bank, "") // empty query = full improve
+				result, err := s.backend.Reflect(job.Ctx, job.Bank, "") // empty query = full improve
 				ws.improve.mu.Lock()
 				delete(ws.improve.pending, job.Bank)
 				ws.improve.mu.Unlock()
