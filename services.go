@@ -25,14 +25,16 @@ type services struct {
 	llamaCmd         *exec.Cmd
 	llamaRerankerCmd *exec.Cmd
 	hindsightCmd     *exec.Cmd
+	cogneeCmd        *exec.Cmd
 	httpClient       *http.Client
 	mu               sync.Mutex
 	log              *logger.Logger
 	alerts           *AlertClient
+	backendName      string // "hindsight", "cognee-python", or "cognee-rust"
 
 	// Cached health status to avoid 3 HTTP requests per tool call
 	healthMu      sync.RWMutex
-	healthCache   [3]bool // llama, reranker, hindsight
+	healthCache   [3]bool // llama, reranker, hindsight/cognee
 	healthChecked time.Time
 	healthGroup   singleflight.Group // deduplicate concurrent health refreshes
 
@@ -40,6 +42,7 @@ type services struct {
 	llamaFails     serviceFails
 	rerankerFails  serviceFails
 	hindsightFails serviceFails
+	cogneeFails    serviceFails
 }
 
 type serviceFails struct {
@@ -51,18 +54,18 @@ type serviceFails struct {
 
 func newServices(config Config, log *logger.Logger, alerts *AlertClient) *services {
 	return &services{
-		config:     config,
-		httpClient: &http.Client{Timeout: config.RequestTimeout},
-		log:        log,
-		alerts:     alerts,
+		config:      config,
+		httpClient:  &http.Client{Timeout: config.RequestTimeout},
+		log:         log,
+		alerts:      alerts,
+		backendName: string(config.Backend),
 	}
 }
 
 func (svc *services) start() error {
 	llamaURL := healthURL(svc.config.LlamaPort)
-	rerankerURL := healthURL(svc.config.LlamaRerankerPort)
-	hindsightURL := healthURL(svc.config.HindsightPort)
 
+	// llama-server runs for ALL backends — Cognee uses it as external embeddings provider
 	if svc.config.IsCloudEmbedding() {
 		svc.log.Info("llama.cpp skipped (cloud embedding mode)")
 	} else if svc.check(llamaURL) != nil {
@@ -72,29 +75,62 @@ func (svc *services) start() error {
 	} else {
 		svc.log.Info("llama.cpp already running")
 	}
-	if svc.config.IsCloudReranker() {
-		svc.log.Info("llama reranker skipped (cloud reranker mode)")
-	} else if svc.check(rerankerURL) != nil {
-		if err := svc.startLlamaReranker(); err != nil { return err }
-		if err := svc.wait(context.Background(), rerankerURL, svc.config.StartTimeout); err != nil { return err }
-		svc.log.Info("llama reranker started")
-	} else {
-		svc.log.Info("llama reranker already running")
-	}
-	if svc.check(hindsightURL) != nil {
-		if err := svc.startHindsight(); err != nil { return err }
-		if err := svc.wait(context.Background(), hindsightURL, svc.config.StartTimeout); err != nil { return err }
-		svc.log.Info("Hindsight started")
-	} else {
-		svc.log.Info("Hindsight already running")
+
+	switch svc.config.Backend {
+	case BackendHindsight:
+		// Reranker — only for Hindsight
+		rerankerURL := healthURL(svc.config.LlamaRerankerPort)
+		if svc.config.IsCloudReranker() {
+			svc.log.Info("llama reranker skipped (cloud reranker mode)")
+		} else if svc.check(rerankerURL) != nil {
+			if err := svc.startLlamaReranker(); err != nil { return err }
+			if err := svc.wait(context.Background(), rerankerURL, svc.config.StartTimeout); err != nil { return err }
+			svc.log.Info("llama reranker started")
+		} else {
+			svc.log.Info("llama reranker already running")
+		}
+		// Hindsight API
+		hindsightURL := healthURL(svc.config.HindsightPort)
+		if svc.check(hindsightURL) != nil {
+			if err := svc.startHindsight(); err != nil { return err }
+			if err := svc.wait(context.Background(), hindsightURL, svc.config.StartTimeout); err != nil { return err }
+			svc.log.Info("Hindsight started")
+		} else {
+			svc.log.Info("Hindsight already running")
+		}
+
+	case BackendCogneePython:
+		cogneeURL := healthURL(svc.config.CogneePort)
+		if svc.check(cogneeURL) != nil {
+			if err := svc.startCogneePython(); err != nil { return err }
+			if err := svc.wait(context.Background(), cogneeURL, svc.config.StartTimeout); err != nil { return err }
+			svc.log.Info("cognee-python started")
+		} else {
+			svc.log.Info("cognee-python already running")
+		}
+
+	case BackendCogneeRust:
+		cogneeURL := healthURL(svc.config.CogneePort)
+		if svc.check(cogneeURL) != nil {
+			if err := svc.startCogneeRust(); err != nil { return err }
+			if err := svc.wait(context.Background(), cogneeURL, svc.config.StartTimeout); err != nil { return err }
+			svc.log.Info("cognee-rust started")
+		} else {
+			svc.log.Info("cognee-rust already running")
+		}
 	}
 	return nil
 }
 
 func (svc *services) stop() {
-	svc.stopProcess(&svc.hindsightCmd, "Hindsight")
-	if !svc.config.IsCloudReranker() {
-		svc.stopProcess(&svc.llamaRerankerCmd, "llama.cpp reranker")
+	switch svc.config.Backend {
+	case BackendHindsight:
+		svc.stopProcess(&svc.hindsightCmd, "Hindsight")
+		if !svc.config.IsCloudReranker() {
+			svc.stopProcess(&svc.llamaRerankerCmd, "llama.cpp reranker")
+		}
+	case BackendCogneePython, BackendCogneeRust:
+		svc.stopProcess(&svc.cogneeCmd, "cognee")
 	}
 	if !svc.config.IsCloudEmbedding() {
 		svc.stopProcess(&svc.llamaCmd, "llama.cpp")
@@ -117,20 +153,29 @@ func (svc *services) monitor(ctx context.Context, panics *atomic.Int64) {
 	for {
 		select {
 		case <-ticker.C:
-			// Spawn each service check in its own goroutine to prevent
-			// a slow restart on one service from blocking others.
+			// llama-server monitored for ALL backends
 			if !svc.config.IsCloudEmbedding() {
 				go svc.checkAndRestart(ctx, "llama.cpp", healthURL(svc.config.LlamaPort),
 					&svc.llamaCmd, svc.startLlama, &svc.llamaFails, maxRestartsPerHour)
 			}
 
-			if !svc.config.IsCloudReranker() {
-				go svc.checkAndRestart(ctx, "llama reranker", healthURL(svc.config.LlamaRerankerPort),
-					&svc.llamaRerankerCmd, svc.startLlamaReranker, &svc.rerankerFails, maxRestartsPerHour)
-			}
+			switch svc.config.Backend {
+			case BackendHindsight:
+				if !svc.config.IsCloudReranker() {
+					go svc.checkAndRestart(ctx, "llama reranker", healthURL(svc.config.LlamaRerankerPort),
+						&svc.llamaRerankerCmd, svc.startLlamaReranker, &svc.rerankerFails, maxRestartsPerHour)
+				}
+				go svc.checkAndRestart(ctx, "Hindsight", healthURL(svc.config.HindsightPort),
+					&svc.hindsightCmd, svc.startHindsight, &svc.hindsightFails, maxRestartsPerHour)
 
-			go svc.checkAndRestart(ctx, "Hindsight", healthURL(svc.config.HindsightPort),
-				&svc.hindsightCmd, svc.startHindsight, &svc.hindsightFails, maxRestartsPerHour)
+			case BackendCogneePython:
+				go svc.checkAndRestart(ctx, "cognee-python", healthURL(svc.config.CogneePort),
+					&svc.cogneeCmd, svc.startCogneePython, &svc.cogneeFails, maxRestartsPerHour)
+
+			case BackendCogneeRust:
+				go svc.checkAndRestart(ctx, "cognee-rust", healthURL(svc.config.CogneePort),
+					&svc.cogneeCmd, svc.startCogneeRust, &svc.cogneeFails, maxRestartsPerHour)
+			}
 
 		case <-ctx.Done():
 			return
@@ -254,12 +299,6 @@ func (svc *services) allHealthy() (llama, reranker, hindsight bool) {
 	val, _, _ := svc.healthGroup.Do("health", func() (interface{}, error) {
 		var l, r, h bool
 
-		// Count how many goroutines we actually need to launch
-		nChecks := 0
-		if !svc.config.IsCloudEmbedding() { nChecks++ }
-		if !svc.config.IsCloudReranker() { nChecks++ }
-		nChecks++ // hindsight always checked
-
 		// Cloud services are always "healthy" — no local process to check
 		if svc.config.IsCloudEmbedding() {
 			l = true
@@ -269,27 +308,53 @@ func (svc *services) allHealthy() (llama, reranker, hindsight bool) {
 		}
 
 		var wg sync.WaitGroup
-		wg.Add(nChecks)
 
-		if !svc.config.IsCloudEmbedding() {
+		switch svc.config.Backend {
+		case BackendHindsight:
+			nChecks := 1 // hindsight always checked
+			if !svc.config.IsCloudEmbedding() { nChecks++ }
+			if !svc.config.IsCloudReranker() { nChecks++ }
+			wg.Add(nChecks)
+			if !svc.config.IsCloudEmbedding() {
+				go func() {
+					defer func() { if rec := recover(); rec != nil { svc.log.Error("allHealthy panic", "service", "llama", "panic", fmt.Sprintf("%v", rec)) } }()
+					defer wg.Done()
+					l = svc.check(healthURL(svc.config.LlamaPort)) == nil
+				}()
+			}
+			if !svc.config.IsCloudReranker() {
+				go func() {
+					defer func() { if rec := recover(); rec != nil { svc.log.Error("allHealthy panic", "service", "reranker", "panic", fmt.Sprintf("%v", rec)) } }()
+					defer wg.Done()
+					r = svc.check(healthURL(svc.config.LlamaRerankerPort)) == nil
+				}()
+			}
 			go func() {
-				defer func() { if r := recover(); r != nil { svc.log.Error("allHealthy panic", "service", "llama", "panic", fmt.Sprintf("%v", r)) } }()
+				defer func() { if rec := recover(); rec != nil { svc.log.Error("allHealthy panic", "service", "hindsight", "panic", fmt.Sprintf("%v", rec)) } }()
 				defer wg.Done()
-				l = svc.check(healthURL(svc.config.LlamaPort)) == nil
+				h = svc.check(healthURL(svc.config.HindsightPort)) == nil
+			}()
+
+		case BackendCogneePython, BackendCogneeRust:
+			// Cognee: llama + cognee. Reranker is N/A (always true).
+			r = true // Cognee handles ranking via graph reweighting
+			nChecks := 1 // cognee
+			if !svc.config.IsCloudEmbedding() { nChecks++ }
+			wg.Add(nChecks)
+			if !svc.config.IsCloudEmbedding() {
+				go func() {
+					defer func() { if rec := recover(); rec != nil { svc.log.Error("allHealthy panic", "service", "llama", "panic", fmt.Sprintf("%v", rec)) } }()
+					defer wg.Done()
+					l = svc.check(healthURL(svc.config.LlamaPort)) == nil
+				}()
+			}
+			go func() {
+				defer func() { if rec := recover(); rec != nil { svc.log.Error("allHealthy panic", "service", "cognee", "panic", fmt.Sprintf("%v", rec)) } }()
+				defer wg.Done()
+				h = svc.check(healthURL(svc.config.CogneePort)) == nil
 			}()
 		}
-		if !svc.config.IsCloudReranker() {
-			go func() {
-				defer func() { if r := recover(); r != nil { svc.log.Error("allHealthy panic", "service", "reranker", "panic", fmt.Sprintf("%v", r)) } }()
-				defer wg.Done()
-				r = svc.check(healthURL(svc.config.LlamaRerankerPort)) == nil
-			}()
-		}
-		go func() {
-			defer func() { if r := recover(); r != nil { svc.log.Error("allHealthy panic", "service", "hindsight", "panic", fmt.Sprintf("%v", r)) } }()
-			defer wg.Done()
-			h = svc.check(healthURL(svc.config.HindsightPort)) == nil
-		}()
+
 		wg.Wait()
 
 		svc.healthMu.Lock()
@@ -524,6 +589,135 @@ func (svc *services) startHindsight() error {
 	svc.mu.Lock(); svc.hindsightCmd = cmd; svc.mu.Unlock()
 	svc.log.Info("Hindsight started", "pid", cmd.Process.Pid)
 	return nil
+}
+
+// startCogneePython spawns uvicorn serving the Cognee Python API.
+func (svc *services) startCogneePython() error {
+	pythonPath := svc.resolveCogneePythonPath()
+	cmd := exec.Command(pythonPath, "-m", "uvicorn", "cognee.api.client:app",
+		"--host", "0.0.0.0", "--port", svc.config.CogneePort)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// Env var translation: Hindsight env var names → Cognee env var names
+	cmd.Env = append(os.Environ(),
+		// LLM config (translated from Hindsight env var names)
+		"LLM_API_KEY="+svc.config.LLMAPIKey,
+		"LLM_MODEL="+svc.config.LLMModel,
+		"LLM_ENDPOINT="+svc.config.LLMBaseURL,
+		"LLM_PROVIDER=openai",
+		// Embedding config (points at our llama-server :8080)
+		"EMBEDDING_ENDPOINT=http://localhost:"+svc.config.LlamaPort+"/v1",
+		"EMBEDDING_PROVIDER="+svc.config.CogneeEmbeddingProvider,
+		"EMBEDDING_API_KEY=not-needed",
+		// Data isolation
+		"COGNEE_DATA_DIR="+svc.config.CogneeDataDir,
+		"HTTP_API_PORT="+svc.config.CogneePort,
+		// Database providers (defaults in env, overridable by user)
+		"COGNEE_DB_PROVIDER="+getEnvOrDefault("COGNEE_DB_PROVIDER", "sqlite"),
+		"COGNEE_VECTOR_DB_PROVIDER="+getEnvOrDefault("COGNEE_VECTOR_DB_PROVIDER", "lancedb"),
+		"COGNEE_GRAPH_DB_PROVIDER="+getEnvOrDefault("COGNEE_GRAPH_DB_PROVIDER", "ladybug"),
+	)
+
+	wd, _ := os.Getwd()
+	f, _ := os.OpenFile(filepath.Join(wd, "logs", "cognee-crash.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	cmd.Stdout, cmd.Stderr = f, f
+	if err := cmd.Start(); err != nil {
+		if f != nil { f.Close() }
+		return err
+	}
+	svc.mu.Lock()
+	svc.cogneeCmd = cmd
+	svc.mu.Unlock()
+	svc.log.Info("cognee-python started", "pid", cmd.Process.Pid)
+	return nil
+}
+
+// startCogneeRust spawns the cognee-http-server Rust binary.
+func (svc *services) startCogneeRust() error {
+	binaryPath := svc.resolveCogneeBinary()
+	if binaryPath == "" {
+		return fmt.Errorf("COGNEE_BINARY not found")
+	}
+
+	cmd := exec.Command(binaryPath)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// Same env var translation as Python Cognee
+	cmd.Env = append(os.Environ(),
+		"LLM_API_KEY="+svc.config.LLMAPIKey,
+		"LLM_MODEL="+svc.config.LLMModel,
+		"LLM_ENDPOINT="+svc.config.LLMBaseURL,
+		"LLM_PROVIDER=openai",
+		"EMBEDDING_ENDPOINT=http://localhost:"+svc.config.LlamaPort+"/v1",
+		"EMBEDDING_PROVIDER="+svc.config.CogneeEmbeddingProvider,
+		"EMBEDDING_API_KEY=not-needed",
+		"COGNEE_DATA_DIR="+svc.config.CogneeDataDir,
+		"HTTP_API_PORT="+svc.config.CogneePort,
+		"COGNEE_DB_PROVIDER="+getEnvOrDefault("COGNEE_DB_PROVIDER", "sqlite"),
+		"COGNEE_VECTOR_DB_PROVIDER="+getEnvOrDefault("COGNEE_VECTOR_DB_PROVIDER", "lancedb"),
+		"COGNEE_GRAPH_DB_PROVIDER="+getEnvOrDefault("COGNEE_GRAPH_DB_PROVIDER", "ladybug"),
+	)
+
+	wd, _ := os.Getwd()
+	f, _ := os.OpenFile(filepath.Join(wd, "logs", "cognee-crash.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	cmd.Stdout, cmd.Stderr = f, f
+	if err := cmd.Start(); err != nil {
+		if f != nil { f.Close() }
+		return err
+	}
+	svc.mu.Lock()
+	svc.cogneeCmd = cmd
+	svc.mu.Unlock()
+	svc.log.Info("cognee-rust started", "pid", cmd.Process.Pid)
+	return nil
+}
+
+// resolveCogneePythonPath resolves the Python binary for Cognee Python.
+// Fallback chain: config.CogneePythonPath → .venv/bin/python → python3
+func (svc *services) resolveCogneePythonPath() string {
+	if svc.config.CogneePythonPath != "" {
+		info, err := os.Stat(svc.config.CogneePythonPath)
+		if err == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Mode()&0111 != 0 {
+			return svc.config.CogneePythonPath
+		}
+	}
+	// Project-local venv
+	venvPython := filepath.Join(".venv", "bin", "python")
+	if runtime.GOOS == "windows" {
+		venvPython = filepath.Join(".venv", "Scripts", "python.exe")
+	}
+	info, err := os.Stat(venvPython)
+	if err == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Mode()&0111 != 0 {
+		return venvPython
+	}
+	// System PATH
+	if lp, err := exec.LookPath("python3"); err == nil {
+		return lp
+	}
+	return "python3" // Last resort — let it fail at exec time
+}
+
+// resolveCogneeBinary resolves the Rust Cognee binary path.
+// Fallback chain: config.CogneeBinary → cognee-http-server on PATH
+func (svc *services) resolveCogneeBinary() string {
+	if svc.config.CogneeBinary != "" {
+		info, err := os.Stat(svc.config.CogneeBinary)
+		if err == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Mode()&0111 != 0 {
+			return svc.config.CogneeBinary
+		}
+	}
+	if lp, err := exec.LookPath("cognee-http-server"); err == nil {
+		return lp
+	}
+	return ""
+}
+
+// getEnvOrDefault returns the env var value or the default if unset/empty.
+func getEnvOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 func (svc *services) spawn(name string, args ...string) *exec.Cmd {

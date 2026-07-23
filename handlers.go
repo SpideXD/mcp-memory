@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -187,7 +189,7 @@ func (s *Server) routeMCP(sid string, method string, id interface{}, params json
 	case "ping":
 		s.mcpResult(sid, id, map[string]interface{}{})
 	case "tools/list":
-		s.mcpResult(sid, id, toolsList())
+		s.mcpResult(sid, id, s.toolsList())
 	case "tools/call":
 		s.handleToolCall(sid, id, params)
 	default:
@@ -233,10 +235,11 @@ func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessa
 			return
 		}
 		s.metrics.recallCalls.Inc()
-		r, err := s.recallAPI(bank, a.Query)
+		r, err := s.backend.Recall(context.Background(), bank, a.Query)
 		if err != nil { s.mcpError(sid, id, -32000, err.Error()); logReq("", err); return }
 		s.mcpToolResult(sid, id, r)
 		logReq("ok", nil)
+
 	case "memory_retain":
 		var a struct{ Content string `json:"content"` }
 		if err := json.Unmarshal(c.Arguments, &a); err != nil || a.Content == "" {
@@ -251,10 +254,72 @@ func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessa
 			return
 		}
 		s.metrics.retainCalls.Inc()
-		r, err := s.queueJob(s.workers.retainJobs, bank, "retain", a.Content)
-		if err != nil { s.mcpError(sid, id, -32000, err.Error()); logReq("", err); return }
-		s.mcpToolResult(sid, id, r.Data)
+
+		if s.backend.IsSync() {
+			// ★ HINDSIGHT PATH: queue to worker pool (unchanged)
+			r, err := s.queueJob(s.workers.retainJobs, bank, "retain", a.Content)
+			if err != nil { s.mcpError(sid, id, -32000, err.Error()); logReq("", err); return }
+			s.mcpToolResult(sid, id, r.Data)
+			logReq("ok", nil)
+			return
+		}
+
+		// ★ COGNEE PATH: goroutine-per-retain with semaphore
+		jobID := fmt.Sprintf("%x", time.Now().UnixNano())
+		if s.jobTracker != nil {
+			s.jobTracker.store(jobID, bank)
+		}
+
+		select {
+		case s.cogneeSemaphore <- struct{}{}:
+			// acquired slot, spawn goroutine
+		default:
+			s.mcpToolResult(sid, id, `{"status":"rejected","reason":"too_many_concurrent_retains"}`)
+			return
+		}
+
+		go func() {
+			defer func() { <-s.cogneeSemaphore }()
+			defer func() {
+				if r := recover(); r != nil {
+					s.panics.Add(1)
+					s.log.Error("cognee retain goroutine panic", "bank", bank, "job_id", jobID, "panic", fmt.Sprintf("%v", r))
+					if s.jobTracker != nil {
+						s.jobTracker.fail(jobID, "internal error: panic")
+					}
+				}
+			}()
+
+			s.log.Info("cognee retain started", "bank", bank, "job_id", jobID)
+			startTime := time.Now()
+
+			detachedCtx, cancel := context.WithTimeout(context.Background(), s.config.CogneeRetainTimeout)
+			defer cancel()
+
+			result, err := s.backend.Retain(detachedCtx, bank, a.Content)
+			duration := time.Since(startTime)
+
+			if err != nil {
+				s.log.Error("cognee retain failed", "bank", bank, "job_id", jobID, "duration", duration, logger.Error(err))
+				s.metrics.errorCalls.Inc()
+				if s.jobTracker != nil {
+					s.jobTracker.fail(jobID, err.Error())
+				}
+				s.fireErrorWebhook(bank, jobID, err.Error(), "retain")
+			} else {
+				s.log.Info("cognee retain completed", "bank", bank, "job_id", jobID, "duration", duration)
+				if s.jobTracker != nil {
+					s.jobTracker.complete(jobID, result)
+				}
+			}
+
+			// Trigger auto-improve after retain
+			s.maybeAutoImprove(bank)
+		}()
+
+		s.mcpToolResult(sid, id, fmt.Sprintf(`{"status":"queued","bank":"%s","job_id":"%s"}`, bank, jobID))
 		logReq("ok", nil)
+
 	case "memory_reflect":
 		var a struct{ Query string `json:"query"` }
 		if err := json.Unmarshal(c.Arguments, &a); err != nil || a.Query == "" {
@@ -263,10 +328,47 @@ func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessa
 			return
 		}
 		s.metrics.reflectCalls.Inc()
-		r, err := s.queueJob(s.workers.reflectJobs, bank, "reflect", a.Query)
-		if err != nil { s.mcpError(sid, id, -32000, err.Error()); logReq("", err); return }
-		s.mcpToolResult(sid, id, r.Data)
+
+		if s.backend.IsSync() {
+			// ★ HINDSIGHT PATH: queue to worker pool
+			r, err := s.queueJob(s.workers.reflectJobs, bank, "reflect", a.Query)
+			if err != nil { s.mcpError(sid, id, -32000, err.Error()); logReq("", err); return }
+			s.mcpToolResult(sid, id, r.Data)
+			logReq("ok", nil)
+			return
+		}
+
+		// ★ COGNEE PATH: goroutine, immediate response
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					s.panics.Add(1)
+					s.log.Error("cognee reflect goroutine panic", "bank", bank, "panic", fmt.Sprintf("%v", r))
+				}
+			}()
+
+			detachedCtx, cancel := context.WithTimeout(context.Background(), s.config.BackendReflectTimeout)
+			defer cancel()
+
+			_, err := s.backend.Reflect(detachedCtx, bank, a.Query)
+			if err != nil {
+				s.log.Error("cognee reflect failed", "bank", bank, logger.Error(err))
+				s.metrics.errorCalls.Inc()
+			}
+		}()
+
+		s.mcpToolResult(sid, id, fmt.Sprintf(`{"status":"queued","bank":"%s"}`, bank))
 		logReq("ok", nil)
+
+	case "memory_improve":
+		s.handleImprove(sid, id, bank, logReq)
+
+	case "memory_forget":
+		s.handleForget(sid, id, bank, c.Arguments, logReq)
+
+	case "memory_retain_status":
+		s.handleRetainStatus(sid, id, c.Arguments, logReq)
+
 	default:
 		s.mcpError(sid, id, -32601, fmt.Sprintf("unknown tool: %s", c.Name))
 		logReq("", fmt.Errorf("unknown tool: %s", c.Name))
@@ -283,10 +385,132 @@ func (s *Server) checkAuth(r *http.Request) bool {
 	return r.Header.Get("Authorization") == "Bearer "+token
 }
 
-func toolsList() map[string]interface{} {
-	return map[string]interface{}{"tools": []map[string]interface{}{
+// toolsList returns the available MCP tools. Adapts per backend.
+func (s *Server) toolsList() map[string]interface{} {
+	tools := []map[string]interface{}{
 		{"name": "memory_retain", "description": "Store information in long-term memory", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"content": map[string]interface{}{"type": "string"}}, "required": []string{"content"}}},
 		{"name": "memory_recall", "description": "Search memory using semantic search", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"query": map[string]interface{}{"type": "string"}}, "required": []string{"query"}}},
 		{"name": "memory_reflect", "description": "Synthesize memories for insights", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"query": map[string]interface{}{"type": "string"}}, "required": []string{"query"}}},
-	}}
+	}
+	// memory_improve always available
+	tools = append(tools, map[string]interface{}{
+		"name":        "memory_improve",
+		"description":  "Improve memory graph for a dataset",
+		"inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}, "required": []string{}},
+	})
+	// Cognee-only tools
+	if !s.backend.IsSync() {
+		tools = append(tools,
+			map[string]interface{}{
+				"name":        "memory_forget",
+				"description":  "Remove a specific memory from storage",
+				"inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"content_id": map[string]interface{}{"type": "string"}}, "required": []string{"content_id"}},
+			},
+			map[string]interface{}{
+				"name":        "memory_retain_status",
+				"description":  "Check the status of an async retain job",
+				"inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"job_id": map[string]interface{}{"type": "string"}}, "required": []string{"job_id"}},
+			},
+		)
+	}
+	return map[string]interface{}{"tools": tools}
+}
+
+// handleImprove triggers graph improvement for the given bank.
+func (s *Server) handleImprove(sid string, id interface{}, bank string, logReq func(string, error)) {
+	s.log.Info("memory_improve called", "bank", bank)
+	r, err := s.backend.Reflect(context.Background(), bank, "")
+	if err != nil {
+		s.mcpError(sid, id, -32000, err.Error())
+		logReq("", err)
+		return
+	}
+	s.mcpToolResult(sid, id, r)
+	logReq("ok", nil)
+}
+
+// handleForget removes a specific memory from the backend.
+func (s *Server) handleForget(sid string, id interface{}, bank string, args json.RawMessage, logReq func(string, error)) {
+	var a struct{ ContentID string `json:"content_id"` }
+	if err := json.Unmarshal(args, &a); err != nil || a.ContentID == "" {
+		s.mcpError(sid, id, -32602, "content_id is required")
+		logReq("", fmt.Errorf("missing content_id"))
+		return
+	}
+	r, err := s.backend.Forget(context.Background(), bank, a.ContentID)
+	if err != nil {
+		s.mcpError(sid, id, -32000, err.Error())
+		logReq("", err)
+		return
+	}
+	s.mcpToolResult(sid, id, r)
+	logReq("ok", nil)
+}
+
+// handleRetainStatus checks the status of an async retain job.
+func (s *Server) handleRetainStatus(sid string, id interface{}, args json.RawMessage, logReq func(string, error)) {
+	var a struct{ JobID string `json:"job_id"` }
+	if err := json.Unmarshal(args, &a); err != nil || a.JobID == "" {
+		s.mcpError(sid, id, -32602, "job_id is required")
+		logReq("", fmt.Errorf("missing job_id"))
+		return
+	}
+	if s.jobTracker == nil {
+		s.mcpError(sid, id, -32000, "job tracking not available with current backend")
+		logReq("", fmt.Errorf("jobTracker nil"))
+		return
+	}
+	result := s.jobTracker.get(a.JobID)
+	if result == nil {
+		s.mcpToolResult(sid, id, `{"status":"not_found"}`)
+		logReq("not_found", nil)
+		return
+	}
+	data, _ := json.Marshal(result)
+	s.mcpToolResult(sid, id, string(data))
+	logReq("ok", nil)
+}
+
+// fireErrorWebhook sends an error notification to the configured webhook URL.
+// Non-blocking — runs in its own goroutine. Retries 3 times with exponential
+// backoff (1s, 2s, 4s). Failures are logged at WARN level and never crash
+// the server. If webhookURL is empty, this is a no-op.
+func (s *Server) fireErrorWebhook(bank, jobID, errMsg, operation string) {
+	url := s.config.ErrorWebhookURL
+	if url == "" {
+		return
+	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.log.Error("error webhook goroutine panic", "panic", fmt.Sprintf("%v", r))
+			}
+		}()
+
+		payload := map[string]interface{}{
+			"backend":   s.backend.Name(),
+			"bank":      bank,
+			"job_id":    jobID,
+			"error":     errMsg,
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+			"operation": operation,
+		}
+		body, _ := json.Marshal(payload)
+
+		client := &http.Client{Timeout: 10 * time.Second}
+		for attempt := 0; attempt < 3; attempt++ {
+			if attempt > 0 {
+				backoff := time.Duration(1<<uint(attempt-1)) * time.Second // 1s, 2s
+				time.Sleep(backoff)
+			}
+			resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+			if err == nil {
+				resp.Body.Close()
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					return // success
+				}
+			}
+		}
+		s.log.Warn("error webhook failed after 3 attempts", "url", url, "job_id", jobID)
+	}()
 }

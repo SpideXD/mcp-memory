@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"gopkg.in/natefinch/lumberjack.v2"
+	"mcp-memory/backend"
 	"mcp-memory/logger"
 	"mcp-memory/metrics"
 )
@@ -32,12 +33,16 @@ type Server struct {
 
 	startTime time.Time
 
+	// Backend adapter — single dimension of variation
+	backend backend.Backend
+
 	// Observability
 	log     *logger.Logger
 	metrics *serverMetrics
 
-	// Circuit breaker for Hindsight API
-	hindsightBreaker *circuitBreaker
+	// Cognee-only fields — nil when BACKEND=hindsight
+	cogneeSemaphore chan struct{} // buffered, bounds concurrent retains
+	jobTracker      *jobTracker  // in-memory job result map + TTL cleanup
 }
 
 type serverMetrics struct {
@@ -64,16 +69,30 @@ func NewServer(config Config) *Server {
 	blog, _ := logger.NewBuf("memory", "info", logWriter, logger.WithSource())
 	alertClient := NewAlertClient(config.AlertURL, config.AlertMode)
 
+	backendCfg := backend.BackendConfig{
+		Backend:                 string(config.Backend),
+		HindsightPort:           config.HindsightPort,
+		CogneePort:              config.CogneePort,
+		BackendRetainTimeout:    config.BackendRetainTimeout,
+		BackendRecallTimeout:    config.BackendRecallTimeout,
+		BackendReflectTimeout:   config.BackendReflectTimeout,
+		RetryAttempts:           config.RetryAttempts,
+		RetryDelay:              config.RetryDelay,
+		RetryMaxDelay:           config.RetryMaxDelay,
+		CircuitBreakerThreshold: config.CircuitBreakerThreshold,
+		CircuitBreakerCooldown:  config.CircuitBreakerCooldown,
+	}
+
 	s := &Server{
 		state:    StateStopped,
 		config:   config,
+		backend:  backend.New(backendCfg),
 		svc:      newServices(config, blog, alertClient),
 		sessions: make(map[string]*MCPSession),
 		workers:  newWorkerSystem(config, blog),
 		log:      blog,
 		shutdown: make(chan struct{}),
 		alerts:   alertClient,
-		hindsightBreaker: newCircuitBreaker(config.CircuitBreakerThreshold, config.CircuitBreakerCooldown),
 		metrics: &serverMetrics{
 			recallCalls:  metrics.NewCounter("memory.recall"),
 			retainCalls:  metrics.NewCounter("memory.retain"),
@@ -86,6 +105,14 @@ func NewServer(config Config) *Server {
 			sseDrops:     metrics.NewCounter("memory.sse_drops"),
 		},
 	}
+
+	// Cognee infrastructure exists iff backend is async
+	if !s.backend.IsSync() {
+		s.cogneeSemaphore = make(chan struct{}, config.CogneeMaxConcurrentRetains)
+		s.jobTracker = newJobTracker(30 * time.Minute)
+		go s.jobTrackerCleanup()
+	}
+
 	return s
 }
 

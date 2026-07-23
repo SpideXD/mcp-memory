@@ -6,6 +6,17 @@ import (
 	"time"
 )
 
+// Backend is an enum for the memory backend type.
+// Valid values: "hindsight", "cognee-python", "cognee-rust".
+// Default is "hindsight" — backward compatible.
+type Backend string
+
+const (
+	BackendHindsight    Backend = "hindsight"
+	BackendCogneePython Backend = "cognee-python"
+	BackendCogneeRust   Backend = "cognee-rust"
+)
+
 type ServiceState string
 
 const (

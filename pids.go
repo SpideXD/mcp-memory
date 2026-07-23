@@ -25,6 +25,9 @@ func (svc *services) savePids() {
 	if svc.hindsightCmd != nil && svc.hindsightCmd.Process != nil {
 		pids["hindsight"] = svc.hindsightCmd.Process.Pid
 	}
+	if svc.cogneeCmd != nil && svc.cogneeCmd.Process != nil {
+		pids["cognee"] = svc.cogneeCmd.Process.Pid
+	}
 
 	if len(pids) == 0 {
 		return
