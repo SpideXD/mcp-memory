@@ -316,64 +316,138 @@ func expectedEmployerForMonth(month int) string {
 	}
 }
 
+// extractTopResultText parses the MCP recall JSON response and extracts the
+// text of the first (top-ranked) result. The response structure is:
+//  {"content":[{"text":"{\"results\":[{\"text\":\"...\"},...],...}"}]}
+// Returns empty string if parsing fails (probe returned errors or malformed JSON).
+func extractTopResultText(actualOutput string) string {
+	if actualOutput == "" {
+		return ""
+	}
+	var rpcResult struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(actualOutput), &rpcResult); err != nil {
+		return ""
+	}
+	if len(rpcResult.Content) == 0 {
+		return ""
+	}
+	textPayload := rpcResult.Content[0].Text
+	if textPayload == "" {
+		return ""
+	}
+	var recallResp struct {
+		Results []struct {
+			Text string `json:"text"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(textPayload), &recallResp); err != nil {
+		// textPayload may be a plain string (not JSON)
+		return textPayload
+	}
+	if len(recallResp.Results) == 0 {
+		return ""
+	}
+	return recallResp.Results[0].Text
+}
+
+// extractAllResultTexts parses the MCP recall JSON response and extracts the
+// text of ALL ranked results. Returns nil if parsing fails.
+func extractAllResultTexts(actualOutput string) []string {
+	if actualOutput == "" {
+		return nil
+	}
+	var rpcResult struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(actualOutput), &rpcResult); err != nil {
+		return nil
+	}
+	if len(rpcResult.Content) == 0 {
+		return nil
+	}
+	textPayload := rpcResult.Content[0].Text
+	var recallResp struct {
+		Results []struct {
+			Text string `json:"text"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(textPayload), &recallResp); err != nil {
+		return nil
+	}
+	texts := make([]string, len(recallResp.Results))
+	for i, r := range recallResp.Results {
+		texts[i] = r.Text
+	}
+	return texts
+}
+
 // computePrecisionAt1 computes precision@1 from probe results.
+// Parses the JSON ActualOutput to extract the actual top-ranked result text,
+// then checks if the expected concept appears in that result.
 func computePrecisionAt1(results []ProbeResult) float64 {
 	if len(results) == 0 {
 		return 0
 	}
+	validCount := 0
 	hits := 0
 	for _, r := range results {
 		if r.ExpectedConcept == "" {
 			continue
 		}
-		// Check first line or first sentence
-		output := strings.ToLower(r.ActualOutput)
+		topText := extractTopResultText(r.ActualOutput)
+		if topText == "" {
+			// Probe returned error or empty result; skip from metric
+			continue
+		}
+		validCount++
 		concept := strings.ToLower(r.ExpectedConcept)
-		lines := strings.SplitN(output, "\n", 2)
-		firstLine := lines[0]
-		sentences := strings.SplitN(firstLine, ".", 2)
-		firstSentence := sentences[0]
-		if strings.Contains(firstSentence, concept) || strings.Contains(firstLine, concept) {
+		if strings.Contains(strings.ToLower(topText), concept) {
 			hits++
 		}
 	}
-	return float64(hits) / float64(len(results))
+	if validCount == 0 {
+		return 0
+	}
+	return float64(hits) / float64(validCount)
 }
 
 // computeMRR computes Mean Reciprocal Rank from probe results.
+// Parses the JSON ActualOutput to extract all ranked result texts,
+// then finds the rank of the first result containing the expected concept.
 func computeMRR(results []ProbeResult) float64 {
 	if len(results) == 0 {
 		return 0
 	}
+	validCount := 0
 	totalRR := 0.0
 	for _, r := range results {
 		if r.ExpectedConcept == "" {
 			continue
 		}
-		output := strings.ToLower(r.ActualOutput)
+		texts := extractAllResultTexts(r.ActualOutput)
+		if len(texts) == 0 {
+			// Probe returned error or empty result; skip from metric
+			continue
+		}
+		validCount++
 		concept := strings.ToLower(r.ExpectedConcept)
-		lines := strings.Split(output, "\n")
-		found := false
-		for i, line := range lines {
-			if strings.Contains(line, concept) {
+		for i, text := range texts {
+			if strings.Contains(strings.ToLower(text), concept) {
 				totalRR += 1.0 / float64(i+1)
-				found = true
 				break
 			}
 		}
-		if !found {
-			// Check sentences too
-			sentences := strings.Split(output, ".")
-			for i, sent := range sentences {
-				if strings.Contains(sent, concept) {
-					totalRR += 1.0 / float64(i+1)
-					found = true
-					break
-				}
-			}
-		}
 	}
-	return totalRR / float64(len(results))
+	if validCount == 0 {
+		return 0
+	}
+	return totalRR / float64(validCount)
 }
 
 // computePercentile computes the p-th percentile from sorted float64 slice.
@@ -464,6 +538,18 @@ func TestStressScale_50(t *testing.T) {
 	retainDur := time.Since(retainStart)
 
 	// Phase 2: Probe — 30 sequential queries
+	// SSE reconnection: the 120s timeout may have killed the SSE stream during retain phase.
+	// Create a fresh client before probing to ensure the session is alive.
+	client.Close()
+	client, err = testutil.NewClient(testutil.DefaultServerURL, bank)
+	if err != nil {
+		t.Fatalf("SSE reconnect for probe phase: %v", err)
+	}
+	if err := client.Initialize(); err != nil {
+		t.Fatalf("Re-initialize for probe phase: %v", err)
+	}
+	defer client.Close()
+
 	probeStart := time.Now()
 	var probeResults []ProbeResult
 	for _, probe := range probes {
@@ -503,6 +589,19 @@ func TestStressScale_50(t *testing.T) {
 		LatencyP99Ms:      computePercentile(latencies, 0.99),
 	}
 
+	probeErrorRate := float64(0)
+	if len(probeResults) > 0 {
+		errCount := 0
+		for _, pr := range probeResults {
+			if pr.Note != "" {
+				errCount++
+			}
+		}
+		probeErrorRate = float64(errCount) / float64(len(probeResults))
+	}
+	retainErrorRate := float64(retainErrors.Load()) / float64(len(retainResults))
+	passed := probeErrorRate <= 0.5 && retainErrorRate <= 0.5
+
 	metricsJSON, _ := json.Marshal(metrics)
 	report := DimensionReport{
 		Dimension:  "scale",
@@ -510,7 +609,7 @@ func TestStressScale_50(t *testing.T) {
 		Timestamp:  time.Now(),
 		Results:    probeResults,
 		Metrics:    metricsJSON,
-		Passed:     true,
+		Passed:     passed,
 		DurationMs: float64(time.Since(totalStart).Milliseconds()),
 	}
 	writeJSONReport(t, "scale_50.json", report)
@@ -617,6 +716,18 @@ func TestStressScale_200(t *testing.T) {
 	retainDur := time.Since(retainStart)
 
 	// Probe phase
+	// SSE reconnection: the 120s timeout may have killed the SSE stream during retain phase.
+	// Create a fresh client before probing to ensure the session is alive.
+	client.Close()
+	client, err = testutil.NewClient(testutil.DefaultServerURL, bank)
+	if err != nil {
+		t.Fatalf("SSE reconnect for probe phase: %v", err)
+	}
+	if err := client.Initialize(); err != nil {
+		t.Fatalf("Re-initialize for probe phase: %v", err)
+	}
+	defer client.Close()
+
 	probeStart := time.Now()
 	var probeResults []ProbeResult
 	for _, probe := range probes {
@@ -655,6 +766,19 @@ func TestStressScale_200(t *testing.T) {
 		LatencyP99Ms:      computePercentile(latencies, 0.99),
 	}
 
+	probeErrorRate := float64(0)
+	if len(probeResults) > 0 {
+		errCount := 0
+		for _, pr := range probeResults {
+			if pr.Note != "" {
+				errCount++
+			}
+		}
+		probeErrorRate = float64(errCount) / float64(len(probeResults))
+	}
+	retainErrorRate := float64(retainErrors.Load()) / float64(len(retainResults))
+	passed := probeErrorRate <= 0.5 && retainErrorRate <= 0.5
+
 	metricsJSON, _ := json.Marshal(metrics)
 	report := DimensionReport{
 		Dimension:  "scale",
@@ -662,7 +786,7 @@ func TestStressScale_200(t *testing.T) {
 		Timestamp:  time.Now(),
 		Results:    probeResults,
 		Metrics:    metricsJSON,
-		Passed:     true,
+		Passed:     passed,
 		DurationMs: float64(time.Since(totalStart).Milliseconds()),
 	}
 	writeJSONReport(t, "scale_200.json", report)
@@ -731,12 +855,21 @@ func TestStressContradiction_Alice(t *testing.T) {
 			item.Month, truncate(item.Content, 60), truncate(output, 60), expected)
 	}
 
+	// Alice contradiction: passed if no retain errors (quality is expected behavior)
+	retainErrors := 0
+	for _, r := range results {
+		if r.Note != "" && strings.Contains(r.Note, "retain error") {
+			retainErrors++
+		}
+	}
+	passed := retainErrors == 0
+
 	report := DimensionReport{
 		Dimension:  "contradiction",
 		Scenario:   "alice_sequential",
 		Timestamp:  time.Now(),
 		Results:    results,
-		Passed:     true,
+		Passed:     passed,
 		DurationMs: float64(time.Since(totalStart).Milliseconds()),
 	}
 	writeJSONReport(t, "contradiction_alice.json", report)
@@ -790,11 +923,28 @@ func TestStressContradiction_Concurrent(t *testing.T) {
 	wg.Wait()
 	close(errs)
 
+	retainErrCount := 0
 	for e := range errs {
+		retainErrCount++
 		t.Logf("Concurrent retain error: agent=%d op=%s err=%v", e.Agent, e.Op, e.Err)
 	}
 
-	time.Sleep(3 * time.Second)
+	// Poll for processing completion instead of fixed sleep.
+	// Wait up to 30s for the concurrent retains to be processed by Hindsight.
+	deadline := time.Now().Add(30 * time.Second)
+	processed := false
+	for time.Now().Before(deadline) {
+		checkOut, checkErr := client.Recall("What color is the sky?")
+		if checkErr == nil && len(extractAllResultTexts(checkOut)) > 0 {
+			processed = true
+			t.Logf("Concurrent retains processed after %.1fs", time.Since(totalStart).Seconds())
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if !processed {
+		t.Logf("WARNING: concurrent retains may not be fully processed after 30s polling")
+	}
 
 	// Probe
 	start := time.Now()
@@ -811,12 +961,22 @@ func TestStressContradiction_Concurrent(t *testing.T) {
 		pr.Note = fmt.Sprintf("recall error: %v", err)
 	}
 
+	// Concurrent contradiction: passed if no errors during retain and recall
+	hasErrors := false
+	if pr.Note != "" {
+		hasErrors = true
+	}
+	if retainErrCount > 0 {
+		hasErrors = true
+	}
+	passed := !hasErrors
+
 	report := DimensionReport{
 		Dimension:  "contradiction",
 		Scenario:   "concurrent",
 		Timestamp:  time.Now(),
 		Results:    []ProbeResult{pr},
-		Passed:     true,
+		Passed:     passed,
 		DurationMs: float64(time.Since(totalStart).Milliseconds()),
 	}
 	writeJSONReport(t, "contradiction_concurrent.json", report)
@@ -905,10 +1065,21 @@ func TestStressConcurrency_MultiAgent(t *testing.T) {
 	results := make(chan testutil.AgentResult, 50)
 	errs := make(chan testutil.AgentError, 50)
 
+	// Synchronization: recall agents wait for retain agents to finish
+	// so that queries have data to recall.
+	var retainWg sync.WaitGroup
+	retainsDone := make(chan struct{})
+
+	// Launch retain agents first
 	for _, cfg := range configs {
+		if cfg.Op != "retain" {
+			continue
+		}
+		retainWg.Add(1)
 		wg.Add(1)
 		go func(cfg agentConfig) {
 			defer wg.Done()
+			defer retainWg.Done()
 			defer func() {
 				if r := recover(); r != nil {
 					errs <- testutil.AgentError{Agent: cfg.ID, Op: "goroutine", Err: fmt.Errorf("panic: %v", r)}
@@ -930,12 +1101,63 @@ func TestStressConcurrency_MultiAgent(t *testing.T) {
 				time.Sleep(time.Duration(100+int(time.Now().UnixNano()%400)) * time.Millisecond)
 
 				start := time.Now()
-				var err error
-				if cfg.Op == "retain" {
-					_, err = client.Retain(item)
+				_, err := client.Retain(item)
+				dur := time.Since(start)
+
+				if err != nil {
+					errs <- testutil.AgentError{Agent: cfg.ID, Op: cfg.Op, Err: err}
 				} else {
-					_, err = client.Recall(item)
+					results <- testutil.AgentResult{Agent: cfg.ID, Op: cfg.Op, Dur: dur}
 				}
+			}
+		}(cfg)
+	}
+
+	// Close retainsDone when all retain agents finish
+	go func() {
+		retainWg.Wait()
+		close(retainsDone)
+	}()
+
+	// Launch recall agents — they wait for retains to finish first
+	for _, cfg := range configs {
+		if cfg.Op != "recall" {
+			continue
+		}
+		wg.Add(1)
+		go func(cfg agentConfig) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					errs <- testutil.AgentError{Agent: cfg.ID, Op: "goroutine", Err: fmt.Errorf("panic: %v", r)}
+				}
+			}()
+
+			// Wait for retain agents to finish so recall has data
+			select {
+			case <-retainsDone:
+				// Retains complete, proceed with recall
+			case <-time.After(300 * time.Second):
+				errs <- testutil.AgentError{Agent: cfg.ID, Op: "recall", Err: fmt.Errorf("timeout waiting for retains to complete")}
+				return
+			}
+
+			client, err := testutil.NewClient(testutil.DefaultServerURL, bank)
+			if err != nil {
+				errs <- testutil.AgentError{Agent: cfg.ID, Op: "connect", Err: err}
+				return
+			}
+			if err := client.Initialize(); err != nil {
+				errs <- testutil.AgentError{Agent: cfg.ID, Op: "init", Err: err}
+				return
+			}
+			defer client.Close()
+
+			for _, item := range cfg.Items {
+				time.Sleep(time.Duration(100+int(time.Now().UnixNano()%400)) * time.Millisecond)
+
+				start := time.Now()
+				_, err := client.Recall(item)
 				dur := time.Since(start)
 
 				if err != nil {
@@ -994,13 +1216,18 @@ func TestStressConcurrency_MultiAgent(t *testing.T) {
 		PerAgentResults: perAgent,
 	}
 
+	// Multi-agent: passed if all agents had at least some successful ops
+	totalSuccessful := metrics.SuccessfulOps
+	totalFailed := metrics.FailedOps
+	passed := totalSuccessful > 0 && float64(totalFailed)/float64(totalSuccessful+totalFailed) <= 0.5
+
 	metricsJSON, _ := json.Marshal(metrics)
 	report := DimensionReport{
 		Dimension:  "concurrency",
 		Scenario:   "multi_agent",
 		Timestamp:  time.Now(),
 		Metrics:    metricsJSON,
-		Passed:     true,
+		Passed:     passed,
 		DurationMs: float64(time.Since(totalStart).Milliseconds()),
 	}
 	writeJSONReport(t, "concurrency_5agents.json", report)
@@ -1063,13 +1290,16 @@ func TestStressConcurrency_Burst(t *testing.T) {
 		ErrorRate:     float64(len(burstErrors)) / float64(burstSize),
 	}
 
+	burstErrorRate := float64(len(burstErrors)) / float64(burstSize)
+	passed := burstErrorRate <= 0.5
+
 	metricsJSON, _ := json.Marshal(metrics)
 	report := DimensionReport{
 		Dimension:  "concurrency",
 		Scenario:   "burst",
 		Timestamp:  time.Now(),
 		Metrics:    metricsJSON,
-		Passed:     true,
+		Passed:     passed,
 		DurationMs: float64(time.Since(totalStart).Milliseconds()),
 	}
 	writeJSONReport(t, "concurrency_burst.json", report)
@@ -1120,6 +1350,23 @@ func TestStressChaos_KillLlama(t *testing.T) {
 	_, err = client.Retain("pre-chaos retain: chaos test baseline memory")
 	if err != nil {
 		t.Logf("pre-chaos retain failed: %v", err)
+	}
+
+	// Verify PID is alive before killing (stale PID safety check)
+	if err := syscall.Kill(llamaPID, syscall.Signal(0)); err != nil {
+		t.Logf("llama PID=%d is not alive (stale PID file?): %v — skipping kill", llamaPID, err)
+		metrics := ChaosMetrics{
+			Scenario: "kill_llama", Degraded: false, Recovered: false,
+		}
+		metricsJSON, _ := json.Marshal(metrics)
+		report := DimensionReport{
+			Dimension: "chaos", Scenario: "kill_llama",
+			Timestamp: time.Now(), Metrics: metricsJSON, Passed: false,
+			DurationMs: float64(time.Since(totalStart).Milliseconds()),
+		}
+		writeJSONReport(t, "chaos_kill_llama.json", report)
+		t.Skipf("Skipping chaos kill: llama PID %d is stale", llamaPID)
+		return
 	}
 
 	// Kill llama
@@ -1189,13 +1436,14 @@ func TestStressChaos_KillLlama(t *testing.T) {
 		RetainDuringChaos: retainErr == nil,
 	}
 
+	passed := recovered
 	metricsJSON, _ := json.Marshal(metrics)
 	report := DimensionReport{
 		Dimension:  "chaos",
 		Scenario:   "kill_llama",
 		Timestamp:  time.Now(),
 		Metrics:    metricsJSON,
-		Passed:     true,
+		Passed:     passed,
 		DurationMs: float64(time.Since(totalStart).Milliseconds()),
 	}
 	writeJSONReport(t, "chaos_kill_llama.json", report)
@@ -1235,6 +1483,23 @@ func TestStressChaos_KillHindsight(t *testing.T) {
 	_, err = client.Retain("pre-chaos retain: hindsight baseline")
 	if err != nil {
 		t.Logf("pre-chaos retain failed: %v", err)
+	}
+
+	// Verify PID is alive before killing (stale PID safety check)
+	if err := syscall.Kill(hindsightPID, syscall.Signal(0)); err != nil {
+		t.Logf("hindsight PID=%d is not alive (stale PID file?): %v — skipping kill", hindsightPID, err)
+		metrics := ChaosMetrics{
+			Scenario: "kill_hindsight", Degraded: false, Recovered: false,
+		}
+		metricsJSON, _ := json.Marshal(metrics)
+		report := DimensionReport{
+			Dimension: "chaos", Scenario: "kill_hindsight",
+			Timestamp: time.Now(), Metrics: metricsJSON, Passed: false,
+			DurationMs: float64(time.Since(totalStart).Milliseconds()),
+		}
+		writeJSONReport(t, "chaos_kill_hindsight.json", report)
+		t.Skipf("Skipping chaos kill: hindsight PID %d is stale", hindsightPID)
+		return
 	}
 
 	killStart := time.Now()
@@ -1299,13 +1564,14 @@ func TestStressChaos_KillHindsight(t *testing.T) {
 		RetainDuringChaos: retainErr == nil,
 	}
 
+	passed := recovered
 	metricsJSON, _ := json.Marshal(metrics)
 	report := DimensionReport{
 		Dimension:  "chaos",
 		Scenario:   "kill_hindsight",
 		Timestamp:  time.Now(),
 		Metrics:    metricsJSON,
-		Passed:     true,
+		Passed:     passed,
 		DurationMs: float64(time.Since(totalStart).Milliseconds()),
 	}
 	writeJSONReport(t, "chaos_kill_hindsight.json", report)
@@ -1363,25 +1629,40 @@ func TestStressChaos_Flood(t *testing.T) {
 		floodResults = append(floodResults, r)
 	}
 
-	var overloaded, timeout, otherErrors int
+	var overloaded, timeout, rateLimited, otherErrors int
+	sampleErrors := make(map[string]int) // error string -> count
 	for _, r := range floodResults {
 		if r.Err != nil {
 			errStr := r.Err.Error()
+			// Capture sample error strings for diagnosis (P1-7)
+			if len(sampleErrors) < 5 {
+				sampleErrors[errStr]++
+			}
 			if strings.Contains(errStr, "overloaded") || strings.Contains(errStr, "queue") {
 				overloaded++
 			} else if strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline") {
 				timeout++
+			} else if strings.Contains(errStr, "status 429") {
+				rateLimited++
+			} else if strings.Contains(errStr, "status 503") {
+				overloaded++ // 503 is service unavailable, treat as overload
 			} else {
 				otherErrors++
 			}
 		}
 	}
+	for errStr, count := range sampleErrors {
+		t.Logf("Flood sample error (x%d): %s", count, truncate(errStr, 200))
+	}
+
+	floodErrorRate := float64(overloaded+timeout+rateLimited+otherErrors) / float64(floodSize)
+	passed := floodErrorRate <= 0.5
 
 	metrics := FloodMetrics{
 		FloodSize:     floodSize,
 		SubmittedInMs: float64(floodDur.Microseconds()) / 1000.0,
-		Successful:    floodSize - overloaded - timeout - otherErrors,
-		Overloaded:    overloaded,
+		Successful:    floodSize - overloaded - timeout - rateLimited - otherErrors,
+		Overloaded:    overloaded + rateLimited,
 		Timeouts:      timeout,
 		OtherErrors:   otherErrors,
 	}
@@ -1392,15 +1673,15 @@ func TestStressChaos_Flood(t *testing.T) {
 		Scenario:   "flood",
 		Timestamp:  time.Now(),
 		Metrics:    metricsJSON,
-		Passed:     true,
+		Passed:     passed,
 		DurationMs: float64(time.Since(totalStart).Milliseconds()),
 	}
 	writeJSONReport(t, "chaos_flood.json", report)
 
-	t.Logf("Flood: %d retains in %.1fms, successful=%d overloaded=%d timeout=%d other=%d",
-		floodSize, metrics.SubmittedInMs, metrics.Successful, overloaded, timeout, otherErrors)
+	t.Logf("Flood: %d retains in %.1fms, successful=%d overloaded=%d timeout=%d rate_limited=%d other=%d",
+		floodSize, metrics.SubmittedInMs, metrics.Successful, overloaded, timeout, rateLimited, otherErrors)
 
-	if overloaded+timeout+otherErrors == floodSize && otherErrors > 0 {
+	if overloaded+timeout+rateLimited+otherErrors == floodSize && otherErrors > 0 {
 		t.Fatal("all flood retains failed with non-overload errors — possible infrastructure issue")
 	}
 }
@@ -1511,12 +1792,42 @@ func TestStressEdge_All(t *testing.T) {
 		client.Close()
 	}
 
+	// P1-14: Add empty/special-char probe to verify graceful handling.
+	// Probe against the duplicate bank (already has data from above).
+	edgeClient, err := testutil.NewClient(testutil.DefaultServerURL, "stress:edge:duplicate")
+	if err == nil {
+		if initErr := edgeClient.Initialize(); initErr == nil {
+			// Empty string probe
+			start := time.Now()
+			emptyOutput, emptyErr := edgeClient.Recall("")
+			emptyDur := time.Since(start)
+			allResults = append(allResults, ProbeResult{
+				Query:           "",
+				ExpectedConcept: "",
+				ActualOutput:    emptyOutput,
+				LatencyMs:       float64(emptyDur.Microseconds()) / 1000.0,
+				Note:            func() string { if emptyErr != nil { return fmt.Sprintf("empty probe error (expected): %v", emptyErr) }; return "" }(),
+			})
+			t.Logf("Empty-string probe: err=%v output_len=%d", emptyErr, len(emptyOutput))
+		}
+		edgeClient.Close()
+	}
+
+	// Edge cases: passed if all probes have actual content (no errors)
+	edgeProbeErrors := 0
+	for _, r := range allResults {
+		if r.Note != "" {
+			edgeProbeErrors++
+		}
+	}
+	passed := edgeProbeErrors == 0
+
 	report := DimensionReport{
 		Dimension:  "edge",
 		Scenario:   "all",
 		Timestamp:  time.Now(),
 		Results:    allResults,
-		Passed:     true,
+		Passed:     passed,
 		DurationMs: float64(time.Since(totalStart).Milliseconds()),
 	}
 	writeJSONReport(t, "edge_all.json", report)
