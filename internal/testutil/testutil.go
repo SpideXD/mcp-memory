@@ -80,10 +80,12 @@ func Min(a, b int) int {
 }
 
 // NewClient creates a new MCP client connected to the given base URL and bank.
+// The SSE GET connection uses a client with no overall timeout (it is a long-lived stream).
+// The POST calls in CallJSONRPC use a separate client with DefaultTimeout.
 func NewClient(baseURL, bank string) (*Client, error) {
 	c := &Client{
 		baseURL:    baseURL,
-		httpClient: &http.Client{Timeout: DefaultTimeout},
+		httpClient: &http.Client{Timeout: DefaultTimeout}, // Used for POST calls only
 		responses:  make(map[int]chan Response),
 	}
 	sseURL := fmt.Sprintf("%s/mcp/sse?bank=%s", baseURL, bank)
@@ -91,10 +93,15 @@ func NewClient(baseURL, bank string) (*Client, error) {
 }
 
 // ConnectSSE establishes an SSE connection and extracts the session ID.
+// Uses a dedicated http.Client with no overall timeout for the long-lived SSE stream.
 func (c *Client) ConnectSSE(sseURL string) (*Client, error) {
+	sseClient := &http.Client{
+		Transport: &http.Transport{},
+		// No Timeout: SSE is a long-lived stream that must not be killed by a client-side timer.
+	}
 	req, _ := http.NewRequest("GET", sseURL, nil)
 	req.Header.Set("Accept", "text/event-stream")
-	resp, err := c.httpClient.Do(req)
+	resp, err := sseClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("SSE connect: %w", err)
 	}
