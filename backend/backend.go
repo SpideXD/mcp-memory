@@ -3,7 +3,6 @@ package backend
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 )
 
@@ -45,6 +44,7 @@ type BackendConfig struct {
 	BackendRetainTimeout  time.Duration
 	BackendRecallTimeout  time.Duration
 	BackendReflectTimeout time.Duration
+	CogneeRetainTimeout   time.Duration // Cognee-specific: 900s default, used for HTTP client timeout
 	RetryAttempts         int
 	RetryDelay            time.Duration
 	RetryMaxDelay         time.Duration
@@ -62,15 +62,5 @@ func New(cfg BackendConfig) Backend {
 	default:
 		// Default to hindsight for backward compatibility
 		return newHindsightBackend(cfg)
-	}
-}
-
-// Validate returns an error if the backend name is invalid.
-func ValidateBackend(name string) error {
-	switch name {
-	case "hindsight", "cognee-python", "cognee-rust":
-		return nil
-	default:
-		return fmt.Errorf("unknown backend: %q (valid: hindsight, cognee-python, cognee-rust)", name)
 	}
 }

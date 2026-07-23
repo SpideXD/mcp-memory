@@ -29,9 +29,15 @@ type CogneeBackend struct {
 var _ Backend = (*CogneeBackend)(nil)
 
 func newCogneeBackend(cfg BackendConfig) *CogneeBackend {
+	// Use CogneeRetainTimeout (default 900s) for the HTTP client timeout,
+	// NOT BackendRetainTimeout (60s default). Cognee retains can take 2-10 minutes.
+	clientTimeout := cfg.BackendRetainTimeout
+	if cfg.CogneeRetainTimeout > 0 {
+		clientTimeout = cfg.CogneeRetainTimeout
+	}
 	return &CogneeBackend{
 		baseURL:        fmt.Sprintf("http://localhost:%s", cfg.CogneePort),
-		httpClient:     &http.Client{Timeout: cfg.BackendRetainTimeout},
+		httpClient:     &http.Client{Timeout: clientTimeout},
 		breaker:        NewCircuitBreaker(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerCooldown),
 		retryAttempts:  cfg.RetryAttempts,
 		retryDelay:     cfg.RetryDelay,
@@ -77,7 +83,7 @@ func (c *CogneeBackend) Retain(ctx context.Context, bank string, content string)
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 	_ = writer.WriteField("datasetName", bank)
-	part, err := writer.CreateFormFile("content", "data.txt")
+	part, err := writer.CreateFormFile("data", "data.txt")
 	if err != nil {
 		return "", fmt.Errorf("create form file: %w", err)
 	}
@@ -133,7 +139,7 @@ func (c *CogneeBackend) Reflect(ctx context.Context, bank string, query string) 
 
 	payload := map[string]interface{}{
 		"dataset_name": bank,
-		"query":        query,
+		"data":         query,
 	}
 	data, _ := json.Marshal(payload)
 
@@ -159,7 +165,7 @@ func (c *CogneeBackend) Forget(ctx context.Context, bank string, contentID strin
 
 	payload := map[string]interface{}{
 		"dataset":     bank,
-		"content_id":  contentID,
+		"data_id":     contentID,
 		"memory_only": true,
 	}
 	data, _ := json.Marshal(payload)

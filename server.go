@@ -43,6 +43,9 @@ type Server struct {
 	// Cognee-only fields — nil when BACKEND=hindsight
 	cogneeSemaphore chan struct{} // buffered, bounds concurrent retains
 	jobTracker      *jobTracker  // in-memory job result map + TTL cleanup
+	cogneeCtx       context.Context    // cancelled on Stop() for goroutine coordination
+	cogneeCancel    context.CancelFunc // called from Stop()
+	cogneeWg        sync.WaitGroup    // tracks in-flight Cognee goroutines
 }
 
 type serverMetrics struct {
@@ -55,6 +58,15 @@ type serverMetrics struct {
 	queueGauge   *metrics.Gauge
 	sessionGauge *metrics.Gauge
 	sseDrops     *metrics.Counter
+	// Spec-required metrics (AC-M7.13)
+	retainTotal    *metrics.Counter // memory.retain_total
+	retainErrors   *metrics.Counter // memory.retain_errors
+	recallTotal    *metrics.Counter // memory.recall_total
+	reflectTotal   *metrics.Counter // memory.reflect_total
+	improveTotal   *metrics.Counter // memory.improve_total
+	forgetTotal    *metrics.Counter // memory.forget_total
+	semaphoreGauge *metrics.Gauge   // memory.semaphore_in_use (Cognee only)
+	cogneePending  *metrics.Gauge   // memory.cognee_jobs_pending (Cognee only)
 }
 
 func NewServer(config Config) *Server {
@@ -76,6 +88,7 @@ func NewServer(config Config) *Server {
 		BackendRetainTimeout:    config.BackendRetainTimeout,
 		BackendRecallTimeout:    config.BackendRecallTimeout,
 		BackendReflectTimeout:   config.BackendReflectTimeout,
+		CogneeRetainTimeout:     config.CogneeRetainTimeout,
 		RetryAttempts:           config.RetryAttempts,
 		RetryDelay:              config.RetryDelay,
 		RetryMaxDelay:           config.RetryMaxDelay,
@@ -102,7 +115,16 @@ func NewServer(config Config) *Server {
 			reflectDur:   metrics.NewTimer("memory.reflect_duration"),
 			queueGauge:   metrics.NewGauge("memory.queue_depth"),
 			sessionGauge: metrics.NewGauge("memory.sessions"),
-			sseDrops:     metrics.NewCounter("memory.sse_drops"),
+			sseDrops:       metrics.NewCounter("memory.sse_drops"),
+			// Spec-required metrics (AC-M7.13)
+			retainTotal:    metrics.NewCounter("memory.retain_total"),
+			retainErrors:   metrics.NewCounter("memory.retain_errors"),
+			recallTotal:    metrics.NewCounter("memory.recall_total"),
+			reflectTotal:   metrics.NewCounter("memory.reflect_total"),
+			improveTotal:   metrics.NewCounter("memory.improve_total"),
+			forgetTotal:    metrics.NewCounter("memory.forget_total"),
+			semaphoreGauge: metrics.NewGauge("memory.semaphore_in_use"),
+			cogneePending:  metrics.NewGauge("memory.cognee_jobs_pending"),
 		},
 	}
 
@@ -110,6 +132,7 @@ func NewServer(config Config) *Server {
 	if !s.backend.IsSync() {
 		s.cogneeSemaphore = make(chan struct{}, config.CogneeMaxConcurrentRetains)
 		s.jobTracker = newJobTracker(30 * time.Minute)
+		s.cogneeCtx, s.cogneeCancel = context.WithCancel(context.Background())
 		go s.jobTrackerCleanup()
 	}
 
@@ -178,6 +201,13 @@ func (s *Server) Stop() {
 
 	// Signal session cleaner goroutine to exit (once)
 	s.shutdownOnce.Do(func() { close(s.shutdown) })
+
+	// Cancel Cognee goroutine contexts and wait for them to drain
+	if s.cogneeCancel != nil {
+		s.cogneeCancel()
+		s.cogneeWg.Wait()
+		s.log.Info("all cognee goroutines drained")
+	}
 
 	s.workers.stop()
 
