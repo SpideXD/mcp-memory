@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"mcp-memory/logger"
@@ -13,18 +14,37 @@ import (
 type workerSystem struct {
 	retainJobs  chan MemoryJob
 	reflectJobs chan MemoryJob
+	improveJobs chan MemoryJob // dedicated auto-improve channel
 	retainPool  *worker.Pool
 	reflectPool *worker.Pool
+	improvePool *worker.Pool // 1 worker for auto-improve
 	log         *logger.Logger
 	stopOnce    sync.Once
+
+	// Auto-improve state
+	improve *autoImproveState
+}
+
+type autoImproveState struct {
+	mu      sync.Mutex
+	perBank map[string]*atomic.Int64 // retain counter per bank
+	pending map[string]bool           // dedup: only one pending improve per bank
 }
 
 func newWorkerSystem(cfg Config, log *logger.Logger) *workerSystem {
-	return &workerSystem{
+	ws := &workerSystem{
 		retainJobs:  make(chan MemoryJob, cfg.JobBufferSize),
 		reflectJobs: make(chan MemoryJob, cfg.JobBufferSize),
+		improveJobs: make(chan MemoryJob, cfg.JobBufferSize),
 		log:         log,
 	}
+	if cfg.AutoImproveAfterN > 0 {
+		ws.improve = &autoImproveState{
+			perBank: make(map[string]*atomic.Int64),
+			pending: make(map[string]bool),
+		}
+	}
+	return ws
 }
 
 func (ws *workerSystem) start(s *Server) {
@@ -44,7 +64,7 @@ func (ws *workerSystem) start(s *Server) {
 			default:
 			}
 			handle := s.metrics.retainDur.Start()
-			result, err := s.retainAPIWithContext(job.Ctx, job.Bank, job.Data)
+			result, err := s.backend.Retain(job.Ctx, job.Bank, job.Data)
 			s.metrics.retainDur.Stop(handle)
 			// Try to send result; if receiver timed out, just discard
 			select {
@@ -75,7 +95,7 @@ func (ws *workerSystem) start(s *Server) {
 			default:
 			}
 			handle := s.metrics.reflectDur.Start()
-			result, err := s.reflectAPIWithContext(job.Ctx, job.Bank, job.Data)
+			result, err := s.backend.Reflect(job.Ctx, job.Bank, job.Data)
 			s.metrics.reflectDur.Stop(handle)
 			// Try to send result; if receiver timed out, just discard
 			select {
@@ -92,6 +112,30 @@ func (ws *workerSystem) start(s *Server) {
 	})
 	ws.reflectPool.Start()
 
+	// Auto-improve worker: 1 worker, dedicated channel, panic-recovered
+	if ws.improve != nil {
+		ws.improvePool = worker.NewPool("improve", 1, ws.log, func(ctx context.Context) {
+			select {
+			case job, ok := <-ws.improveJobs:
+				if !ok {
+					return
+				}
+				_, err := s.backend.Reflect(ctx, job.Bank, "") // empty query = full improve
+				ws.improve.mu.Lock()
+				delete(ws.improve.pending, job.Bank)
+				ws.improve.mu.Unlock()
+				if err != nil {
+					ws.log.Warn("auto-improve failed", "bank", job.Bank, logger.Error(err))
+				} else {
+					ws.log.Info("auto-improve completed", "bank", job.Bank)
+				}
+			case <-ctx.Done():
+				return
+			}
+		})
+		ws.improvePool.Start()
+	}
+
 	go s.sessionCleaner()
 }
 
@@ -100,9 +144,13 @@ func (ws *workerSystem) stop() {
 		// Stop pools first — workers will drain in-flight jobs
 		ws.retainPool.Stop()
 		ws.reflectPool.Stop()
+		if ws.improvePool != nil {
+			ws.improvePool.Stop()
+		}
 		// Then close channels — no senders remain
 		close(ws.retainJobs)
 		close(ws.reflectJobs)
+		close(ws.improveJobs)
 	})
 }
 
@@ -210,6 +258,37 @@ func (s *Server) sessionCleaner() {
 		if sessionCount > s.config.MaxSessions*9/10 {
 			s.log.Warn("approaching session limit", "sessions", sessionCount, "max", s.config.MaxSessions)
 			s.alerts.Send(AlertWarn, fmt.Sprintf("Sessions at %d/%d", sessionCount, s.config.MaxSessions), nil)
+		}
+	}
+}
+
+// maybeAutoImprove triggers graph improvement after N retains per bank.
+// Only active when AUTO_IMPROVE_AFTER_N > 0 and backend is not Hindsight.
+func (s *Server) maybeAutoImprove(bank string) {
+	if s.config.AutoImproveAfterN <= 0 {
+		return // disabled
+	}
+	ws := s.workers
+	if ws.improve == nil {
+		return
+	}
+
+	ws.improve.mu.Lock()
+	defer ws.improve.mu.Unlock()
+
+	// Initialize per-bank counter if needed
+	if _, ok := ws.improve.perBank[bank]; !ok {
+		ws.improve.perBank[bank] = &atomic.Int64{}
+	}
+
+	count := ws.improve.perBank[bank].Add(1)
+	if count%int64(s.config.AutoImproveAfterN) == 0 && !ws.improve.pending[bank] {
+		ws.improve.pending[bank] = true
+		job := MemoryJob{Bank: bank, Method: "improve", Data: "", Result: make(chan MemoryResult, 1)}
+		select {
+		case ws.improveJobs <- job:
+		default:
+			ws.improve.pending[bank] = false // channel full, skip this cycle
 		}
 	}
 }

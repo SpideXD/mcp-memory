@@ -97,6 +97,33 @@ type Config struct {
 
 	// Retry backoff cap
 	RetryMaxDelay time.Duration
+
+	// Backend selection (default: "hindsight")
+	Backend Backend
+
+	// Cognee
+	CogneePort               string        // COGNEE_PORT, default "8000"
+	CogneeDataDir            string        // COGNEE_DATA_DIR, default "./cognee-data"
+	CogneeBinary             string        // COGNEE_BINARY, Rust binary path
+	CogneePythonPath         string        // COGNEE_PYTHON_PATH, Python venv path
+	CogneeLLMApiKey          string        // COGNEE_LLM_API_KEY (defaults to OPENROUTER_API_KEY if unset)
+	CogneeLLMModel           string        // COGNEE_LLM_MODEL (default "deepseek/deepseek-v4-flash")
+	CogneeLLMEndpoint        string        // COGNEE_LLM_ENDPOINT (default "https://openrouter.ai/api/v1")
+	CogneeEmbeddingEndpoint  string        // COGNEE_EMBEDDING_ENDPOINT (default "http://localhost:8080/v1")
+	CogneeEmbeddingProvider  string        // COGNEE_EMBEDDING_PROVIDER (default "openai")
+	CogneeMaxConcurrentRetains int         // COGNEE_MAX_CONCURRENT_RETAINS, default 10
+	CogneeRetainTimeout      time.Duration // COGNEE_RETAIN_TIMEOUT, default 900s (15 min)
+
+	// Auto-improve
+	AutoImproveAfterN int // AUTO_IMPROVE_AFTER_N, 0=disabled, default 0
+
+	// Error webhook
+	ErrorWebhookURL string // ERROR_WEBHOOK_URL, default "" (disabled)
+
+	// Generic backend timeouts (primary; falls back to Hindsight-specific if unset)
+	BackendRetainTimeout  time.Duration // BACKEND_RETAIN_TIMEOUT
+	BackendRecallTimeout  time.Duration // BACKEND_RECALL_TIMEOUT
+	BackendReflectTimeout time.Duration // BACKEND_REFLECT_TIMEOUT
 }
 
 func LoadConfig() Config {
@@ -188,6 +215,33 @@ func LoadConfig() Config {
 
 		// Retry backoff cap
 		RetryMaxDelay: getEnvDuration("MCP_RETRY_MAX_DELAY", 30*time.Second),
+
+		// Backend selection
+		Backend: Backend(getEnv("BACKEND", "hindsight")),
+
+		// Cognee
+		CogneePort:               getEnv("COGNEE_PORT", "8000"),
+		CogneeDataDir:            getEnv("COGNEE_DATA_DIR", "./cognee-data"),
+		CogneeBinary:             getEnv("COGNEE_BINARY", ""),
+		CogneePythonPath:         getEnv("COGNEE_PYTHON_PATH", ""),
+		CogneeLLMApiKey:          getEnv("COGNEE_LLM_API_KEY", getEnv("OPENROUTER_API_KEY", "")),
+		CogneeLLMModel:           getEnv("COGNEE_LLM_MODEL", "deepseek/deepseek-v4-flash"),
+		CogneeLLMEndpoint:        getEnv("COGNEE_LLM_ENDPOINT", "https://openrouter.ai/api/v1"),
+		CogneeEmbeddingEndpoint:  getEnv("COGNEE_EMBEDDING_ENDPOINT", "http://localhost:"+getEnv("LLAMA_PORT", "8080")+"/v1"),
+		CogneeEmbeddingProvider:  getEnv("COGNEE_EMBEDDING_PROVIDER", "openai"),
+		CogneeMaxConcurrentRetains: getEnvInt("COGNEE_MAX_CONCURRENT_RETAINS", 10),
+		CogneeRetainTimeout:      getEnvDuration("COGNEE_RETAIN_TIMEOUT", 900*time.Second),
+
+		// Auto-improve
+		AutoImproveAfterN: getEnvInt("AUTO_IMPROVE_AFTER_N", 0),
+
+		// Error webhook
+		ErrorWebhookURL: getEnv("ERROR_WEBHOOK_URL", ""),
+
+		// Generic backend timeouts (fall back to Hindsight-specific values)
+		BackendRetainTimeout:  getEnvDuration("BACKEND_RETAIN_TIMEOUT", getEnvDuration("HINDSIGHT_RETAIN_TIMEOUT", 60*time.Second)),
+		BackendRecallTimeout:  getEnvDuration("BACKEND_RECALL_TIMEOUT", getEnvDuration("HINDSIGHT_RECALL_TIMEOUT", 10*time.Second)),
+		BackendReflectTimeout: getEnvDuration("BACKEND_REFLECT_TIMEOUT", getEnvDuration("HINDSIGHT_REFLECT_TIMEOUT", 60*time.Second)),
 	}
 }
 
@@ -226,6 +280,19 @@ func (c Config) IsCloudEmbedding() bool { return isCloudURL(c.ModelPath) }
 // indicating the reranker service should use a cloud endpoint.
 func (c Config) IsCloudReranker() bool { return isCloudURL(c.RerankerModel) }
 
+// Env Var Translation Table (consumed by services.go when spawning Cognee subprocesses):
+//
+//   | Config field            | Hindsight env var          | Cognee env var              |
+//   |-------------------------|----------------------------|-----------------------------|
+//   | LLMAPIKey               | OPENROUTER_API_KEY         | LLM_API_KEY                 |
+//   | LLMModel                | HINDSIGHT_LLM_MODEL        | LLM_MODEL                   |
+//   | LLMBaseURL              | OPENROUTER_BASE_URL        | LLM_ENDPOINT                |
+//   | CogneeEmbeddingProvider | — (uses local llama-server)| EMBEDDING_PROVIDER          |
+//   | CogneeEmbeddingEndpoint | —                          | EMBEDDING_ENDPOINT          |
+//   | CogneeDataDir           | —                          | COGNEE_DATA_DIR             |
+//
+// services.go translates names when spawning subprocesses.
+
 // Validate checks the configuration for common mistakes.
 func (c Config) Validate() error {
 	if c.LLMAPIKey == "" {
@@ -243,44 +310,85 @@ func (c Config) Validate() error {
 	if c.StartTimeout <= 0 || c.StopTimeout <= 0 || c.ShutdownTimeout <= 0 {
 		return fmt.Errorf("timeouts must be positive")
 	}
-	// Validate model files exist (skip for cloud endpoints)
-	for _, path := range []string{c.ModelPath, c.RerankerModel} {
-		if isCloudURL(path) {
-			continue
-		}
-		if !filepath.IsAbs(path) {
-			wd, _ := os.Getwd()
-			path = filepath.Join(wd, path)
-		}
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			return fmt.Errorf("model file not found: %s", path)
-		}
-	}
 
-	// Cloud embedding: if configured, all three fields are required
-	if c.IsCloudEmbedding() {
-		if strings.TrimSpace(c.CloudEmbeddingAPIKey) == "" {
-			return fmt.Errorf("CLOUD_EMBEDDING_API_KEY is required when LLAMA_MODEL_PATH is a cloud URL")
+	// Branch validation per backend type
+	switch c.Backend {
+	case BackendHindsight:
+		// Validate model files exist (skip for cloud endpoints)
+		for _, path := range []string{c.ModelPath, c.RerankerModel} {
+			if isCloudURL(path) {
+				continue
+			}
+			if !filepath.IsAbs(path) {
+				wd, _ := os.Getwd()
+				path = filepath.Join(wd, path)
+			}
+			if _, err := os.Stat(path); os.IsNotExist(err) {
+				return fmt.Errorf("model file not found: %s", path)
+			}
 		}
-		if strings.TrimSpace(c.CloudEmbeddingURL) == "" {
-			return fmt.Errorf("CLOUD_EMBEDDING_URL is required when LLAMA_MODEL_PATH is a cloud URL")
-		}
-		if strings.TrimSpace(c.CloudEmbeddingModel) == "" {
-			return fmt.Errorf("CLOUD_EMBEDDING_MODEL is required when LLAMA_MODEL_PATH is a cloud URL")
-		}
-	}
 
-	// Cloud reranker: if configured, all three fields are required
-	if c.IsCloudReranker() {
-		if strings.TrimSpace(c.CloudRerankerAPIKey) == "" {
-			return fmt.Errorf("CLOUD_RERANKER_API_KEY is required when HINDSIGHT_RERANKER_MODEL is a cloud URL")
+		// Cloud embedding: if configured, all three fields are required
+		if c.IsCloudEmbedding() {
+			if strings.TrimSpace(c.CloudEmbeddingAPIKey) == "" {
+				return fmt.Errorf("CLOUD_EMBEDDING_API_KEY is required when LLAMA_MODEL_PATH is a cloud URL")
+			}
+			if strings.TrimSpace(c.CloudEmbeddingURL) == "" {
+				return fmt.Errorf("CLOUD_EMBEDDING_URL is required when LLAMA_MODEL_PATH is a cloud URL")
+			}
+			if strings.TrimSpace(c.CloudEmbeddingModel) == "" {
+				return fmt.Errorf("CLOUD_EMBEDDING_MODEL is required when LLAMA_MODEL_PATH is a cloud URL")
+			}
 		}
-		if strings.TrimSpace(c.CloudRerankerURL) == "" {
-			return fmt.Errorf("CLOUD_RERANKER_URL is required when HINDSIGHT_RERANKER_MODEL is a cloud URL")
+
+		// Cloud reranker: if configured, all three fields are required
+		if c.IsCloudReranker() {
+			if strings.TrimSpace(c.CloudRerankerAPIKey) == "" {
+				return fmt.Errorf("CLOUD_RERANKER_API_KEY is required when HINDSIGHT_RERANKER_MODEL is a cloud URL")
+			}
+			if strings.TrimSpace(c.CloudRerankerURL) == "" {
+				return fmt.Errorf("CLOUD_RERANKER_URL is required when HINDSIGHT_RERANKER_MODEL is a cloud URL")
+			}
+			if strings.TrimSpace(c.CloudRerankerModel) == "" {
+				return fmt.Errorf("CLOUD_RERANKER_MODEL is required when HINDSIGHT_RERANKER_MODEL is a cloud URL")
+			}
 		}
-		if strings.TrimSpace(c.CloudRerankerModel) == "" {
-			return fmt.Errorf("CLOUD_RERANKER_MODEL is required when HINDSIGHT_RERANKER_MODEL is a cloud URL")
+
+	case BackendCogneePython:
+		// Cognee uses llama-server for embeddings, not model files directly
+		// Validate Cognee Python path is resolvable
+		if c.CogneePythonPath != "" {
+			info, err := os.Stat(c.CogneePythonPath)
+			if err == nil && (!info.Mode().IsRegular() || info.Size() == 0 || info.Mode()&0111 == 0) {
+				return fmt.Errorf("COGNEE_PYTHON_PATH is not a valid executable: %s", c.CogneePythonPath)
+			}
 		}
+		if c.CogneeMaxConcurrentRetains < 1 {
+			return fmt.Errorf("COGNEE_MAX_CONCURRENT_RETAINS must be >= 1, got %d", c.CogneeMaxConcurrentRetains)
+		}
+		if c.CogneeRetainTimeout <= 0 {
+			return fmt.Errorf("COGNEE_RETAIN_TIMEOUT must be positive")
+		}
+
+	case BackendCogneeRust:
+		// Validate Cognee binary is resolvable
+		if c.CogneeBinary == "" {
+			return fmt.Errorf("COGNEE_BINARY is required for cognee-rust backend")
+		}
+		if info, err := os.Stat(c.CogneeBinary); err == nil {
+			if !info.Mode().IsRegular() || info.Size() == 0 || info.Mode()&0111 == 0 {
+				return fmt.Errorf("COGNEE_BINARY is not a valid executable: %s", c.CogneeBinary)
+			}
+		}
+		if c.CogneeMaxConcurrentRetains < 1 {
+			return fmt.Errorf("COGNEE_MAX_CONCURRENT_RETAINS must be >= 1, got %d", c.CogneeMaxConcurrentRetains)
+		}
+		if c.CogneeRetainTimeout <= 0 {
+			return fmt.Errorf("COGNEE_RETAIN_TIMEOUT must be positive")
+		}
+
+	default:
+		return fmt.Errorf("unknown BACKEND: %q (valid: hindsight, cognee-python, cognee-rust)", c.Backend)
 	}
 
 	return nil
