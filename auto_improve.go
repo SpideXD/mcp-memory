@@ -177,14 +177,38 @@ func (s *Server) maybeAutoImprove(bank string) {
 
 		// Defer ordering per AC-M2.31: recover() must be the FIRST deferred
 		// statement to execute. In Go, defers execute LIFO, so recover() is
-		// registered LAST (innermost) so it runs FIRST.
+		// registered as the FIRST defer (outermost after cogneeWg.Done) so it
+		// executes LAST — but it is the FIRST to be registered, meaning all
+		// subsequent defers run INSIDE its protection.
+		// Register FIRST so it catches panics from all other defers and body.
+		defer func() {
+			if r := recover(); r != nil {
+				if s.log != nil {
+					s.log.Error("auto-improve goroutine panicked", "bank", bank, "panic", fmt.Sprintf("%v", r))
+				}
+				s.panics.Add(1)
+			}
+		}()
+
+		// Nil-safety: capture log/metrics locally so nil struct fields
+		// don't cause SIGSEGV during defer registration or body execution.
+		log := s.log
+		metrics := s.metrics
+
+		// Nil-safe context: context.WithTimeout(nil, ...) panics before
+		// recover() can catch it (defer args are evaluated at registration).
+		if s.cogneeCtx == nil {
+			s.cogneeCtx = context.Background()
+		}
 
 		// Detached context with timeout — cancelled on Stop()
 		detachedCtx, cancel := context.WithTimeout(s.cogneeCtx, s.config.BackendReflectTimeout)
 		defer cancel()
 
-		// Log goroutine lifecycle
-		defer s.log.Info("goroutine_stopped", "name", "auto_improve", "bank", bank)
+		// Log goroutine lifecycle (nil-safe: guard at registration time)
+		if log != nil {
+			defer log.Info("goroutine_stopped", "name", "auto_improve", "bank", bank)
+		}
 
 		// Reset improveInFlight on exit (success, error, or panic)
 		defer func() {
@@ -196,22 +220,22 @@ func (s *Server) maybeAutoImprove(bank string) {
 			s.improveState.mu.Unlock()
 		}()
 
-		// MUST be innermost defer (registered last, runs first) per AC-M2.31
-		defer func() {
-			if r := recover(); r != nil {
-				s.panics.Add(1)
-				s.log.Error("auto-improve goroutine panicked", "bank", bank, "panic", fmt.Sprintf("%v", r))
-			}
-		}()
-
-		s.log.Info("goroutine_started", "name", "auto_improve", "bank", bank)
+		if log != nil {
+			log.Info("goroutine_started", "name", "auto_improve", "bank", bank)
+		}
 
 		_, err := s.backend.Reflect(detachedCtx, bank, "") // empty query = full improve
 		if err != nil {
-			s.log.Error("auto-improve failed", "bank", bank, "error", err.Error())
-			s.metrics.errorCalls.Inc()
+			if log != nil {
+				log.Error("auto-improve failed", "bank", bank, "error", err.Error())
+			}
+			if metrics != nil {
+				metrics.errorCalls.Inc()
+			}
 		} else {
-			s.log.Info("auto-improve completed", "bank", bank)
+			if log != nil {
+				log.Info("auto-improve completed", "bank", bank)
+			}
 		}
 	}()
 }
