@@ -4,13 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
-
-	"mcp-memory/logger"
-	"mcp-memory/metrics"
 )
 
 // bankState tracks the auto-improve state for a single memory bank.
@@ -130,6 +128,11 @@ func (s *Server) maybeAutoImprove(bank string) {
 		return
 	}
 
+	// Defensive bank name validation (HIGH-5)
+	if bank == "" || !bankNamePattern.MatchString(bank) {
+		return
+	}
+
 	s.improveState.mu.Lock()
 
 	// Get or create bank state
@@ -139,8 +142,10 @@ func (s *Server) maybeAutoImprove(bank string) {
 		s.improveState.banks[bank] = bs
 	}
 
-	// Increment retain counter
-	bs.retainsSince++
+	// Increment retain counter (saturate at MaxInt64 to prevent overflow wrap)
+	if bs.retainsSince < math.MaxInt64 {
+		bs.retainsSince++
+	}
 
 	// Persist after counter increment
 	s.improveState.saveStateLocked()
@@ -170,25 +175,16 @@ func (s *Server) maybeAutoImprove(bank string) {
 	go func() {
 		defer s.cogneeWg.Done()
 
-		// Initialize logger/metrics FIRST before any defers that use them
-		if s.metrics == nil {
-			s.metrics = &serverMetrics{errorCalls: metrics.NewCounter("test")}
-		}
-		if s.log == nil {
-			var err error
-			s.log, err = logger.NewBuf("test", "error", nil)
-			if err != nil {
-				return
-			}
-		}
+		// Defer ordering per AC-M2.31: recover() must be the FIRST deferred
+		// statement to execute. In Go, defers execute LIFO, so recover() is
+		// registered LAST (innermost) so it runs FIRST.
 
-		// MUST be first deferred statement for panic recovery
-		defer func() {
-			if r := recover(); r != nil {
-				s.panics.Add(1)
-				s.log.Error("auto-improve goroutine panicked", "bank", bank, "panic", fmt.Sprintf("%v", r))
-			}
-		}()
+		// Detached context with timeout — cancelled on Stop()
+		detachedCtx, cancel := context.WithTimeout(s.cogneeCtx, s.config.BackendReflectTimeout)
+		defer cancel()
+
+		// Log goroutine lifecycle
+		defer s.log.Info("goroutine_stopped", "name", "auto_improve", "bank", bank)
 
 		// Reset improveInFlight on exit (success, error, or panic)
 		defer func() {
@@ -200,11 +196,15 @@ func (s *Server) maybeAutoImprove(bank string) {
 			s.improveState.mu.Unlock()
 		}()
 
-		s.log.Info("goroutine_started", "name", "auto_improve", "bank", bank)
-		defer s.log.Info("goroutine_stopped", "name", "auto_improve", "bank", bank)
+		// MUST be innermost defer (registered last, runs first) per AC-M2.31
+		defer func() {
+			if r := recover(); r != nil {
+				s.panics.Add(1)
+				s.log.Error("auto-improve goroutine panicked", "bank", bank, "panic", fmt.Sprintf("%v", r))
+			}
+		}()
 
-		detachedCtx, cancel := context.WithTimeout(s.cogneeCtx, s.config.BackendReflectTimeout)
-		defer cancel()
+		s.log.Info("goroutine_started", "name", "auto_improve", "bank", bank)
 
 		_, err := s.backend.Reflect(detachedCtx, bank, "") // empty query = full improve
 		if err != nil {

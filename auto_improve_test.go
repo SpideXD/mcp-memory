@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -160,10 +162,11 @@ func (m *mockBackend) Forget(ctx context.Context, bank string, contentID string)
 }
 
 func testServer(dir string, cfg Config) *Server {
-	l, _ := logger.NewBuf("test", "error", nil)
+	l, err := logger.NewBuf("test", "error", &bytes.Buffer{})
+	if err != nil {
+		panic(fmt.Sprintf("failed to create test logger: %v", err))
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	// Suppress unused variable warning
-	_ = cancel
 	return &Server{
 		config:        cfg,
 		improveState:  loadAutoImproveState(dir),
@@ -345,9 +348,12 @@ func TestMaybeAutoImprove_ConcurrentSafety(t *testing.T) {
 	}
 }
 
-// testLogger returns a no-op logger for tests.
+// testLogger returns a logger backed by a bytes.Buffer for tests.
 func testLogger() *logger.Logger {
-	l, _ := logger.NewBuf("test", "error", nil)
+	l, err := logger.NewBuf("test", "error", &bytes.Buffer{})
+	if err != nil {
+		l, _ = logger.New("test", "error")
+	}
 	return l
 }
 

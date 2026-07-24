@@ -235,7 +235,7 @@ func LoadConfig() Config {
 
 		// Auto-improve
 		AutoImproveAfterN:  getEnvInt("AUTO_IMPROVE_AFTER_N", 0),
-		AutoImproveCooldown: getEnvDuration("AUTO_IMPROVE_COOLDOWN", 120*time.Second),
+		AutoImproveCooldown: clampDuration(getEnvDuration("AUTO_IMPROVE_COOLDOWN", 120*time.Second), 0),
 
 		// Error webhook
 		ErrorWebhookURL: getEnv("ERROR_WEBHOOK_URL", ""),
@@ -266,6 +266,14 @@ func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
 		log.Printf("WARN: invalid duration for %s=%q, using default %v", key, v, defaultValue)
 	}
 	return defaultValue
+}
+
+// clampDuration returns d if d >= min, otherwise returns min.
+func clampDuration(d, min time.Duration) time.Duration {
+	if d < min {
+		return min
+	}
+	return d
 }
 
 // isCloudURL returns true if s is an HTTP or HTTPS URL (i.e., a cloud
