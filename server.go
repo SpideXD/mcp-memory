@@ -46,6 +46,10 @@ type Server struct {
 	cogneeCtx       context.Context    // cancelled on Stop() for goroutine coordination
 	cogneeCancel    context.CancelFunc // called from Stop()
 	cogneeWg        sync.WaitGroup    // tracks in-flight Cognee goroutines
+
+	// Auto-improve state — periodic graph optimization
+	improveState *autoImproveState // per-bank counters + in-flight tracking
+	dataDir      string            // directory for improve_state.json persistence
 }
 
 type serverMetrics struct {
@@ -133,6 +137,8 @@ func NewServer(config Config) *Server {
 		s.cogneeSemaphore = make(chan struct{}, config.CogneeMaxConcurrentRetains)
 		s.jobTracker = newJobTracker(30 * time.Minute)
 		s.cogneeCtx, s.cogneeCancel = context.WithCancel(context.Background())
+		s.dataDir = getEnv("DATA_DIR", "./data")
+		s.improveState = loadAutoImproveState(s.dataDir)
 		go s.jobTrackerCleanup()
 	}
 

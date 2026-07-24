@@ -354,9 +354,9 @@ func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessa
 
 	case "memory_reflect":
 		var a struct{ Query string `json:"query"` }
-		if err := json.Unmarshal(c.Arguments, &a); err != nil || a.Query == "" {
-			s.mcpError(sid, id, -32602, "query is required")
-			logReq("", fmt.Errorf("missing query"))
+		if err := json.Unmarshal(c.Arguments, &a); err != nil {
+			s.mcpError(sid, id, -32602, "invalid arguments")
+			logReq("", fmt.Errorf("invalid arguments"))
 			return
 		}
 		s.metrics.reflectCalls.Inc()
@@ -399,9 +399,6 @@ func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessa
 		s.mcpToolResult(sid, id, fmt.Sprintf(`{"status":"queued","bank":"%s"}`, bank))
 		logReq("ok", nil)
 
-	case "memory_improve":
-		s.handleImprove(sid, id, bank, logReq)
-
 	case "memory_forget":
 		s.handleForget(sid, id, bank, c.Arguments, logReq)
 
@@ -429,14 +426,8 @@ func (s *Server) toolsList() map[string]interface{} {
 	tools := []map[string]interface{}{
 		{"name": "memory_retain", "description": "Store information in long-term memory", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"content": map[string]interface{}{"type": "string"}}, "required": []string{"content"}}},
 		{"name": "memory_recall", "description": "Search memory using semantic search", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"query": map[string]interface{}{"type": "string"}}, "required": []string{"query"}}},
-		{"name": "memory_reflect", "description": "Synthesize memories for insights", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"query": map[string]interface{}{"type": "string"}}, "required": []string{"query"}}},
+		{"name": "memory_reflect", "description": "Synthesize memories for insights", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"query": map[string]interface{}{"type": "string"}}, "required": []string{}}},
 	}
-	// memory_improve always available
-	tools = append(tools, map[string]interface{}{
-		"name":        "memory_improve",
-		"description":  "Improve memory graph for a dataset",
-		"inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}, "required": []string{}},
-	})
 	// Cognee-only tools
 	if !s.backend.IsSync() {
 		tools = append(tools,
@@ -453,58 +444,6 @@ func (s *Server) toolsList() map[string]interface{} {
 		)
 	}
 	return map[string]interface{}{"tools": tools}
-}
-
-// handleImprove triggers graph improvement for the given bank.
-// Routes through the dedicated improve worker pool (AC-M6.8).
-func (s *Server) handleImprove(sid string, id interface{}, bank string, logReq func(string, error)) {
-	s.log.Info("memory_improve called", "bank", bank)
-	s.metrics.improveTotal.Inc()
-
-	if s.backend.IsSync() {
-		// Hindsight: direct call with timeout
-		ctx, cancel := context.WithTimeout(context.Background(), s.config.BackendReflectTimeout)
-		defer cancel()
-		r, err := s.backend.Reflect(ctx, bank, "")
-		if err != nil {
-			s.mcpError(sid, id, -32000, err.Error())
-			logReq("", err)
-			return
-		}
-		s.mcpToolResult(sid, id, r)
-		logReq("ok", nil)
-		return
-	}
-
-	// Cognee: push to dedicated improveJobs channel and wait for result
-	ctx, cancel := context.WithTimeout(context.Background(), s.config.BackendReflectTimeout)
-	defer cancel()
-
-	resultCh := make(chan MemoryResult, 1)
-	job := MemoryJob{Bank: bank, Method: "improve", Data: "", Result: resultCh, Ctx: ctx, Cancel: cancel}
-
-	select {
-	case s.workers.improveJobs <- job:
-		// queued successfully
-	default:
-		s.mcpError(sid, id, -32000, "improve queue full")
-		logReq("", fmt.Errorf("improve queue full"))
-		return
-	}
-
-	select {
-	case result := <-resultCh:
-		if result.Err != nil {
-			s.mcpError(sid, id, -32000, result.Err.Error())
-			logReq("", result.Err)
-			return
-		}
-		s.mcpToolResult(sid, id, result.Data)
-		logReq("ok", nil)
-	case <-ctx.Done():
-		s.mcpError(sid, id, -32000, "improve operation timed out")
-		logReq("", ctx.Err())
-	}
 }
 
 // handleForget removes a specific memory from the backend.

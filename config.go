@@ -115,7 +115,8 @@ type Config struct {
 	CogneeRetainTimeout      time.Duration // COGNEE_RETAIN_TIMEOUT, default 900s (15 min)
 
 	// Auto-improve
-	AutoImproveAfterN int // AUTO_IMPROVE_AFTER_N, 0=disabled, default 0
+	AutoImproveAfterN  int           // AUTO_IMPROVE_AFTER_N, 0=disabled, default 0
+	AutoImproveCooldown time.Duration // AUTO_IMPROVE_COOLDOWN, default 120s
 
 	// Error webhook
 	ErrorWebhookURL string // ERROR_WEBHOOK_URL, default "" (disabled)
@@ -233,7 +234,8 @@ func LoadConfig() Config {
 		CogneeRetainTimeout:      getEnvDuration("COGNEE_RETAIN_TIMEOUT", 900*time.Second),
 
 		// Auto-improve
-		AutoImproveAfterN: getEnvInt("AUTO_IMPROVE_AFTER_N", 0),
+		AutoImproveAfterN:  getEnvInt("AUTO_IMPROVE_AFTER_N", 0),
+		AutoImproveCooldown: getEnvDuration("AUTO_IMPROVE_COOLDOWN", 120*time.Second),
 
 		// Error webhook
 		ErrorWebhookURL: getEnv("ERROR_WEBHOOK_URL", ""),
