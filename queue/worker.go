@@ -119,17 +119,21 @@ func (w *Worker) workerLoop(ctx context.Context, id int) {
 			continue
 		}
 
-		// Acquire semaphore. Release in a defer so the slot is freed even
-		// if processJob panics (B1 fix: prevents semaphore leak on panic).
+		// Acquire semaphore (B1 fix: use helper function so defer runs per-iteration)
 		select {
 		case w.sem <- struct{}{}:
-			defer func() { <-w.sem }()
 		case <-ctx.Done():
 			return
 		}
 
-		w.processJob(ctx, job)
+		w.processWithSemaphore(ctx, job)
 	}
+}
+
+// processWithSemaphore wraps processJob with semaphore release on return (B1 fix).
+func (w *Worker) processWithSemaphore(ctx context.Context, job *Job) {
+	defer func() { <-w.sem }()
+	w.processJob(ctx, job)
 }
 
 // processJob calls the ProcessFunc and handles the result.
