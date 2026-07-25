@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -27,8 +28,8 @@ func TestAdversarial_SemaphoreLeakOnPanic(t *testing.T) {
 	const semSize = 3
 	const workerCount = 4
 
-	// Insert jobs — we need semSize+1 jobs to prove deadlock
-	for i := 0; i < semSize+1; i++ {
+	// Insert workerCount jobs — all should be processed thanks to B1 fix
+	for i := 0; i < workerCount; i++ {
 		insertTestJob(t, s, fmt.Sprintf("panic-job-%d", i))
 	}
 
@@ -52,42 +53,39 @@ func TestAdversarial_SemaphoreLeakOnPanic(t *testing.T) {
 	}
 	w.Start(ctx)
 
-	// Wait long enough for 3 panics to fill the semaphore
-	// After semSize panics, the 4th worker can never acquire the sem.
-	// The 4th job never gets processed.
-	time.Sleep(2 * time.Second)
+	// B1 FIX: defer recovery in processWithSemaphore now releases the
+	// semaphore slot after a panic. All workers should get through.
+	deadline := time.After(10 * time.Second)
+	for panicCount.Load() < int32(workerCount) {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out: expected %d panics, got %d — semaphore may still be leaking", workerCount, panicCount.Load())
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
 
-	// Check: exactly semSize jobs should have panicked
 	gotPanics := int(panicCount.Load())
-	if gotPanics != semSize {
-		t.Fatalf("BUG PARTIALLY CONFIRMED: expected %d panics (semaphore full), got %d", semSize, gotPanics)
+	if gotPanics != workerCount {
+		t.Fatalf("expected %d panics (all workers get through), got %d", workerCount, gotPanics)
 	}
 
-	// The semSize+1-th job should still be pending (never claimed)
-	// because the 4th worker is blocked on the full semaphore
-	extra, err := s.Get("panic-job-3")
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if extra == nil {
-		t.Fatal("BUG CONFIRMED: extra job vanished?")
-	}
-	if extra.Status == StatusPending {
-		t.Logf("BUG CONFIRMED: extra job still pending (status=%s) — semaphore deadlocked", extra.Status)
-	} else if extra.Status == StatusRunning {
-		t.Log("BUG PARTIALLY CONFIRMED: extra job is running but worker may be stuck on semaphore")
-	} else {
-		t.Fatalf("BUG CONFIRMED: extra job has unexpected status %s", extra.Status)
+	// Verify semaphore slot IS freed after panic: all jobs were claimed
+	for i := 0; i < workerCount; i++ {
+		id := fmt.Sprintf("panic-job-%d", i)
+		got, err := s.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got == nil {
+			t.Fatalf("job %s vanished", id)
+		}
+		if got.Status == StatusPending {
+			t.Errorf("job %s still pending — semaphore was NOT freed after panic", id)
+		}
 	}
 
-	// Verify no more progress happens even after waiting
-	time.Sleep(3 * time.Second)
-	extra2, _ := s.Get("panic-job-3")
-	if extra2 != nil && extra2.Status == StatusPending {
-		t.Logf("BUG CONFIRMED: after %ds, extra job still pending — semaphore permanently deadlocked", 5)
-	} else if extra2 != nil && extra2.Status == StatusRunning {
-		t.Error("BUG CONFIRMED: extra job stuck in running with no way to complete")
-	}
+	t.Logf("FIX CONFIRMED: all %d panics completed, semaphore freed after each panic", workerCount)
 }
 
 // =============================================================================
@@ -265,11 +263,18 @@ func TestAdversarial_IllegalStateTransitions(t *testing.T) {
 		job, _ := s.NextPending()
 		_ = s.UpdateStatus(job.ID, StatusCompleted, "done", "")
 		err := s.UpdateStatus(job.ID, StatusFailed, "", "retroactive fail")
-		if err != nil {
-			t.Fatalf("UpdateStatus(completed→failed) errored: %v", err)
+		if !errors.Is(err, ErrJobNotFound) {
+			t.Fatalf("UpdateStatus(completed→failed): expected ErrJobNotFound, got %v", err)
 		}
+		// Job should remain completed — no status change, no retry_count bump
 		got, _ := s.Get(job.ID)
-		t.Logf("GAP CONFIRMED: completed→failed produces retry_count=%d", got.RetryCount)
+		if got.Status != StatusCompleted {
+			t.Errorf("status changed to %q, expected completed (no illegal transition)", got.Status)
+		}
+		if got.RetryCount != 0 {
+			t.Errorf("retry_count = %d, expected 0 (only increments on running→failed)", got.RetryCount)
+		}
+		t.Logf("FIX CONFIRMED: completed→failed correctly rejected, retry_count stays %d", got.RetryCount)
 	})
 
 	t.Run("dead to pending", func(t *testing.T) {

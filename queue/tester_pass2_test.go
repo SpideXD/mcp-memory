@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -389,7 +390,6 @@ func TestPass2_SemaphoreExhaustionBehavior(t *testing.T) {
 		activeCount   atomic.Int32
 		maxActive     atomic.Int32
 		completedJobs atomic.Int32
-		startedJobs   sync.WaitGroup
 	)
 
 	// Each processFunc blocks until we signal it to complete
@@ -406,8 +406,6 @@ func TestPass2_SemaphoreExhaustionBehavior(t *testing.T) {
 				break
 			}
 		}
-
-		startedJobs.Done()
 
 		// Wait for the signal or context cancellation
 		select {
@@ -432,22 +430,17 @@ func TestPass2_SemaphoreExhaustionBehavior(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	startedJobs.Add(numJobs)
 	w.Start(ctx)
 
-	// Wait for all jobs to be picked up by workers and enter processFunc
+	// Wait for exactly semSize workers to enter processFunc (blocked on releaseAll)
 	deadline := time.After(10 * time.Second)
-	started := false
-	for i := 0; i < numJobs; i++ {
+	for activeCount.Load() < int32(semSize) {
 		select {
-		case <-waitChan(&startedJobs):
-			started = true
 		case <-deadline:
-			t.Fatalf("timed out waiting for job %d to start processing (active=%d)", i, activeCount.Load())
+			t.Fatalf("timed out waiting for %d workers to enter processFunc (active=%d)", semSize, activeCount.Load())
+		default:
+			time.Sleep(10 * time.Millisecond)
 		}
-	}
-	if !started {
-		t.Fatal("failed to wait for all jobs to start processing")
 	}
 
 	// At this point:
@@ -465,13 +458,14 @@ func TestPass2_SemaphoreExhaustionBehavior(t *testing.T) {
 
 	// Check active count
 	active := activeCount.Load()
-	if active != semSize {
+	if active != int32(semSize) {
 		t.Errorf("active = %d, want %d (semaphore should allow exactly %d concurrent)", active, semSize, semSize)
 	}
 
 	t.Logf("Semaphore correctly limited to %d concurrent: peak=%d, active=%d", semSize, peak, active)
 
 	// Now release the blocking jobs — the 3rd job should start immediately
+	// after a slot opens up.
 	close(releaseAll)
 
 	// Wait for all jobs to complete
@@ -1168,18 +1162,21 @@ func TestPass2_UpdateStatusFailedOnCompletedIncrementsRetryCount(t *testing.T) {
 	// Complete the job
 	_ = s.UpdateStatus(job.ID, StatusCompleted, "done", "")
 
-	// Now fail the already-completed job — should it increment retry_count?
+	// B6 FIX: UpdateStatus(failed) now requires WHERE status='running'.
+	// completed→failed returns ErrJobNotFound — no status change, no retry_count bump.
 	err := s.UpdateStatus(job.ID, StatusFailed, "", "retroactive failure")
-	if err != nil {
-		t.Fatalf("UpdateStatus(completed→failed) errored: %v", err)
+	if !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("UpdateStatus(completed→failed): expected ErrJobNotFound, got %v", err)
 	}
 
 	got, _ := s.Get(job.ID)
-	t.Logf("UpdateStatus(completed→failed): status=%q, retry_count=%d", got.Status, got.RetryCount)
-
-	if got.RetryCount > 0 {
-		t.Log("GAP: completed→failed increments retry_count (retry_count should track completed attempts)")
+	if got.Status != StatusCompleted {
+		t.Errorf("status changed to %q, expected completed", got.Status)
 	}
+	if got.RetryCount != 0 {
+		t.Errorf("retry_count = %d, expected 0 (only increments on running→failed)", got.RetryCount)
+	}
+	t.Logf("FIX CONFIRMED: completed→failed rejected, retry_count stays %d", got.RetryCount)
 }
 
 // =============================================================================
@@ -1480,18 +1477,20 @@ func TestPass2_UpdateStatusFailedAlwaysIncrementsRetryCount(t *testing.T) {
 	got1, _ := s.Get("retry-inc-bug")
 	beforeRC := got1.RetryCount
 
-	// Now call UpdateStatus with StatusFailed on an already-completed job
-	_ = s.UpdateStatus(job.ID, StatusFailed, "", "illegal fail")
+	// B6 FIX: UpdateStatus(failed) now requires WHERE status='running'.
+	// Calling StatusFailed on a completed job returns ErrJobNotFound.
+	err := s.UpdateStatus(job.ID, StatusFailed, "", "illegal fail")
+	if !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("UpdateStatus(completed→failed): expected ErrJobNotFound, got %v", err)
+	}
 
 	got2, _ := s.Get("retry-inc-bug")
 	afterRC := got2.RetryCount
 
-	if afterRC != beforeRC+1 {
-		t.Errorf("retry_count before=%d after=%d, expected increment by 1", beforeRC, afterRC)
+	if afterRC != beforeRC {
+		t.Errorf("retry_count before=%d after=%d, expected NO change (only increments on running→failed)", beforeRC, afterRC)
 	}
-	t.Logf("BUG CONFIRMED: UpdateStatus(failed) on 'completed' job incremented retry_count from %d to %d",
-		beforeRC, afterRC)
-	t.Log("retry_count should only increment on valid running→failed transitions")
+	t.Logf("FIX CONFIRMED: completed→failed rejected, retry_count stays %d", afterRC)
 }
 
 // =============================================================================
