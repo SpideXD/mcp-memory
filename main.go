@@ -47,7 +47,7 @@ func main() {
 	}
 	srv := NewServer(config)
 
-	// Phase 1: Start internal services (llama.cpp, Hindsight, workers, health monitor)
+	// Phase 1: Start internal services (llama.cpp, Cognee, health monitor)
 	println("mcp-memory: starting services...")
 	if err := srv.Start(); err != nil {
 		// Log to stderr before dying — logger isn't ready yet

@@ -21,28 +21,23 @@ import (
 var errProcessPanic = fmt.Errorf("process goroutine panicked")
 
 type services struct {
-	config           Config
-	llamaCmd         *exec.Cmd
-	llamaRerankerCmd *exec.Cmd
-	hindsightCmd     *exec.Cmd
-	cogneeCmd        *exec.Cmd
-	httpClient       *http.Client
-	mu               sync.Mutex
-	log              *logger.Logger
-	alerts           *AlertClient
-	backendName      string // "hindsight", "cognee-python", or "cognee-rust"
+	config     Config
+	llamaCmd   *exec.Cmd
+	cogneeCmd  *exec.Cmd
+	httpClient *http.Client
+	mu         sync.Mutex
+	log        *logger.Logger
+	alerts     *AlertClient
 
-	// Cached health status to avoid 3 HTTP requests per tool call
+	// Cached health status to avoid HTTP requests per tool call
 	healthMu      sync.RWMutex
-	healthCache   [3]bool // llama, reranker, hindsight/cognee
+	healthCache   [2]bool // llama, cognee
 	healthChecked time.Time
 	healthGroup   singleflight.Group // deduplicate concurrent health refreshes
 
 	// Per-service fail/restart tracking for backoff
-	llamaFails     serviceFails
-	rerankerFails  serviceFails
-	hindsightFails serviceFails
-	cogneeFails    serviceFails
+	llamaFails  serviceFails
+	cogneeFails serviceFails
 }
 
 type serviceFails struct {
@@ -54,11 +49,10 @@ type serviceFails struct {
 
 func newServices(config Config, log *logger.Logger, alerts *AlertClient) *services {
 	return &services{
-		config:      config,
-		httpClient:  &http.Client{Timeout: config.RequestTimeout},
-		log:         log,
-		alerts:      alerts,
-		backendName: string(config.Backend),
+		config:     config,
+		httpClient: &http.Client{Timeout: config.RequestTimeout},
+		log:        log,
+		alerts:     alerts,
 	}
 }
 
@@ -77,28 +71,6 @@ func (svc *services) start() error {
 	}
 
 	switch svc.config.Backend {
-	case BackendHindsight:
-		// Reranker — only for Hindsight
-		rerankerURL := healthURL(svc.config.LlamaRerankerPort)
-		if svc.config.IsCloudReranker() {
-			svc.log.Info("llama reranker skipped (cloud reranker mode)")
-		} else if svc.check(rerankerURL) != nil {
-			if err := svc.startLlamaReranker(); err != nil { return err }
-			if err := svc.wait(context.Background(), rerankerURL, svc.config.StartTimeout); err != nil { return err }
-			svc.log.Info("llama reranker started")
-		} else {
-			svc.log.Info("llama reranker already running")
-		}
-		// Hindsight API
-		hindsightURL := healthURL(svc.config.HindsightPort)
-		if svc.check(hindsightURL) != nil {
-			if err := svc.startHindsight(); err != nil { return err }
-			if err := svc.wait(context.Background(), hindsightURL, svc.config.StartTimeout); err != nil { return err }
-			svc.log.Info("Hindsight started")
-		} else {
-			svc.log.Info("Hindsight already running")
-		}
-
 	case BackendCogneePython:
 		cogneeURL := healthURL(svc.config.CogneePort)
 		if svc.check(cogneeURL) != nil {
@@ -124,11 +96,6 @@ func (svc *services) start() error {
 
 func (svc *services) stop() {
 	switch svc.config.Backend {
-	case BackendHindsight:
-		svc.stopProcess(&svc.hindsightCmd, "Hindsight")
-		if !svc.config.IsCloudReranker() {
-			svc.stopProcess(&svc.llamaRerankerCmd, "llama.cpp reranker")
-		}
 	case BackendCogneePython, BackendCogneeRust:
 		svc.stopProcess(&svc.cogneeCmd, "cognee")
 	}
@@ -160,14 +127,6 @@ func (svc *services) monitor(ctx context.Context, panics *atomic.Int64) {
 			}
 
 			switch svc.config.Backend {
-			case BackendHindsight:
-				if !svc.config.IsCloudReranker() {
-					go svc.checkAndRestart(ctx, "llama reranker", healthURL(svc.config.LlamaRerankerPort),
-						&svc.llamaRerankerCmd, svc.startLlamaReranker, &svc.rerankerFails, maxRestartsPerHour)
-				}
-				go svc.checkAndRestart(ctx, "Hindsight", healthURL(svc.config.HindsightPort),
-					&svc.hindsightCmd, svc.startHindsight, &svc.hindsightFails, maxRestartsPerHour)
-
 			case BackendCogneePython:
 				go svc.checkAndRestart(ctx, "cognee-python", healthURL(svc.config.CogneePort),
 					&svc.cogneeCmd, svc.startCogneePython, &svc.cogneeFails, maxRestartsPerHour)
@@ -285,89 +244,56 @@ func (svc *services) checkAndRestart(
 	fails.mu.Unlock()
 }
 
-func (svc *services) allHealthy() (llama, reranker, hindsight bool) {
-	// Use cached health with 10s TTL to avoid 3 HTTP requests per tool call
+func (svc *services) allHealthy() (llama, cognee bool) {
+	// Use cached health with 10s TTL to avoid HTTP requests per tool call
 	svc.healthMu.RLock()
 	if time.Since(svc.healthChecked) < 10*time.Second {
-		l, r, h := svc.healthCache[0], svc.healthCache[1], svc.healthCache[2]
+		l, c := svc.healthCache[0], svc.healthCache[1]
 		svc.healthMu.RUnlock()
-		return l, r, h
+		return l, c
 	}
 	svc.healthMu.RUnlock()
 
 	// Cache expired — deduplicate concurrent refreshes via singleflight
 	val, _, _ := svc.healthGroup.Do("health", func() (interface{}, error) {
-		var l, r, h bool
+		var l, c bool
 
-		// Cloud services are always "healthy" — no local process to check
+		// Cloud embedding: llama is always "healthy"
 		if svc.config.IsCloudEmbedding() {
 			l = true
-		}
-		if svc.config.IsCloudReranker() {
-			r = true
 		}
 
 		var wg sync.WaitGroup
 
-		switch svc.config.Backend {
-		case BackendHindsight:
-			nChecks := 1 // hindsight always checked
-			if !svc.config.IsCloudEmbedding() { nChecks++ }
-			if !svc.config.IsCloudReranker() { nChecks++ }
-			wg.Add(nChecks)
-			if !svc.config.IsCloudEmbedding() {
-				go func() {
-					defer func() { if rec := recover(); rec != nil { svc.log.Error("allHealthy panic", "service", "llama", "panic", fmt.Sprintf("%v", rec)) } }()
-					defer wg.Done()
-					l = svc.check(healthURL(svc.config.LlamaPort)) == nil
-				}()
-			}
-			if !svc.config.IsCloudReranker() {
-				go func() {
-					defer func() { if rec := recover(); rec != nil { svc.log.Error("allHealthy panic", "service", "reranker", "panic", fmt.Sprintf("%v", rec)) } }()
-					defer wg.Done()
-					r = svc.check(healthURL(svc.config.LlamaRerankerPort)) == nil
-				}()
-			}
+		nChecks := 1 // cognee
+		if !svc.config.IsCloudEmbedding() { nChecks++ }
+		wg.Add(nChecks)
+		if !svc.config.IsCloudEmbedding() {
 			go func() {
-				defer func() { if rec := recover(); rec != nil { svc.log.Error("allHealthy panic", "service", "hindsight", "panic", fmt.Sprintf("%v", rec)) } }()
+				defer func() { if rec := recover(); rec != nil { svc.log.Error("allHealthy panic", "service", "llama", "panic", fmt.Sprintf("%v", rec)) } }()
 				defer wg.Done()
-				h = svc.check(healthURL(svc.config.HindsightPort)) == nil
-			}()
-
-		case BackendCogneePython, BackendCogneeRust:
-			// Cognee: llama + cognee. Reranker is N/A (always true).
-			r = true // Cognee handles ranking via graph reweighting
-			nChecks := 1 // cognee
-			if !svc.config.IsCloudEmbedding() { nChecks++ }
-			wg.Add(nChecks)
-			if !svc.config.IsCloudEmbedding() {
-				go func() {
-					defer func() { if rec := recover(); rec != nil { svc.log.Error("allHealthy panic", "service", "llama", "panic", fmt.Sprintf("%v", rec)) } }()
-					defer wg.Done()
-					l = svc.check(healthURL(svc.config.LlamaPort)) == nil
-				}()
-			}
-			go func() {
-				defer func() { if rec := recover(); rec != nil { svc.log.Error("allHealthy panic", "service", "cognee", "panic", fmt.Sprintf("%v", rec)) } }()
-				defer wg.Done()
-				h = svc.check(healthURL(svc.config.CogneePort)) == nil
+				l = svc.check(healthURL(svc.config.LlamaPort)) == nil
 			}()
 		}
+		go func() {
+			defer func() { if rec := recover(); rec != nil { svc.log.Error("allHealthy panic", "service", "cognee", "panic", fmt.Sprintf("%v", rec)) } }()
+			defer wg.Done()
+			c = svc.check(healthURL(svc.config.CogneePort)) == nil
+		}()
 
 		wg.Wait()
 
 		svc.healthMu.Lock()
-		svc.healthCache = [3]bool{l, r, h}
+		svc.healthCache = [2]bool{l, c}
 		svc.healthChecked = time.Now()
 		svc.healthMu.Unlock()
-		return [3]bool{l, r, h}, nil
+		return [2]bool{l, c}, nil
 	})
-	result, ok := val.([3]bool)
+	result, ok := val.([2]bool)
 	if !ok {
-		return false, false, false
+		return false, false
 	}
-	return result[0], result[1], result[2]
+	return result[0], result[1]
 }
 
 func healthURL(port string) string { return "http://localhost:" + port + "/health" }
@@ -452,144 +378,11 @@ func (svc *services) startLlama() error {
 }
 
 func (svc *services) startLlamaReranker() error {
-	modelPath := svc.config.RerankerModel
-	if !filepath.IsAbs(modelPath) {
-		wd, _ := os.Getwd(); modelPath = filepath.Join(wd, modelPath)
-	}
-	if _, err := os.Stat(modelPath); os.IsNotExist(err) {
-		return errModelNotFound(modelPath)
-	}
-	llamaPath, err := svc.resolveLlamaPath()
-	if err != nil {
-		return err
-	}
-	cmd := svc.spawn(llamaPath,
-		"--model", modelPath, "--reranking",
-		"--ctx-size", svc.config.CtxSize,
-		"--parallel", "1",
-		"--cache-ram", "64",
-		"--cache-type-k", "q8_0",
-		"--cache-type-v", "q8_0",
-		"--n-gpu-layers", svc.config.GPULayers,
-		"--port", svc.config.LlamaRerankerPort, "--host", svc.config.LlamaHost,
-	)
-	if cmd == nil {
-		return fmt.Errorf("failed to spawn llama.cpp reranker")
-	}
-	svc.mu.Lock(); svc.llamaRerankerCmd = cmd; svc.mu.Unlock()
-	return nil
+	// REMOVED: Hindsight reranker no longer used
+	return fmt.Errorf("startLlamaReranker: not implemented")
 }
 
-func (svc *services) startHindsight() error {
-	// Don't double-spawn — port conflict
-	svc.mu.Lock()
-	if svc.hindsightCmd != nil && svc.hindsightCmd.Process != nil {
-		if svc.check(healthURL(svc.config.HindsightPort)) == nil {
-			svc.mu.Unlock()
-			return nil // Already running and healthy
-		}
-	}
-	svc.mu.Unlock()
-	hindsightPath := svc.config.HindsightPath
 
-	// Try project-local .venv first (make setup), fall back to system PATH and hardcoded locations
-	venvBin := filepath.Join(".venv", "bin", "hindsight-api")
-	if runtime.GOOS == "windows" {
-		venvBin = filepath.Join(".venv", "Scripts", "hindsight-api.exe")
-	}
-	found := false
-	for _, p := range []string{
-		venvBin,
-		hindsightPath,
-		"/Library/Frameworks/Python.framework/Versions/3.12/bin/hindsight-api",
-		"/usr/local/bin/hindsight-api",
-		filepath.Join(os.Getenv("HOME"), ".local/bin/hindsight-api"),
-	} {
-		if p == svc.config.HindsightPath {
-			lp, err := exec.LookPath(p)
-			if err != nil {
-				continue
-			}
-			p = lp
-		}
-		info, err := os.Stat(p)
-		if err != nil {
-			continue
-		}
-		if !info.Mode().IsRegular() {
-			continue
-		}
-		if info.Size() == 0 {
-			continue
-		}
-		if info.Mode()&0111 == 0 {
-			continue
-		}
-		hindsightPath = p
-		found = true
-		break
-	}
-	if !found { return errBinaryNotFound }
-	env := os.Environ()
-	// Block torch/sklearn from being importable — these 400MB+ libraries
-	// get lazy-loaded by Hindsight's query_analyzer and local-ml backends
-	// even when provider=cohere. Hindsight gracefully falls back via
-	// ImportError when these packages aren't available.
-	env = append(env,
-		"TORCH_UNAVAILABLE=1",
-		"PYTHON_DISABLE_TORCH=1",
-	)
-	env = append(env,
-		"HINDSIGHT_API_LLM_PROVIDER="+svc.config.LLMProvider,
-		"HINDSIGHT_API_LLM_API_KEY="+svc.config.LLMAPIKey,
-		"HINDSIGHT_API_LLM_MODEL="+svc.config.LLMModel,
-		"HINDSIGHT_API_LLM_BASE_URL="+svc.config.LLMBaseURL,
-	)
-
-	// Embedding env vars: branch on cloud vs local
-	env = append(env, "HINDSIGHT_API_EMBEDDINGS_PROVIDER="+svc.config.EmbedProvider)
-	if svc.config.IsCloudEmbedding() {
-		env = append(env,
-			"HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY="+svc.config.CloudEmbeddingAPIKey,
-			"HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL="+svc.config.CloudEmbeddingURL,
-			"HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL="+svc.config.CloudEmbeddingModel,
-		)
-	} else {
-		env = append(env,
-			"HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY=not-needed",
-			"HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL=http://localhost:"+svc.config.LlamaPort+"/v1",
-			"HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL="+svc.config.EmbedModel,
-		)
-	}
-
-	// Reranker env vars: branch on cloud vs local
-	env = append(env, "HINDSIGHT_API_RERANKER_PROVIDER="+svc.config.RerankerProvider)
-	if svc.config.IsCloudReranker() {
-		env = append(env,
-			"HINDSIGHT_API_RERANKER_COHERE_API_KEY="+svc.config.CloudRerankerAPIKey,
-			"HINDSIGHT_API_RERANKER_COHERE_BASE_URL="+svc.config.CloudRerankerURL,
-			"HINDSIGHT_API_RERANKER_COHERE_MODEL="+svc.config.CloudRerankerModel,
-		)
-	} else {
-		env = append(env,
-			"HINDSIGHT_API_RERANKER_COHERE_API_KEY=not-needed",
-			"HINDSIGHT_API_RERANKER_COHERE_BASE_URL=http://localhost:"+svc.config.LlamaRerankerPort+"/v1/rerank",
-			"HINDSIGHT_API_RERANKER_COHERE_MODEL="+filepath.Base(svc.config.RerankerModel),
-		)
-	}
-
-	env = append(env, "HINDSIGHT_API_PORT="+svc.config.HindsightPort)
-	cmd := exec.Command(hindsightPath, "--port", svc.config.HindsightPort)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = env
-	wd, _ := os.Getwd()
-	f, _ := os.OpenFile(filepath.Join(wd, "logs", "hindsight-crash.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	cmd.Stdout, cmd.Stderr = f, f
-	if err := cmd.Start(); err != nil { return err }
-	svc.mu.Lock(); svc.hindsightCmd = cmd; svc.mu.Unlock()
-	svc.log.Info("Hindsight started", "pid", cmd.Process.Pid)
-	return nil
-}
 
 // cogneeBaseEnv returns shared env vars common to both Cognee Python and Rust.
 func (svc *services) cogneeBaseEnv() []string {
@@ -796,11 +589,11 @@ func (svc *services) waitAllHealthy(timeout time.Duration) error {
 	for {
 		select {
 		case <-ctx.Done():
-			l, r, h := svc.allHealthy()
-			return fmt.Errorf("services not healthy after %v: llama=%v reranker=%v hindsight=%v", timeout, l, r, h)
+			l, c := svc.allHealthy()
+			return fmt.Errorf("services not healthy after %v: llama=%v cognee=%v", timeout, l, c)
 		case <-ticker.C:
-			l, r, h := svc.allHealthy()
-			if l && r && h { return nil }
+			l, c := svc.allHealthy()
+			if l && c { return nil }
 		}
 	}
 }

@@ -258,15 +258,6 @@ func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessa
 		s.metrics.retainCalls.Inc()
 		s.metrics.retainTotal.Inc()
 
-		if s.backend.IsSync() {
-			// ★ HINDSIGHT PATH: queue to worker pool (unchanged)
-			r, err := s.queueJob(s.workers.retainJobs, bank, "retain", a.Content)
-			if err != nil { s.mcpError(sid, id, -32000, err.Error()); logReq("", err); return }
-			s.mcpToolResult(sid, id, r.Data)
-			logReq("ok", nil)
-			return
-		}
-
 		// ★ COGNEE PATH: goroutine-per-retain with semaphore
 		jobID := newJobID()
 
@@ -353,15 +344,6 @@ func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessa
 		s.metrics.reflectCalls.Inc()
 		s.metrics.reflectTotal.Inc()
 
-		if s.backend.IsSync() {
-			// ★ HINDSIGHT PATH: queue to worker pool
-			r, err := s.queueJob(s.workers.reflectJobs, bank, "reflect", a.Query)
-			if err != nil { s.mcpError(sid, id, -32000, err.Error()); logReq("", err); return }
-			s.mcpToolResult(sid, id, r.Data)
-			logReq("ok", nil)
-			return
-		}
-
 		// ★ COGNEE PATH: goroutine, immediate response
 		s.cogneeWg.Add(1)
 		go func() {
@@ -420,20 +402,18 @@ func (s *Server) toolsList() map[string]interface{} {
 		{"name": "memory_reflect", "description": "Synthesize memories for insights", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"query": map[string]interface{}{"type": "string"}}, "required": []string{}}},
 	}
 	// Cognee-only tools
-	if !s.backend.IsSync() {
-		tools = append(tools,
-			map[string]interface{}{
-				"name":        "memory_forget",
-				"description":  "Remove a specific memory from storage",
-				"inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"content_id": map[string]interface{}{"type": "string"}}, "required": []string{"content_id"}},
-			},
-			map[string]interface{}{
-				"name":        "memory_retain_status",
-				"description":  "Check the status of an async retain job",
-				"inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"job_id": map[string]interface{}{"type": "string"}}, "required": []string{"job_id"}},
-			},
-		)
-	}
+	tools = append(tools,
+		map[string]interface{}{
+			"name":        "memory_forget",
+			"description":  "Remove a specific memory from storage",
+			"inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"content_id": map[string]interface{}{"type": "string"}}, "required": []string{"content_id"}},
+		},
+		map[string]interface{}{
+			"name":        "memory_retain_status",
+			"description":  "Check the status of an async retain job",
+			"inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"job_id": map[string]interface{}{"type": "string"}}, "required": []string{"job_id"}},
+		},
+	)
 	return map[string]interface{}{"tools": tools}
 }
 

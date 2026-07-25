@@ -19,12 +19,7 @@ func (svc *services) savePids() {
 	if svc.llamaCmd != nil && svc.llamaCmd.Process != nil {
 		pids["llama"] = svc.llamaCmd.Process.Pid
 	}
-	if svc.llamaRerankerCmd != nil && svc.llamaRerankerCmd.Process != nil {
-		pids["llama_reranker"] = svc.llamaRerankerCmd.Process.Pid
-	}
-	if svc.hindsightCmd != nil && svc.hindsightCmd.Process != nil {
-		pids["hindsight"] = svc.hindsightCmd.Process.Pid
-	}
+
 	if svc.cogneeCmd != nil && svc.cogneeCmd.Process != nil {
 		pids["cognee"] = svc.cogneeCmd.Process.Pid
 	}
