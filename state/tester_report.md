@@ -181,6 +181,286 @@ These 5 failures are pre-existing Makefile/download/gitignore tests, unrelated t
 
 ---
 
+## M1 Tester Pass 2 Report — Edge Cases & Spec Gaps
+
+**Tester**: SDET (Pass 2)
+**Date**: 2026-07-22
+**Scope**: Edge cases, config defaults, backward compat, lifecycle, stale references
+
+---
+
+## Summary
+
+**BUG FOUND: 1 (MEDIUM — .env.example not updated per AC-M1.29)**
+
+Plus 3 observational findings (info-level, not blocking). All 8 investigation points are documented below.
+
+---
+
+## Investigation Results
+
+### 1. Config Default Changed: BACKEND unset
+
+**Verdict: PASS**
+
+When BACKEND is unset in .env:
+1. `LoadConfig()` defaults to `Backend: "cognee-python"` (config.go: `getEnv("BACKEND", "cognee-python")`)
+2. `backend.New()` receives `cfg.Backend = "cognee-python"` and matches `case "cognee-python", "cognee-rust": return newCogneeBackend(cfg)`
+3. The `default` case also safely returns `newCogneeBackend(cfg)` as a catch-all
+4. `Validate()` catches truly invalid Backend values before `New()` is ever called
+
+The server starts correctly with BACKEND unset. No nil pointer, no panic.
+
+**Confirmation code path:**
+```
+loadEnv() → LoadConfig() → config.Validate() → NewServer() → backend.New(cfg) → newCogneeBackend(cfg)
+```
+
+---
+
+### 2. Backward-Compat of Health Endpoint
+
+**Verdict: PASS**
+
+Current health JSON fields (handlers.go `handleHealth`):
+```json
+{"status", "version", "built", "llama", "cognee", "down", "queue_depth",
+ "sessions", "sse_drops", "uptime", "panics_total", "metrics"}
+```
+
+Checked for field type changes:
+- `llama` is `bool` — same as pre-M1
+- `cognee` is `bool` — was previously `hindsight` (bool). Type unchanged.
+- No int→float or bool→string conversions detected
+- No zero-value vs omitted-field ambiguity (all fields use concrete types)
+
+**Breaking change (expected per spec):** Old clients parsing `hindsight` field will get nothing (unmarshal zero-value false). This is documented in spec §4.6 and is a known breaking change for M5.
+
+---
+
+### 3. CogneeBackend Default Construction
+
+**Verdict: PASS**
+
+The `default` case in `backend.New()` now returns `newCogneeBackend(cfg)` (backend.go:31-32):
+```go
+default:
+    // Default to cognee-python for backward compatibility
+    return newCogneeBackend(cfg)
+```
+
+`newCogneeBackend()` (cognee.go:34-49) sets all fields from `cfg`:
+- `baseURL: fmt.Sprintf("http://localhost:%s", cfg.CogneePort)` — defaults to `8000`
+- `httpClient` with `clientTimeout` from `CogneeRetainTimeout` (default 900s)
+- `breaker: NewCircuitBreaker(5, 30*time.Second)` — hardcoded, always valid
+- `retryAttempts`, `retryDelay`, `retryMaxDelay` — all from config
+- `retainTimeout`, `recallTimeout`, `reflectTimeout` — all from config
+
+No field is zero/nil that could cause a panic. The `Recv()` path never calls methods on nil receivers.
+
+**However**, the `default` case in `backend.New()` is effectively dead code because `Validate()` catches unknown backends before `New()` is called. If someone bypasses `Validate()`, they'd get a CogneeBackend regardless of what Backend string they passed. This is defensive and safe.
+
+---
+
+### 4. CircuitBreaker Defaults Hardcoded
+
+**Verdict: PASS**
+
+`newCogneeBackend()` uses `NewCircuitBreaker(5, 30*time.Second)` (cognee.go:44).
+
+Cross-referenced against original defaults:
+- Deployment docs (docs/deployment.md): `HINDSIGHT_CIRCUIT_BREAKER_THRESHOLD=5`, `HINDSIGHT_CIRCUIT_BREAKER_COOLDOWN=30s`
+- README.md: `threshold=5, cooldown=30s`
+
+Hardcoded values (5, 30s) match the original defaults exactly. The config fields `CircuitBreakerThreshold`/`CircuitBreakerCooldown` were removed from `BackendConfig` (backend.go) — they were only used by the deleted `hindsight.go`. The Cognee circuit breaker was always hardcoded pre-M1 as well.
+
+Spec §7 migration checklist listed `CircuitBreakerCooldown` default as 10s, but this was a spec typo — the actual code/deployment default was always 30s. The hardcoded 30s in the current code is correct.
+
+---
+
+### 5. session_cleaner.go Goroutine Lifecycle
+
+**Verdict: PASS**
+
+Wiring verified:
+- **Start** (server.go:164): `go s.sessionCleaner()`
+- **Exit signal** (session_cleaner.go:28-30): `case <-s.shutdown: return`
+- **Stop** (server.go:207): `s.shutdownOnce.Do(func() { close(s.shutdown) })`
+
+The shutdown channel is closed via `sync.Once`, preventing double-close panic. The session cleaner selects on both `ticker.C` and `s.shutdown`, so it exits promptly when shutdown is signaled.
+
+**Lifecycle order in Stop():**
+1. `close(s.shutdown)` — signals sessionCleaner
+2. `s.cogneeCancel()` — drains Cognee goroutines
+3. Sessions cleaned directly under lock
+
+There is a benign race: sessionCleaner may process one more tick before seeing the shutdown signal, but session cleanup is idempotent (locks prevent concurrent map writes). The session cleaner goroutine is NOT tracked by `cogneeWg`, so Stop() does not Wait() for it. This is acceptable because:
+- Sessions are also cleaned up directly in Stop()
+- The remaining iteration is bounded by `SessionCleanInterval` (default 30s)
+- The process is exiting anyway
+
+---
+
+### 6. Import Cleanup
+
+**Verdict: PASS**
+
+Manually inspected imports in the three main files:
+
+**handlers.go** imports (`bytes`, `context`, `crypto/rand`, `encoding/hex`, `encoding/json`, `fmt`, `net/http`, `net/url`, `regexp`, `time`, `mcp-memory/logger`, `mcp-memory/metrics`):
+- All used. `net/url` used in `handleMCPSSE`. `bytes` used in `fireErrorWebhook`. `regexp` used for `bankNamePattern`.
+
+**services.go** imports (`context`, `fmt`, `net/http`, `os`, `os/exec`, `path/filepath`, `runtime`, `sync`, `sync/atomic`, `syscall`, `time`, `golang.org/x/sync/singleflight`, `mcp-memory/logger`):
+- All used. `sync/atomic` referenced in function signature `panics *atomic.Int64`. `runtime` used in `resolveCogneePythonPath` for `runtime.GOOS`.
+
+**server.go** imports (`context`, `os`, `path/filepath`, `sync`, `sync/atomic`, `time`, `gopkg.in/natefinch/lumberjack.v2`, `mcp-memory/backend`, `mcp-memory/logger`, `mcp-memory/metrics`):
+- All used. `sync/atomic` used for `atomic.Int64` in `panics` field. `lumberjack.v2` used for log rotation.
+
+No unused imports. `go build ./...` passes (confirmed by Pass 1).
+
+---
+
+### 7. Error Messages Containing "hindsight"
+
+**Verdict: PASS**
+
+Grep for `hindsight|Hindsight|HINDSIGHT` in non-test .go files returns only comments:
+- `backend/doRequest.go:13` — `// Used by both Hindsight and Cognee backends.` (innocent comment)
+- `session_cleaner.go:9` — `// Extracted from workers.go during M1 (Hindsight removal).` (M1 provenance comment)
+- `job_tracker.go:38` — `// Only allocated when BACKEND is not "hindsight".` (stale comment — see Observation #2 below)
+
+No error string contains "hindsight". The `Validate()` default case correctly says:
+```go
+return fmt.Errorf("unknown BACKEND: %q (valid: cognee-python, cognee-rust)", c.Backend)
+```
+No "hindsight" listed. Full compliance.
+
+---
+
+### 8. .env.example Stale Hindsight References
+
+**Verdict: BUG — MEDIUM SEVERITY**
+
+`.env.example` was NOT updated per spec §4.12 and AC-M1.29. The file still contains:
+
+**Reranker Server section (lines 31-33):**
+```
+# llama.cpp — Reranker Server
+LLAMA_RERANKER_PORT=8081
+```
+Should be deleted per spec.
+
+**Hindsight section (lines 35-48):**
+```
+# Hindsight — Memory API
+HINDSIGHT_PATH=hindsight-api
+HINDSIGHT_PORT=8888
+HINDSIGHT_LLM_PROVIDER=openrouter
+HINDSIGHT_LLM_MODEL=deepseek/deepseek-v4-flash
+HINDSIGHT_EMBEDDINGS_PROVIDER=openai
+HINDSIGHT_EMBEDDINGS_MODEL=qwen3-embedding-0.6b-Q8_0.gguf
+HINDSIGHT_RERANKER_PROVIDER=cohere
+HINDSIGHT_RERANKER_MODEL=./model/bge-reranker-base-Q4_k_m.gguf
+```
+Should be deleted per spec.
+
+**Cloud Reranker section (lines 50-74):**
+```
+# Cloud Embedding & Reranker (Optional)
+# and HINDSIGHT_RERANKER_MODEL to a Cohere-compatible reranker endpoint URL
+# HINDSIGHT_RERANKER_MODEL=https://api.cohere.com/v1/rerank
+CLOUD_RERANKER_API_KEY=
+CLOUD_RERANKER_URL=
+CLOUD_RERANKER_MODEL=
+# HINDSIGHT_EMBEDDINGS_PROVIDER=openai
+# HINDSIGHT_RERANKER_PROVIDER=cohere
+```
+CLOUD_RERANKER_* vars should be deleted (Hindsight-only). CLOUD_EMBEDDING_* should be KEPT.
+
+**Worker Pools section (lines 89-98):**
+```
+# Worker Pools
+# Each worker makes one Hindsight API call at a time.
+MEMORY_RETAIN_WORKERS=2
+MEMORY_REFLECT_WORKERS=2
+MEMORY_JOB_BUFFER=100
+```
+These fields were removed from config.go. The section and its env vars should be deleted.
+
+**Queue Timeouts section (lines 100-106):**
+```
+# Queue Timeouts
+# Must be longer than the worst-case Hindsight LLM call.
+MEMORY_QUEUE_PUSH_TIMEOUT=5s
+MEMORY_QUEUE_RESPONSE_TIMEOUT=60s
+```
+These fields were removed from config.go. The section and its env vars should be deleted.
+
+**Affected AC:** AC-M1.29 — `.env.example` has no HINDSIGHT_* entries, no CLOUD_RERANKER_* entries.
+
+---
+
+## Additional Observations (Info-Level)
+
+### Observation #1: scripts/stop.sh still references hindsight-api
+
+**File**: `scripts/stop.sh:42-45`
+```bash
+# Step 5: Stop Hindsight
+if pgrep -f "hindsight-api" > /dev/null 2>&1; then
+    echo "  ✓ Stopping Hindsight..."
+    pkill -f "hindsight-api" 2>/dev/null || true
+fi
+```
+Also line 57 still kills port 8888 (was `HINDSIGHT_PORT`). The script should be updated to remove hindsight-api stop and the stale port 8888 kill. Not in M1 AC scope but creates confusion when users run `./stop.sh`.
+
+### Observation #2: Stale comment in job_tracker.go
+
+**File**: `job_tracker.go:38`
+```go
+// Safe for concurrent use. Only allocated when BACKEND is not "hindsight".
+```
+Since Hindsight is removed, `jobTracker` is always allocated. Comment is misleading but harmless.
+
+### Observation #3: Dead code in handleRetainStatus
+
+**File**: `handlers.go:361-363`
+```go
+if s.jobTracker == nil {
+    s.mcpError(sid, id, -32000, "job tracking not available with current backend")
+    logReq("", fmt.Errorf("jobTracker nil"))
+    return
+}
+```
+Since `jobTracker` is now always constructed unconditionally in `NewServer()` (server.go:131), this branch is dead code. Harmless, but the error message mentioning "current backend" is misleading.
+
+---
+
+## Conclusion
+
+**M1 PASS 2: 1 BUG FOUND (MEDIUM)**
+
+| # | Finding | Severity |
+|---|---------|----------|
+| 1 | `.env.example` still contains Hindsight section, Cloud Reranker vars, Worker Pools, and Hindsight/reranker comments. Violates AC-M1.29. | MEDIUM |
+| 2 | (Info) `scripts/stop.sh` still kills hindsight-api — not in M1 scope but confusing | INFO |
+| 3 | (Info) Stale `"hindsight"` comment in `job_tracker.go:38` | INFO |
+| 4 | (Info) Dead `jobTracker == nil` check in `handleRetainStatus` (always non-nil post-M1) | INFO |
+
+All 8 investigation points verified:
+1. Config default (BACKEND unset): PASS
+2. Health endpoint backward compat: PASS
+3. CogneeBackend default construction: PASS
+4. CircuitBreaker hardcoded defaults: PASS
+5. session_cleaner.go lifecycle: PASS
+6. Import cleanup: PASS
+7. Error messages (no "hindsight" in strings): PASS
+8. **.env.example stale references: BUG**
+
+The code itself is solid — no nil pointer risks, no deadlock paths, no unused imports, no panic paths. The one real gap is the .env.example which was left in its pre-M1 state.
+
+---
+
 ## Conclusion
 
 **M1 PASS 1: 1 BUG FOUND (SEVERE)**
