@@ -78,6 +78,11 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 
+	// Limit to 1 connection. Critical for :memory: databases where each
+	// connection gets its own isolated in-memory DB. Also prevents SQLITE_BUSY
+	// contention on file-based databases since Store.mu already serializes writes.
+	db.SetMaxOpenConns(1)
+
 	// Apply pragmas — these are safe to execute even on :memory:
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL",
