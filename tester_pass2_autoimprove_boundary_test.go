@@ -1183,50 +1183,6 @@ func TestConcurrentAutoImproveAndManualReflect_DifferentBanks(t *testing.T) {
 }
 
 // =========================================================================
-// ADDITIONAL: IsSync() Guards — Hindsight path
-// =========================================================================
-
-// TestMaybeAutoImprove_HindsightPathIsSync verifies that when the backend
-// is Hindsight (IsSync=true), maybeAutoImprove is never called because
-// improveState is nil (NewServer only sets it for Cognee backends).
-func TestMaybeAutoImprove_HindsightPathIsSync(t *testing.T) {
-	// When IsSync() is true, NewServer does NOT create improveState
-	s := &Server{
-		config: Config{
-			AutoImproveAfterN:   5,
-			AutoImproveCooldown: 120 * time.Second,
-		},
-		// improveState is nil (Hindsight path)
-		// cogneeSemaphore is nil
-		backend: &mockBackend{
-			reflectFn: func(ctx context.Context, bank string, query string) (string, error) {
-				return "", nil
-			},
-		},
-	}
-
-	// maybeAutoImprove should return early when improveState is nil.
-	// This ensures no goroutines are spawned for Hindsight path.
-	s.maybeAutoImprove("testbank")
-}
-
-// TestMaybeAutoImprove_ImproveStateNilGuard verifies the nil improveState
-// guard triggers correctly.
-func TestMaybeAutoImprove_ImproveStateNilGuard(t *testing.T) {
-	s := &Server{
-		config: Config{
-			AutoImproveAfterN:   5,
-			AutoImproveCooldown: 120 * time.Second,
-		},
-		improveState: nil,
-	}
-
-	// Should return early at improveState == nil check
-	s.maybeAutoImprove("testbank")
-	// No panic = pass
-}
-
-// =========================================================================
 // ENVIRONMENT: LoadConfig defaults
 // =========================================================================
 

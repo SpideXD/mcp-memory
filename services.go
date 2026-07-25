@@ -377,13 +377,6 @@ func (svc *services) startLlama() error {
 	return nil
 }
 
-func (svc *services) startLlamaReranker() error {
-	// REMOVED: Hindsight reranker no longer used
-	return fmt.Errorf("startLlamaReranker: not implemented")
-}
-
-
-
 // cogneeBaseEnv returns shared env vars common to both Cognee Python and Rust.
 func (svc *services) cogneeBaseEnv() []string {
 	return append(os.Environ(),

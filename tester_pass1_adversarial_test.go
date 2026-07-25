@@ -784,27 +784,6 @@ func TestMemoryImprove_HandleImproveDeleted(t *testing.T) {
 }
 
 // -------------------------------------------------------
-// Issue 13: Hindsight path untouched
-// -------------------------------------------------------
-
-func TestHindsight_ReflectPathUnchanged(t *testing.T) {
-	src, err := os.ReadFile("handlers.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// The memory_reflect handler should still have the IsSync() check for hindsight
-	if !bytes.Contains(src, []byte("s.backend.IsSync()")) {
-		t.Fatal("IsSync() check must exist for hindsight path")
-	}
-
-	// Verify the reflect path calls queueJob for hindsight
-	if !bytes.Contains(src, []byte("s.queueJob(s.workers.reflectJobs")) {
-		t.Fatal("hindsight reflect path must queue to reflectJobs")
-	}
-}
-
-// -------------------------------------------------------
 // Issue 14: SaveStateLocked with nil dataDir
 // -------------------------------------------------------
 

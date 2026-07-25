@@ -915,9 +915,8 @@ func TestHTTP_HealthContainsAllFields(t *testing.T) {
 	var health map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&health)
 
-	required := []string{"status", "hindsight", "llama", "reranker", "queue_depth",
-		"retain_workers", "reflect_workers", "retain_panics", "reflect_panics",
-		"sessions", "uptime", "panics_total", "metrics"}
+	required := []string{"status", "llama", "cognee", "down", "queue_depth",
+		"sessions", "uptime", "panics_total", "metrics", "sse_drops", "version", "built"}
 
 	for _, field := range required {
 		if _, ok := health[field]; !ok {

@@ -156,7 +156,6 @@ func (m *mockBackend) Reflect(ctx context.Context, bank string, query string) (s
 }
 func (m *mockBackend) Health(ctx context.Context) error { return nil }
 func (m *mockBackend) Name() string                      { return "mock" }
-func (m *mockBackend) IsSync() bool                      { return false }
 func (m *mockBackend) Forget(ctx context.Context, bank string, contentID string) (string, error) {
 	return "", nil
 }

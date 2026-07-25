@@ -254,7 +254,7 @@ func TestPartialInitNilImproveState(t *testing.T) {
 		config: Config{
 			AutoImproveAfterN: 5,
 		},
-		improveState: nil, // Hindsight path — improveState is nil
+		improveState: nil, // nil improveState guard
 	}
 	// Should not panic
 	s.maybeAutoImprove("testbank")

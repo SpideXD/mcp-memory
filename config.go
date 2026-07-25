@@ -84,7 +84,7 @@ type Config struct {
 	// Error webhook
 	ErrorWebhookURL string // ERROR_WEBHOOK_URL, default "" (disabled)
 
-	// Generic backend timeouts (primary; falls back to Hindsight-specific if unset)
+	// Generic backend timeouts
 	BackendRetainTimeout  time.Duration // BACKEND_RETAIN_TIMEOUT
 	BackendRecallTimeout  time.Duration // BACKEND_RECALL_TIMEOUT
 	BackendReflectTimeout time.Duration // BACKEND_REFLECT_TIMEOUT

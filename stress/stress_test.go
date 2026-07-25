@@ -148,9 +148,8 @@ type retainResult struct {
 // HealthResponse matches the /health JSON structure.
 type HealthResponse struct {
 	Status string `json:"status"`
-	Llama  bool   `json:"llama"`
-	Reranker bool `json:"reranker"`
-	Hindsight bool `json:"hindsight"`
+	Llama    bool `json:"llama"`
+	Cognee   bool `json:"cognee"`
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -830,7 +829,7 @@ func TestStressContradiction_Alice(t *testing.T) {
 			continue
 		}
 
-		// Small delay to let Hindsight process
+		// Small delay to let backend process
 		time.Sleep(1 * time.Second)
 
 		// Probe immediately after each retain
@@ -930,7 +929,7 @@ func TestStressContradiction_Concurrent(t *testing.T) {
 	}
 
 	// Poll for processing completion instead of fixed sleep.
-	// Wait up to 30s for the concurrent retains to be processed by Hindsight.
+	// Wait up to 30s for the concurrent retains to be processed by the backend.
 	deadline := time.Now().Add(30 * time.Second)
 	processed := false
 	for time.Now().Before(deadline) {
@@ -1447,134 +1446,6 @@ func TestStressChaos_KillLlama(t *testing.T) {
 		DurationMs: float64(time.Since(totalStart).Milliseconds()),
 	}
 	writeJSONReport(t, "chaos_kill_llama.json", report)
-}
-
-func TestStressChaos_KillHindsight(t *testing.T) {
-	requireServerUp(t)
-	totalStart := time.Now()
-
-	pids := readPIDFile(t)
-	if pids == nil {
-		t.Skip("PID file not available")
-		return
-	}
-	hindsightPID, ok := pids["hindsight"]
-	if !ok {
-		t.Skip("hindsight PID not found in PID file")
-		return
-	}
-	validatePID(t, "hindsight", hindsightPID)
-
-	if !testutil.ServerUp() {
-		t.Skip("server not healthy at baseline")
-		return
-	}
-	t.Logf("Baseline health confirmed")
-
-	client, err := testutil.NewClient(testutil.DefaultServerURL, "stress:chaos:kill_hindsight")
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-	if err := client.Initialize(); err != nil {
-		t.Fatalf("Initialize: %v", err)
-	}
-	defer client.Close()
-
-	_, err = client.Retain("pre-chaos retain: hindsight baseline")
-	if err != nil {
-		t.Logf("pre-chaos retain failed: %v", err)
-	}
-
-	// Verify PID is alive before killing (stale PID safety check)
-	if err := syscall.Kill(hindsightPID, syscall.Signal(0)); err != nil {
-		t.Logf("hindsight PID=%d is not alive (stale PID file?): %v — skipping kill", hindsightPID, err)
-		metrics := ChaosMetrics{
-			Scenario: "kill_hindsight", Degraded: false, Recovered: false,
-		}
-		metricsJSON, _ := json.Marshal(metrics)
-		report := DimensionReport{
-			Dimension: "chaos", Scenario: "kill_hindsight",
-			Timestamp: time.Now(), Metrics: metricsJSON, Passed: false,
-			DurationMs: float64(time.Since(totalStart).Milliseconds()),
-		}
-		writeJSONReport(t, "chaos_kill_hindsight.json", report)
-		t.Skipf("Skipping chaos kill: hindsight PID %d is stale", hindsightPID)
-		return
-	}
-
-	killStart := time.Now()
-	t.Logf("Sending SIGTERM to hindsight (PID=%d)", hindsightPID)
-	if err := syscall.Kill(hindsightPID, syscall.SIGTERM); err != nil {
-		t.Logf("SIGTERM returned error (may already be dead): %v", err)
-	}
-
-	degraded := false
-	degradeTime := time.Duration(0)
-	for i := 0; i < 30; i++ {
-		time.Sleep(1 * time.Second)
-		if !testutil.ServerUp() {
-			degraded = true
-			degradeTime = time.Since(killStart)
-			t.Logf("Server went down after %.1fs", degradeTime.Seconds())
-			break
-		}
-	}
-	if !degraded {
-		t.Logf("WARNING: server did not go down within 30s of SIGTERM")
-	}
-
-	recallOutput, recallErr := client.Recall("hindsight baseline")
-	t.Logf("Recall during degraded state: err=%v output=%s", recallErr, truncate(recallOutput, 100))
-
-	_, retainErr := client.Retain("post-chaos retain: hindsight down")
-	t.Logf("Retain during degraded state: err=%v", retainErr)
-
-	recovered := false
-	recoveryTime := time.Duration(0)
-	for i := 0; i < 120; i++ {
-		time.Sleep(1 * time.Second)
-		if testutil.ServerUp() {
-			recovered = true
-			recoveryTime = time.Since(killStart)
-			t.Logf("Server recovered after %.1fs", recoveryTime.Seconds())
-			break
-		}
-	}
-	if !recovered {
-		t.Logf("WARNING: server did not recover within 120s")
-	}
-
-	if recovered {
-		_, err := client.Retain("post-recovery retain: hindsight recovery")
-		if err != nil {
-			t.Logf("post-recovery retain failed: %v", err)
-		} else {
-			t.Logf("post-recovery retain succeeded")
-		}
-	}
-
-	metrics := ChaosMetrics{
-		Scenario:          "kill_hindsight",
-		Degraded:          degraded,
-		Recovered:         recovered,
-		DegradeTimeSec:    degradeTime.Seconds(),
-		RecoveryTimeSec:   recoveryTime.Seconds(),
-		DowntimeSec:       recoveryTime.Seconds() - degradeTime.Seconds(),
-		RecallDuringChaos: recallErr == nil,
-		RetainDuringChaos: retainErr == nil,
-	}
-
-	passed := recovered
-	metricsJSON, _ := json.Marshal(metrics)
-	report := DimensionReport{
-		Dimension:  "chaos",
-		Scenario:   "kill_hindsight",
-		Timestamp:  time.Now(),
-		Metrics:    metricsJSON,
-		Passed:     passed,
-		DurationMs: float64(time.Since(totalStart).Milliseconds()),
-	}
-	writeJSONReport(t, "chaos_kill_hindsight.json", report)
 }
 
 func TestStressChaos_Flood(t *testing.T) {

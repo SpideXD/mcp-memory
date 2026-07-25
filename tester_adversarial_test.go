@@ -61,15 +61,7 @@ func newTestConfig() Config {
 		MaxContentBytes:  1 << 20,
 		MaxBodyBytes:     1 << 20,
 		LlamaPort:        "19090",
-		LlamaRerankerPort: "19091",
-		HindsightPort:    "19092",
 		LlamaPath:        "",
-		HindsightPath:    "",
-		CircuitBreakerThreshold: 3,
-		CircuitBreakerCooldown:  50 * time.Millisecond,
-		HindsightRetainTimeout:  50 * time.Millisecond,
-		HindsightRecallTimeout:  50 * time.Millisecond,
-		HindsightReflectTimeout: 50 * time.Millisecond,
 	}
 }
 
@@ -1196,7 +1188,6 @@ func TestFixX_NoGoroutineLeakFromNewServer(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		cfg := newTestConfig()
 		cfg.LlamaPath = "/nonexistent"
-		cfg.HindsightPath = "/nonexistent"
 		s := NewServer(cfg)
 		_ = s
 	}
@@ -1229,21 +1220,10 @@ func TestFixR_LoadConfigSetsCorrectDefaults(t *testing.T) {
 	}
 }
 
-func TestFixR_ValidateRejectsMissingAPIKey(t *testing.T) {
-	cfg := newTestConfig()
-	cfg.LLMAPIKey = ""
-	err := cfg.Validate()
-	if err == nil {
-		t.Error("Validate should reject empty API key")
-	}
-	if !strings.Contains(err.Error(), "API_KEY") {
-		t.Errorf("expected API_KEY error, got: %v", err)
-	}
-}
+
 
 func TestFixR_ValidateRejectsBadSessions(t *testing.T) {
 	cfg := newTestConfig()
-	cfg.LLMAPIKey = "test-key"
 	cfg.MaxSessions = 0
 	cfg.MaxContentBytes = 1
 	err := cfg.Validate()
@@ -1254,7 +1234,6 @@ func TestFixR_ValidateRejectsBadSessions(t *testing.T) {
 
 func TestFixR_ValidateRejectsBadContentBytes(t *testing.T) {
 	cfg := newTestConfig()
-	cfg.LLMAPIKey = "test-key"
 	cfg.MaxContentBytes = 0
 	err := cfg.Validate()
 	if err == nil {
@@ -1264,7 +1243,6 @@ func TestFixR_ValidateRejectsBadContentBytes(t *testing.T) {
 
 func TestFixR_ValidateRejectsBadTimeouts(t *testing.T) {
 	cfg := newTestConfig()
-	cfg.LLMAPIKey = "test-key"
 	cfg.StartTimeout = 0
 	err := cfg.Validate()
 	if err == nil {

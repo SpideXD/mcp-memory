@@ -24,8 +24,6 @@ func testBackendConfig(port int) backend.BackendConfig {
 		RetryAttempts:           1,
 		RetryDelay:              100 * time.Millisecond,
 		RetryMaxDelay:           1 * time.Second,
-		CircuitBreakerThreshold: 5,
-		CircuitBreakerCooldown:  10 * time.Second,
 	}
 }
 
