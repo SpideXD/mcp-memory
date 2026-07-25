@@ -23,13 +23,8 @@ type Backend interface {
 	// Health checks backend connectivity. Returns nil if healthy.
 	Health(ctx context.Context) error
 
-	// Name returns the backend name (e.g., "hindsight", "cognee").
+	// Name returns the backend name (e.g., "cognee-python", "cognee-rust").
 	Name() string
-
-	// IsSync returns true for backends whose operations complete inline.
-	// True:  handlers use worker pool (Hindsight)
-	// False: handlers spawn goroutine with semaphore (Cognee)
-	IsSync() bool
 
 	// Forget removes a specific memory. Optional — may return ErrNotSupported.
 	Forget(ctx context.Context, bank string, contentID string) (string, error)
@@ -38,8 +33,7 @@ type Backend interface {
 // BackendConfig is the flat configuration struct passed to the New factory.
 // It avoids circular imports by not referencing the main package's Config.
 type BackendConfig struct {
-	Backend               string        // "hindsight", "cognee-python", "cognee-rust"
-	HindsightPort         string
+	Backend               string        // "cognee-python", "cognee-rust"
 	CogneePort            string
 	BackendRetainTimeout  time.Duration
 	BackendRecallTimeout  time.Duration
@@ -48,8 +42,6 @@ type BackendConfig struct {
 	RetryAttempts         int
 	RetryDelay            time.Duration
 	RetryMaxDelay         time.Duration
-	CircuitBreakerThreshold int
-	CircuitBreakerCooldown  time.Duration
 	// Cognee-specific feature flags (env: COGNEE_TEMPORAL_COGNIFY, COGNEE_MEMORY_ONLY)
 	TemporalCognify bool
 	MemoryOnly      bool
@@ -58,12 +50,10 @@ type BackendConfig struct {
 // New creates the appropriate Backend based on the config.
 func New(cfg BackendConfig) Backend {
 	switch cfg.Backend {
-	case "hindsight":
-		return newHindsightBackend(cfg)
 	case "cognee-python", "cognee-rust":
 		return newCogneeBackend(cfg)
 	default:
-		// Default to hindsight for backward compatibility
-		return newHindsightBackend(cfg)
+		// Default to cognee-python for backward compatibility
+		return newCogneeBackend(cfg)
 	}
 }
