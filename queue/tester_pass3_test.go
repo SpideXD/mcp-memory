@@ -51,12 +51,15 @@ func TestChaos1_RapidStartStopCycles(t *testing.T) {
 				}
 			}()
 
-			w := NewWorker(WorkerConfig{
+			w, err := NewWorker(WorkerConfig{
 				Store:   s,
 				Process: processFunc,
 				Count:   workerCnt,
 				SemSize: semSize,
 			})
+			if err != nil {
+				t.Fatal(err)
+			}
 
 			ctx1, cancel1 := context.WithCancel(context.Background())
 			w.Start(ctx1)
@@ -457,12 +460,15 @@ func TestChaos5_WorkerStormFIFO(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   numWorkers,
 		SemSize: semSize,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	start := time.Now()
 	w.Start(ctx)
@@ -568,12 +574,15 @@ func TestChaos6_ContextCancellationDuringProcessing(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   numJobs,
 		SemSize: numJobs,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	w.Start(ctx)
 
 	// Wait for all jobs to start processing
@@ -664,12 +673,15 @@ func TestChaos7_StatsUnderFire(t *testing.T) {
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	defer workerCancel()
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   numWorkers,
 		SemSize: 3,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	w.Start(workerCtx)
 
 	// Inserters — add jobs rapidly
@@ -810,12 +822,15 @@ func TestChaos8_MemoryAfter10KJobs(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   10,
 		SemSize: 5,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	w.Start(ctx)
 
 	// Wait for all jobs to complete

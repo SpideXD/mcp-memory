@@ -140,12 +140,15 @@ func TestPass2_WorkerAfterStoreClose(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   2,
 		SemSize: semSize,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	w.Start(ctx)
 
 	// Insert a job for the worker to pick up
@@ -419,12 +422,15 @@ func TestPass2_SemaphoreExhaustionBehavior(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   workerCount,
 		SemSize: semSize,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	startedJobs.Add(numJobs)
 	w.Start(ctx)
@@ -800,12 +806,15 @@ func TestPass2_ProcessFuncContextCancellation(t *testing.T) {
 		}
 	}
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   1,
 		SemSize: 1,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	w.Start(context.Background())
 
@@ -882,12 +891,15 @@ func TestPass2_ZeroValuesDefaultCorrectly(t *testing.T) {
 			return nil
 		}
 
-		w := NewWorker(WorkerConfig{
+		w, err := NewWorker(WorkerConfig{
 			Store:   s,
 			Process: processFunc,
 			Count:   1,
 			SemSize: 0,
 		})
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		// The semaphore should have capacity DefaultSemSize (3)
 		if cap(w.sem) != DefaultSemSize {
@@ -903,12 +915,15 @@ func TestPass2_ZeroValuesDefaultCorrectly(t *testing.T) {
 			return nil
 		}
 
-		w := NewWorker(WorkerConfig{
+		w, err := NewWorker(WorkerConfig{
 			Store:   s,
 			Process: processFunc,
 			Count:   0,
 			SemSize: 1,
 		})
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		if w.count != DefaultWorkerCount {
 			t.Errorf("Count=0: count = %d, want %d (DefaultWorkerCount)", w.count, DefaultWorkerCount)
@@ -1120,12 +1135,15 @@ func TestPass2_ZeroSemSizeWouldDeadlock(t *testing.T) {
 
 		// Verify that the guard exists in NewWorker
 		s := newTestStore(t)
-		w := NewWorker(WorkerConfig{
+		w, err := NewWorker(WorkerConfig{
 			Store:   s,
 			Process: func(ctx context.Context, job *Job) error { return nil },
 			Count:   1,
 			SemSize: 0, // Should default to DefaultSemSize (3)
 		})
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		if cap(w.sem) == 0 {
 			t.Error("BUG: SemSize=0 produced unbuffered channel — would deadlock")
@@ -1236,7 +1254,7 @@ func TestPass2_WorkerOnClosedStore(t *testing.T) {
 
 	var processCalled atomic.Bool
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store: s,
 		Process: func(ctx context.Context, job *Job) error {
 			processCalled.Store(true)
@@ -1245,6 +1263,9 @@ func TestPass2_WorkerOnClosedStore(t *testing.T) {
 		Count:   1,
 		SemSize: 1,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Start worker on closed store
 	ctx, cancel := context.WithCancel(context.Background())

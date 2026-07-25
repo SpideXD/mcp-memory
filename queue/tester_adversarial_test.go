@@ -41,12 +41,15 @@ func TestAdversarial_SemaphoreLeakOnPanic(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   workerCount,
 		SemSize: semSize,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	w.Start(ctx)
 
 	// Wait long enough for 3 panics to fill the semaphore
@@ -197,52 +200,37 @@ func TestAdversarial_RecoverRace(t *testing.T) {
 func TestAdversarial_NilWorkerConfig(t *testing.T) {
 	// Test nil Store
 	t.Run("nil Store", func(t *testing.T) {
-		w := NewWorker(WorkerConfig{
+		w, err := NewWorker(WorkerConfig{
 			Store:   nil,
 			Process: func(ctx context.Context, job *Job) error { return nil },
 			Count:   1,
 			SemSize: 1,
 		})
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		defer func() {
-			if r := recover(); r != nil {
-				// This panic is the BUG — NewWorker should have rejected nil Store
-				t.Logf("BUG CONFIRMED: Start() with nil Store panicked: %v", r)
-			}
-		}()
-		w.Start(ctx)
-		// If we get here without panic, Start() silently accepted nil Store
-		t.Error("BUG CONFIRMED: Start() with nil Store returned without panic — will crash at runtime")
+		if err == nil {
+			t.Fatal("BUG: NewWorker accepted nil Store without error")
+		}
+		if w != nil {
+			t.Fatal("BUG: NewWorker returned non-nil worker for nil Store")
+		}
+		t.Logf("CORRECT: NewWorker rejected nil Store: %v", err)
 	})
 
 	// Test nil Process
 	t.Run("nil Process", func(t *testing.T) {
 		s := newTestStore(t)
-		w := NewWorker(WorkerConfig{
+		w, err := NewWorker(WorkerConfig{
 			Store:   s,
 			Process: nil,
 			Count:   1,
 			SemSize: 1,
 		})
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		insertTestJob(t, s, "nil-process-job")
-
-		defer func() {
-			if r := recover(); r != nil {
-				t.Logf("BUG CONFIRMED: workerLoop with nil Process panicked: %v", r)
-			}
-		}()
-		w.Start(ctx)
-		time.Sleep(500 * time.Millisecond)
-		// If we get here, the worker likely crashed silently
-		got, _ := s.Get("nil-process-job")
-		if got != nil && got.Status == StatusPending {
-			t.Log("BUG CONFIRMED: job still pending because worker crashed with nil Process")
+		if err == nil {
+			t.Fatal("BUG: NewWorker accepted nil Process without error")
 		}
+		if w != nil {
+			t.Fatal("BUG: NewWorker returned non-nil worker for nil Process")
+		}
+		t.Logf("CORRECT: NewWorker rejected nil Process: %v", err)
 	})
 }
 
@@ -476,12 +464,15 @@ func TestAdversarial_WorkerRestartCycle(t *testing.T) {
 
 	baseline := runtimeNumGoroutines()
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   4,
 		SemSize: 2,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Cycle 1: Start → Stop
 	ctx1, cancel1 := context.WithCancel(context.Background())
@@ -546,12 +537,15 @@ func TestAdversarial_ConcurrentStartStop(t *testing.T) {
 	// Run sequential Start/Stop pairs concurrently (not same-pool races)
 	var wg sync.WaitGroup
 	for i := 0; i < 5; i++ {
-		w := NewWorker(WorkerConfig{
+		w, err := NewWorker(WorkerConfig{
 			Store:   s,
 			Process: processFunc,
 			Count:   2,
 			SemSize: 1,
 		})
+		if err != nil {
+			t.Fatal(err)
+		}
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
@@ -662,12 +656,15 @@ func TestAdversarial_SlowProcessFunc(t *testing.T) {
 		return nil
 	}
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   3,
 		SemSize: 3,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	w.Start(context.Background())
 	defer w.Stop()
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -18,7 +19,7 @@ type Store struct {
 	mu         sync.Mutex
 	maxPending int
 	jobTTL     time.Duration
-	closed     bool
+	closed     atomic.Bool
 }
 
 // StoreConfig configures the Store.
@@ -112,8 +113,8 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 		jobTTL:     jobTTL,
 	}
 
-	// Run startup recovery
-	if _, err := s.Recover(); err != nil {
+	// Run startup recovery (unlocked — store not yet shared)
+	if _, err := s.recoverLocked(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("startup recovery: %w", err)
 	}
@@ -128,7 +129,7 @@ func (s *Store) Insert(job *Job) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.closed {
+	if s.closed.Load() {
 		return fmt.Errorf("store is closed")
 	}
 
@@ -178,7 +179,7 @@ func (s *Store) NextPending() (*Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.closed {
+	if s.closed.Load() {
 		return nil, fmt.Errorf("store is closed")
 	}
 
@@ -242,17 +243,19 @@ func (s *Store) UpdateStatus(id string, status Status, result string, errStr str
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.closed {
+	if s.closed.Load() {
 		return fmt.Errorf("store is closed")
 	}
 
 	now := time.Now().Unix()
 
 	if status == StatusFailed {
-		// Increment retry_count when failing
+		// Increment retry_count only when transitioning from running to failed.
+		// This prevents retry_count inflation on illegal transitions
+		// (e.g., completed→failed or pending→failed).
 		res, err := s.db.Exec(
 			`UPDATE jobs SET status = ?, result = ?, error = ?, retry_count = retry_count + 1, updated_at = ?
-			 WHERE id = ?`,
+			 WHERE id = ? AND status = 'running'`,
 			string(status), result, errStr, now, id,
 		)
 		if err != nil {
@@ -282,7 +285,7 @@ func (s *Store) UpdateStatus(id string, status Status, result string, errStr str
 
 // Get retrieves a job by ID. Returns nil, nil if not found.
 func (s *Store) Get(id string) (*Job, error) {
-	if s.closed {
+	if s.closed.Load() {
 		return nil, fmt.Errorf("store is closed")
 	}
 
@@ -304,7 +307,7 @@ func (s *Store) Get(id string) (*Job, error) {
 
 // CountByStatus returns the number of jobs with the given status.
 func (s *Store) CountByStatus(status Status) (int, error) {
-	if s.closed {
+	if s.closed.Load() {
 		return 0, fmt.Errorf("store is closed")
 	}
 
@@ -318,7 +321,7 @@ func (s *Store) CountByStatus(status Status) (int, error) {
 
 // Stats returns counts by status and the age of the oldest pending job.
 func (s *Store) Stats() (StoreStats, error) {
-	if s.closed {
+	if s.closed.Load() {
 		return StoreStats{}, fmt.Errorf("store is closed")
 	}
 
@@ -362,11 +365,21 @@ func (s *Store) Stats() (StoreStats, error) {
 //   - failed with retries left → pending (retry)
 //   - failed with exhausted retries → dead
 //
-// Returns total rows affected.
+// Safe for external use — acquires the mutex and checks closed state.
 func (s *Store) Recover() (int, error) {
-	// Note: called from NewStore which already holds mu implicitly (store not yet returned).
-	// For safety, we don't lock here — the store isn't accessible to other goroutines yet.
-	// If called externally, the caller must hold the lock or call before sharing the store.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed.Load() {
+		return 0, fmt.Errorf("store is closed")
+	}
+
+	return s.recoverLocked()
+}
+
+// recoverLocked performs startup recovery without acquiring the mutex.
+// Called internally by NewStore before the store is shared.
+func (s *Store) recoverLocked() (int, error) {
 
 	now := time.Now().Unix()
 	total := 0
@@ -441,7 +454,7 @@ func (s *Store) cleanupOnce() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.closed {
+	if s.closed.Load() {
 		return
 	}
 
@@ -466,10 +479,10 @@ func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.closed {
+	if s.closed.Load() {
 		return nil // already closed
 	}
-	s.closed = true
+	s.closed.Store(true)
 
 	if s.db != nil {
 		return s.db.Close()

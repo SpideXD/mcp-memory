@@ -798,12 +798,15 @@ func TestWorkerPool_ProcessesJob(t *testing.T) {
 		return nil
 	}
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   1,
 		SemSize: 1,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	w.Start(context.Background())
 	defer w.Stop()
 
@@ -851,12 +854,15 @@ func TestWorkerPool_RetryOnFailure(t *testing.T) {
 		return nil // second attempt succeeds
 	}
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   1,
 		SemSize: 1,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	w.Start(context.Background())
 	defer w.Stop()
 
@@ -902,12 +908,15 @@ func TestWorkerPool_DeadAfterMaxRetries(t *testing.T) {
 		return fmt.Errorf("permanent failure")
 	}
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   1,
 		SemSize: 1,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	w.Start(context.Background())
 	defer w.Stop()
 
@@ -952,12 +961,15 @@ func TestWorkerPool_StopDrainsWorkers(t *testing.T) {
 		return nil
 	}
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   4,
 		SemSize: 2,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	w.Start(context.Background())
 
 	// Give workers time to start
@@ -1002,12 +1014,15 @@ func TestWorkerPool_SemaphoreLimitsConcurrency(t *testing.T) {
 	}
 
 	// SemSize=1 means only 1 concurrent process call
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   3, // 3 workers but semaphore limits to 1
 		SemSize: 1,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	w.Start(context.Background())
 	defer w.Stop()
 
@@ -1431,12 +1446,15 @@ func TestWorkerPool_StartIdempotent(t *testing.T) {
 		return nil
 	}
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   2,
 		SemSize: 2,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Start twice — second should be a no-op
 	w.Start(context.Background())
@@ -1468,12 +1486,15 @@ func TestWorkerPool_StopIdempotent(t *testing.T) {
 		return nil
 	}
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   1,
 		SemSize: 1,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	w.Start(context.Background())
 	w.Stop()
@@ -1501,12 +1522,15 @@ func TestWorkerPool_PanicRecovery(t *testing.T) {
 		return nil
 	}
 
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   2, // 2 workers so surviving one processes normal-job
 		SemSize: 2,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	w.Start(context.Background())
 	defer w.Stop()
 
@@ -1540,12 +1564,15 @@ func TestWorkerPool_EmptyQueue(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	w := NewWorker(WorkerConfig{
+	w, err := NewWorker(WorkerConfig{
 		Store:   s,
 		Process: processFunc,
 		Count:   2,
 		SemSize: 2,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	w.Start(ctx)
 
 	// Give workers time to poll empty queue

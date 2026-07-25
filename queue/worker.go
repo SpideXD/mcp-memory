@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"time"
@@ -32,7 +33,15 @@ type Worker struct {
 }
 
 // NewWorker creates a Worker without spawning goroutines.
-func NewWorker(cfg WorkerConfig) *Worker {
+// Returns an error if Store or Process is nil.
+func NewWorker(cfg WorkerConfig) (*Worker, error) {
+	if cfg.Store == nil {
+		return nil, errors.New("queue: WorkerConfig.Store must not be nil")
+	}
+	if cfg.Process == nil {
+		return nil, errors.New("queue: WorkerConfig.Process must not be nil")
+	}
+
 	count := cfg.Count
 	if count <= 0 {
 		count = DefaultWorkerCount
@@ -47,7 +56,7 @@ func NewWorker(cfg WorkerConfig) *Worker {
 		sem:     make(chan struct{}, semSize),
 		count:   count,
 		process: cfg.Process,
-	}
+	}, nil
 }
 
 // Start spawns worker goroutines. Idempotent — calling twice does not double-spawn.
@@ -110,18 +119,16 @@ func (w *Worker) workerLoop(ctx context.Context, id int) {
 			continue
 		}
 
-		// Acquire semaphore
+		// Acquire semaphore. Release in a defer so the slot is freed even
+		// if processJob panics (B1 fix: prevents semaphore leak on panic).
 		select {
 		case w.sem <- struct{}{}:
-			// acquired
+			defer func() { <-w.sem }()
 		case <-ctx.Done():
 			return
 		}
 
 		w.processJob(ctx, job)
-
-		// Release semaphore
-		<-w.sem
 	}
 }
 
