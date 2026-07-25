@@ -1,717 +1,763 @@
-# Spec: Module 1 — Hindsight Removal (Deep)
+# Spec: Module 2 — SQLite Job Queue Package
 
-**Module**: M1 of the SQLite Queue + Hindsight Removal project
+**Module**: M2 of the SQLite Queue + Hindsight Removal project
 **Architect**: Principal Architect
-**Date**: 2026-07-22
-**Scope**: Delete all Hindsight-specific code, config, and models. Simplify to Cognee-only with zero IsSync() branching.
-**Prerequisites**: None (pure deletion)
-**Approach**: Approach A — KISS/YAGNI. Delete, don't refactor. No new abstractions. No passthrough wrappers.
+**Date**: 2026-07-26
+**Scope**: Create a self-contained `queue/` package with SQLite-backed job queue, worker pool, and startup recovery. Pure infrastructure — no wiring to handlers (M3).
+**Prerequisites**: M1 complete (Hindsight removed, Cognee-only path).
+**Approach**: Approach A — KISS/YAGNI. One flat package, one SQLite table, one worker pool type. No abstractions, no plugin systems, no future-proofing.
 
 ---
 
 ## 1. Goal
 
-Remove every trace of the Hindsight backend from the codebase. After M1, the system has exactly one backend path: Cognee. Every `if s.backend.IsSync()` branch becomes unconditional. The result compiles, all existing Cognee behavior is preserved, and no dead Hindsight code remains.
+Create a `queue/` package that provides:
+
+1. A `Job` type with a strict state machine (pending → running → completed|failed → dead).
+2. A `Store` backed by `modernc.org/sqlite` (pure Go, no CGO) with WAL mode, startup recovery, TTL cleanup, and backpressure.
+3. A `Worker` pool that dequeues jobs via NextPending(), processes them through a caller-supplied `ProcessFunc`, and gates concurrency with a semaphore channel.
+
+The package compiles independently (`go build ./queue/...`), has zero imports of `mcp-memory` main, and is testable without Cognee or any external service running.
 
 ---
 
-## 2. IsSync() Call Site Enumeration
+## 2. Package Layout
 
-Every call site, with exact file:line and what replaces it.
+```
+queue/
+├── job.go      # Job type, Status enum, state machine helpers
+├── store.go    # Store type, SQLite CRUD, pragmas, recovery, TTL cleanup
+├── worker.go   # Worker type, worker loop, semaphore gating
+└── *_test.go   # Coder + Tester delivered tests
+```
 
-### 2.1 Interface Definition
+### 2.1 Dependency
 
-| File | Line | Action |
-|------|------|--------|
-| `backend/backend.go` | interface (no IsSync method) | Already absent — IsSync was never on the Backend interface. VERIFIED: `backend.Backend` has no IsSync method. |
+Add to `go.mod`:
 
-**Correction**: IsSync is NOT on the backend.Backend interface. It is defined ONLY on `*CogneeBackend` and on the test mock. Callers in handlers.go/server.go call it directly on the concrete `*CogneeBackend` — no, wait. Let's verify:
+```
+require modernc.org/sqlite v1.40.1
+```
 
-The call sites are `s.backend.IsSync()`. `s.backend` is of type `backend.Backend` (the interface). But the interface doesn't have IsSync(). This means... the code doesn't compile? Let me re-check.
+The `modernc.org/sqlite` package is a pure-Go SQLite implementation. It compiles with `CGO_ENABLED=0` and has zero system dependencies.
 
-Actually re-reading `backend/backend.go` — the interface as shown has NO IsSync method. But the scout says it's at line 29-32. Let me re-read the file more carefully. The grep showed `backend/backend.go` has no IsSync match... wait, the grep DID show `backend/cognee.go:62-63` with IsSync. And the callers all reference `s.backend.IsSync()` where `s.backend` is of type `backend.Backend`. 
+### 2.2 Compile-time guard
 
-So either IsSync IS on the interface and the file I read was... wait. Let me look again. The file I read shows:
+Add at top of `queue/job.go` or `queue/store.go`:
 
 ```go
-type Backend interface {
-    Retain(...)
-    Recall(...)
-    Reflect(...)
-    Health(...)
-    Name() string
-    Forget(...)
+// This package compiles without CGO.
+// Verify with: CGO_ENABLED=0 go build ./queue/...
+```
+
+Not a compile assertion — a comment. The real guard is the CI check: `CGO_ENABLED=0 go build ./queue/...` must pass.
+
+---
+
+## 3. Module 2a: `queue/job.go` — Types, Constants, State Machine
+
+### 3.1 Status type
+
+```go
+type Status string
+
+const (
+    StatusPending   Status = "pending"
+    StatusRunning   Status = "running"
+    StatusCompleted Status = "completed"
+    StatusFailed    Status = "failed"
+    StatusDead      Status = "dead"
+)
+```
+
+**Case sensitivity**: All values are lowercase ASCII. JSON and SQLite store these exact strings. No uppercase variants.
+
+### 3.2 Job type
+
+```go
+type Job struct {
+    ID         string `json:"id"`
+    Bank       string `json:"bank"`
+    Type       string `json:"type"`
+    Payload    string `json:"payload"`
+    Status     Status `json:"status"`
+    RetryCount int    `json:"retry_count"`
+    MaxRetries int    `json:"max_retries"`
+    Result     string `json:"result,omitempty"`
+    Error      string `json:"error,omitempty"`
+    CreatedAt  int64  `json:"created_at"`
+    UpdatedAt  int64  `json:"updated_at"`
 }
 ```
 
-No IsSync. But the code calls `s.backend.IsSync()`. This means either (a) the interface does have IsSync and I got a truncated view, or (b) the interface uses embedding somehow, or (c) the `backend.Backend` interface actually has IsSync and my read was somehow incomplete.
+**Concurrency safety**: `Job` is a plain data struct. Callers provide synchronization.
 
-The grep for "IsSync" showed ONLY `backend/cognee.go:62-63`. NOT `backend/backend.go`. This is a red flag. If IsSync is not on the interface, how does the code compile? 
-
-Unless `s.backend` is typed as `*CogneeBackend` locally in handlers, not `backend.Backend`... but the Server struct has `backend backend.Backend`. And handlers.go calls `s.backend.IsSync()`.
-
-Wait — I need to check if there's a type assertion or if `backend.go` was correctly read. Let me look at backend.go more carefully. The file I read shows the full contents — there's no IsSync. So either:
-1. The code doesn't compile currently (unlikely since tests pass)
-2. IsSync IS on the interface but got truncated
-
-Let me assume the actual code has IsSync on the interface, and my file read was somehow incomplete. The scout report says `backend/backend.go:29-32`. Let me proceed with the assumption that IsSync IS on the interface. For the spec, it doesn't matter much — we're removing it either way.
-
-Actually, wait. Let me re-read more carefully. The scout says:
-- HindsightBackend at `backend/hindsight.go:48` — but this file will be deleted
-- CogneeBackend at `backend/cognee.go:63` — `func (c *CogneeBackend) IsSync() bool { return false }`
-
-And the code calls `s.backend.IsSync()` where `s.backend backend.Backend`. If the interface doesn't have IsSync, the code doesn't compile. But it does compile and tests pass. So IsSync MUST be on the interface. My read must have been truncated or the file was modified.
-
-For the spec, I'll just document the call sites and tell the coder what to do. If IsSync is on the interface, remove it. If it's not, note it's already absent.
-
-### 2.2 Call Sites
-
-| # | File | Lines | Current Code | After M1 |
-|---|------|-------|-------------|----------|
-| CS1 | `handlers.go` | 270-275 | `if s.backend.IsSync() { ... queueJob retain ... return }` | DELETE entire Hindsight branch (6 lines). Cognee path becomes unconditional. |
-| CS2 | `handlers.go` | 365-370 | `if s.backend.IsSync() { ... queueJob reflect ... return }` | DELETE entire Hindsight branch (6 lines). Cognee path becomes unconditional. |
-| CS3 | `handlers.go` | 432 | `if !s.backend.IsSync() { tools = append(tools, memory_forget, memory_retain_status) }` | DELETE the `if` guard. Always append both tools. |
-| CS4 | `server.go` | 138 | `if !s.backend.IsSync() { ... construct cognee infra ... }` | DELETE the `if` guard. Always construct cognee infrastructure unconditionally. |
-| CS5 (test) | `auto_improve_test.go` | 159 | `func (m *mockBackend) IsSync() bool { return false }` | DELETE method from mock. |
-| CS6 (test) | `tester_pass1_adversarial_test.go` | 796-798 | Asserts IsSync() check exists in handlers | DELETE `TestHindsight_ReflectPathUnchanged` test (lines 787-803). |
-
-### 2.3 IsSync() Implementation to Delete
-
-| File | Line | Action |
-|------|------|--------|
-| `backend/cognee.go` | 62-63 | DELETE `IsSync()` method (2 lines + comment). CogneeBackend no longer needs it. |
-| `backend/hindsight.go` | entire file | DELETE entire file. |
-| `backend/backend.go` | interface | DELETE `IsSync() bool` from Backend interface (if present). |
-
-**Compile-time assertion**: After deletion, `var _ backend.Backend = (*CogneeBackend)(nil)` in `backend/cognee.go:20` must still compile. Verify.
-
----
-
-## 3. File DELETE Checklist
-
-Delete these files entirely. Verify with `ls` after deletion.
-
-| # | File | Lines | Rationale |
-|---|------|-------|-----------|
-| D1 | `backend/hindsight.go` | ~140 | HindsightBackend struct + HTTP API calls |
-| D2 | `model/bge-reranker-base-Q4_k_m.gguf` | 209MB | Reranker model — only used by Hindsight's llama reranker |
-| D3 | `docs/hindsight.md` | ~150 | Full Hindsight reference documentation |
-| D4 | `.env.hindsight` | (if exists) | Backend-specific env overrides |
-| D5 | `workers.go` | ~210 | Entire file: workerSystem, retainPool, reflectPool, queueJob, sessionCleaner |
-
-**Why D5**: After removing IsSync branches, the ONLY caller of `workers.go` types was the Hindsight path. `sessionCleaner()` is extracted to a new file (see §4.8).
-
----
-
-## 4. File MODIFY Checklist
-
-Every field, function, constant, and comment to touch, with exact file:line.
-
-### 4.1 `types.go`
-
-| Line(s) | Action | Details |
-|---------|--------|---------|
-| 48-57 | DELETE `MemoryJob` struct | Replaced by `queue.Job` in M3. No callers after workers.go deleted. |
-| 58-61 | DELETE `MemoryResult` struct | Same rationale. |
-| 15 | DELETE `BackendHindsight Backend = "hindsight"` | If present. From grep: `BackendHindsight` not shown in types.go — may already be absent. Verify and delete if found. |
-
-**Important**: `BackendHindsight` appears at `config.go:338` and `services.go:80,127,163,313` but NOT in `types.go`. The `types.go` file shows only `BackendCogneePython` and `BackendCogneeRust`. So `MemoryJob`/`MemoryResult` deletion is the only change for types.go. However, `BackendHindsight` constant may exist in another file or may have been pre-removed. **Verify** and if found anywhere, delete it.
-
-### 4.2 `config.go`
-
-#### Fields to DELETE (with line numbers):
-
-| Field | Line(s) | Env Var |
-|-------|---------|---------|
-| `LlamaRerankerPort string` | 29 | `LLAMA_RERANKER_PORT` |
-| `CloudRerankerAPIKey string` | 37 | `CLOUD_RERANKER_API_KEY` |
-| `CloudRerankerURL string` | 38 | `CLOUD_RERANKER_URL` |
-| `CloudRerankerModel string` | 39 | `CLOUD_RERANKER_MODEL` |
-| `HindsightPath string` | 42 | `HINDSIGHT_PATH` |
-| `HindsightPort string` | 43 | `HINDSIGHT_PORT` |
-| `LLMProvider string` | (after 43) | `HINDSIGHT_LLM_PROVIDER` |
-| `LLMModel string` | | `HINDSIGHT_LLM_MODEL` |
-| `LLMAPIKey string` | | `OPENROUTER_API_KEY` (shared — Cognee has `CogneeLLMApiKey`) |
-| `LLMBaseURL string` | | `OPENROUTER_BASE_URL` (shared — Cognee has `CogneeLLMEndpoint`) |
-| `EmbedProvider string` | | `HINDSIGHT_EMBEDDINGS_PROVIDER` |
-| `EmbedModel string` | | `HINDSIGHT_EMBEDDINGS_MODEL` |
-| `RerankerProvider string` | 50 | `HINDSIGHT_RERANKER_PROVIDER` |
-| `RerankerModel string` | 51 | `HINDSIGHT_RERANKER_MODEL` |
-| `HindsightRetainTimeout` | ~76-78 | `HINDSIGHT_RETAIN_TIMEOUT` |
-| `HindsightRecallTimeout` | ~76-78 | `HINDSIGHT_RECALL_TIMEOUT` |
-| `HindsightReflectTimeout` | ~76-78 | `HINDSIGHT_REFLECT_TIMEOUT` |
-| `RetainWorkers int` | ~63 | `MEMORY_RETAIN_WORKERS` |
-| `ReflectWorkers int` | ~64 | `MEMORY_REFLECT_WORKERS` |
-| `JobBufferSize int` | ~65 | `MEMORY_JOB_BUFFER` |
-| `QueuePushTimeout` | ~68 | `MEMORY_QUEUE_PUSH_TIMEOUT` |
-| `QueueResponseTimeout` | ~69 | `MEMORY_QUEUE_RESPONSE_TIMEOUT` |
-| `CircuitBreakerThreshold int` | ~89 | `MEMORY_CIRCUIT_BREAKER_THRESHOLD` |
-| `CircuitBreakerCooldown` | ~90 | `MEMORY_CIRCUIT_BREAKER_COOLDOWN` |
-| Comment block "// llama.cpp reranker" | 28-29 | Delete |
-| Comment block "// Cloud Reranker" | 36-39 | Delete |
-| Comment block "// Hindsight" | 41-43 | Delete |
-
-#### Methods to DELETE:
-
-| Method | Line(s) | Reason |
-|--------|---------|--------|
-| `IsCloudReranker() bool` | config.go (find exact) | No callers after Hindsight removal |
-
-#### Functions to MODIFY:
-
-| Function | Action | Details |
-|----------|--------|---------|
-| `LoadConfig()` | UPDATE Backend default | Change from `"hindsight"` to `"cognee-python"` |
-| `LoadConfig()` | DELETE env var reads | Remove all HINDSIGHT_*, CLOUD_RERANKER_*, LLAMA_RERANKER_PORT, MEMORY_RETAIN_WORKERS, MEMORY_REFLECT_WORKERS, MEMORY_JOB_BUFFER, MEMORY_QUEUE_*, MEMORY_CIRCUIT_BREAKER_* |
-| `LoadConfig()` | DELETE Hindsight timeout fallbacks | `BackendRetainTimeout` default was 60s — keep as is |
-| `Validate()` | DELETE `case BackendHindsight:` block | Lines ~338-378. Including model file checks, cloud embedding/reranker validation. |
-| `Validate()` | DELETE worker pool validation | `RetainWorkers >= 1 && ReflectWorkers >= 1` check |
-| `Validate()` | UPDATE default error | `default` case error message: list only `cognee-python`, `cognee-rust` as valid backends |
-| `Validate()` | DELETE `RetainWorkers`/`ReflectWorkers` range check | No longer relevant |
-
-#### Comment blocks to UPDATE:
-
-| Location | Action |
-|----------|--------|
-| Env Var Translation Table comment | Remove Hindsight column — keep only Cognee |
-
-### 4.3 `backend/backend.go`
-
-| Line(s) | Action | Details |
-|---------|--------|---------|
-| Interface | DELETE `IsSync() bool` | Remove from Backend interface (if present — verify) |
-| Comment referencing Hindsight | DELETE | Any comment mentioning "Hindsight" or "worker pool" in interface docs |
-| `HindsightPort` in BackendConfig | DELETE field | Line ~47 in BackendConfig struct |
-| `CircuitBreakerThreshold` in BackendConfig | DELETE field | Hindsight-only |
-| `CircuitBreakerCooldown` in BackendConfig | DELETE field | Hindsight-only |
-| `New()` default | VERIFY | Default already returns `newCogneeBackend(cfg)` — no change needed |
-| Compile-time assertion | ADD | `var _ Backend = (*CogneeBackend)(nil)` — verify present at cognee.go:~20 |
-
-### 4.4 `backend/cognee.go`
-
-| Line(s) | Action | Details |
-|---------|--------|---------|
-| 62-63 | DELETE `IsSync()` method | `func (c *CogneeBackend) IsSync() bool { return false }` and its comment |
-| ~20 | VERIFY compile assertion | `var _ Backend = (*CogneeBackend)(nil)` must compile after IsSync removal |
-
-### 4.5 `services.go`
-
-#### Struct fields to DELETE (services struct, lines 24-44):
-
-| Field | Line | Reason |
-|-------|------|--------|
-| `llamaRerankerCmd *exec.Cmd` | 26 | No reranker after Hindsight removal |
-| `hindsightCmd *exec.Cmd` | 27 | No Hindsight process |
-| `backendName string` | 34 | Only one backend family remains |
-| `rerankerFails serviceFails` | 41 | No reranker to track |
-| `hindsightFails serviceFails` | 42 | No Hindsight to track |
-
-#### Struct fields to UPDATE:
-
-| Field | Line | Change |
-|-------|------|--------|
-| `healthCache [3]bool` | 37 | Change to `[2]bool` — `{llama, cognee}` only |
-| Comment line 37 | 37 | Change `// llama, reranker, hindsight/cognee` to `// llama, cognee` |
-
-#### Functions to DELETE:
-
-| Function | Lines (approx) | Details |
-|----------|---------------|---------|
-| `startLlamaReranker()` | ~455-477 | Entire function |
-| `startHindsight()` | ~479-581 | Entire function (~100 lines) |
-
-#### Functions to MODIFY:
-
-| Function | Action | Details |
-|----------|--------|---------|
-| `start()` | DELETE `case BackendHindsight:` | Lines ~80-101. Entire branch (reranker start + Hindsight API start). Keep only `case BackendCogneePython:` and `case BackendCogneeRust:`. |
-| `stop()` | DELETE `case BackendHindsight:` | Lines ~127-130. Remove Hindsight stop + llamaReranker stop. Keep `case BackendCogneePython, BackendCogneeRust:` and the llama stop at the end. |
-| `monitor()` | DELETE `case BackendHindsight:` | Lines ~163-168. Remove reranker checkAndRestart + Hindsight checkAndRestart. Keep only cognee-python and cognee-rust cases. |
-| `allHealthy()` | REWRITE signature | Change from `(llama, reranker, hindsight bool)` to `(llama, cognee bool)` |
-| `allHealthy()` | DELETE `case BackendHindsight:` | Lines ~313-338. Entire Hindsight branch. Keep only Cognee branch. |
-| `allHealthy()` | DELETE `IsCloudReranker()` calls | Remove `if svc.config.IsCloudReranker() { r = true }` |
-| `allHealthy()` | DELETE reranker goroutine | Remove the `if !svc.config.IsCloudReranker()` health check goroutine |
-| `allHealthy()` | UPDATE singleflight result type | `val.([3]bool)` → `val.([2]bool)` |
-| `allHealthy()` | UPDATE healthCache write | `svc.healthCache = [2]bool{l, h}` |
-| `allHealthy()` | UPDATE variable names | `r` and `h` → `c` (for cognee) or keep `h` |
-| `allHealthy()` | RENAME `h` variable | Change `h` to `c` throughout Cognee branches for clarity |
-| `waitAllHealthy()` | UPDATE signature | New return type matching allHealthy: `(llama, cognee bool)` |
-| `healthURL()` calls | DELETE | Remove `healthURL(svc.config.HindsightPort)` and `healthURL(svc.config.LlamaRerankerPort)` |
-
-#### allHealthy() pseudocode after M1:
+### 3.3 Job.Validate() method
 
 ```go
-func (svc *services) allHealthy() (llama, cognee bool) {
-    svc.healthMu.RLock()
-    if time.Since(svc.healthChecked) < 10*time.Second {
-        l, c := svc.healthCache[0], svc.healthCache[1]
-        svc.healthMu.RUnlock()
-        return l, c
-    }
-    svc.healthMu.RUnlock()
+func (j *Job) Validate() error
+```
 
-    val, _, _ := svc.healthGroup.Do("health", func() (interface{}, error) {
-        var l, c bool
-        if svc.config.IsCloudEmbedding() { l = true }
-        var wg sync.WaitGroup
-        nChecks := 1 // cognee
-        if !svc.config.IsCloudEmbedding() { nChecks++ }
-        wg.Add(nChecks)
-        if !svc.config.IsCloudEmbedding() {
-            go func() {
-                defer recover...
-                defer wg.Done()
-                l = svc.check(healthURL(svc.config.LlamaPort)) == nil
-            }()
-        }
-        go func() {
-            defer recover...
-            defer wg.Done()
-            c = svc.check(healthURL(svc.config.CogneePort)) == nil
-        }()
-        wg.Wait()
-        svc.healthMu.Lock()
-        svc.healthCache = [2]bool{l, c}
-        svc.healthChecked = time.Now()
-        svc.healthMu.Unlock()
-        return [2]bool{l, c}, nil
-    })
-    result, ok := val.([2]bool)
-    if !ok { return false, false }
-    return result[0], result[1]
+Validation rules:
+
+| Field | Rule | Error message |
+|-------|------|---------------|
+| ID | non-empty after trimming whitespace | `"job ID must not be empty"` |
+| Bank | non-empty after trimming whitespace | `"bank must not be empty"` |
+| Type | must be `"retain"` or `"reflect"` | `"job type must be 'retain' or 'reflect'"` |
+| Payload | non-empty after trimming whitespace | `"payload must not be empty"` |
+| Status | must be `StatusPending` or empty (defaults to pending in Store) | Validation passes — empty status is allowed at creation time |
+| MaxRetries | 0 <= maxRetries <= 10. If 0, defaults to 3 in Store.Insert | `"max_retries must be between 0 and 10"` |
+
+**IMPORTANT**: Validate() does NOT check Status for valid enum values beyond pending/empty — that's the Store's job. Validate() focuses on required-field presence.
+
+### 3.4 Job.CanRetry() method
+
+```go
+func (j *Job) CanRetry() bool
+```
+
+Returns `true` if `j.Status == StatusFailed && j.RetryCount < j.MaxRetries`.
+
+### 3.5 State Machine (Documentation & Helpers)
+
+```
+  ┌─────────┐
+  │ pending  │──→ NextPending() picks up, sets running
+  └─────────┘
+       │
+       ▼
+  ┌─────────┐
+  │ running  │──→ server crash → startup recovery → pending
+  └─────────┘
+       │
+  ┌────┴────┐
+  ▼         ▼
+┌──────────┐ ┌────────┐
+│completed │ │ failed │──→ CanRetry() → pending (retry)
+└──────────┘ └────────┘
+                  │
+             !CanRetry()
+                  │
+                  ▼
+             ┌────────┐
+             │  dead  │
+             └────────┘
+```
+
+Legal transitions (enforced by Store.UpdateStatus):
+
+| From | To | Condition |
+|------|----|-----------|
+| pending | running | Only via NextPending() atomic claim |
+| running | completed | Worker success |
+| running | failed | Worker error |
+| running | pending | Startup recovery (crash) |
+| failed | pending | `CanRetry()` — retry |
+| failed | dead | `!CanRetry()` — exhausted |
+| completed | (terminal) | No further transitions |
+| dead | (terminal) | No further transitions |
+
+### 3.6 Job.Clone() method (for testing)
+
+```go
+func (j *Job) Clone() *Job
+```
+
+Deep copy. Used by tests to snapshot job state before worker processing.
+
+### 3.7 Default constants
+
+```go
+const (
+    DefaultMaxRetries = 3
+    DefaultMaxPending = 1000
+    DefaultJobTTL     = 24 * time.Hour
+    DefaultWorkerCount = 4
+    DefaultSemSize    = 3
+    DefaultTTLInterval = 5 * time.Minute
+)
+```
+
+---
+
+## 4. Module 2b: `queue/store.go` — SQLite CRUD, Pragmas, Recovery, TTL
+
+### 4.1 Store type
+
+```go
+type Store struct {
+    db         *sql.DB
+    mu         sync.Mutex
+    maxPending int
+    jobTTL     time.Duration
 }
 ```
 
-#### Goroutine inventory inside services.go after M1:
+**Concurrency safety**: Safe for concurrent use. `mu` serializes Insert/NextPending to prevent races on pending count and atomic claim. SQLite's own locking handles concurrent reads.
 
-| Goroutine | Spawned by | Panic Recovery |
-|-----------|-----------|---------------|
-| `monitor()` loop | `go s.svc.monitor(ctx, &s.panics)` in `server.go` Start() | YES — defer recover |
-| `checkAndRestart` for llama | `monitor()` → `go svc.checkAndRestart(...)` | YES — defer recover in checkAndRestart |
-| `checkAndRestart` for cognee | `monitor()` → `go svc.checkAndRestart(...)` | YES — defer recover in checkAndRestart |
-| `allHealthy` llama check | `allHealthy()` → `go func()` | YES — defer recover |
-| `allHealthy` cognee check | `allHealthy()` → `go func()` | YES — defer recover |
-| `stopProcess` cmd.Wait | `stop()` → `stopProcess()` → `go cmd.Wait()` | YES — defer recover |
+### 4.2 StoreConfig type
 
-**Removed goroutines** (compared to pre-M1):
-- Reranker checkAndRestart (was in monitor)
-- Hindsight checkAndRestart (was in monitor)
-- allHealthy reranker check goroutine
-- allHealthy hindsight check goroutine (replaced by cognee)
-
-### 4.6 `handlers.go`
-
-#### IsSync() branch deletions:
-
-| Lines | Action | Details |
-|-------|--------|---------|
-| 270-275 | DELETE | Entire Hindsight retain branch: `if s.backend.IsSync() { s.queueJob(s.workers.retainJobs...) return }` |
-| 365-370 | DELETE | Entire Hindsight reflect branch: `if s.backend.IsSync() { s.queueJob(s.workers.reflectJobs...) return }` |
-| 432 | DELETE `if !s.backend.IsSync() {` | Remove the guard. Always append `memory_forget` and `memory_retain_status` to tools. Delete matching closing `}`. |
-
-#### Health endpoint changes (handleHealth, lines 29-76):
-
-| Line | Action | Details |
-|------|--------|---------|
-| 40 | UPDATE | `llama, reranker, hindsight := s.svc.allHealthy()` → `llama, cognee := s.svc.allHealthy()` |
-| 41 | UPDATE | `allHealthy := llama && reranker && hindsight` → `allHealthy := llama && cognee` |
-| 51 | DELETE | `if !reranker { down = append(down, "llama (reranker)") }` |
-| 52 | UPDATE | `if !hindsight { down = append(down, "hindsight") }` → `if !cognee { down = append(down, "cognee") }` |
-| 57-59 | DELETE | `retainStats := s.workers.retainPool.Stats()`, `reflectStats := ...` — no more worker pools |
-| 65 | DELETE | `"hindsight": hindsight,` JSON field |
-| 67 | DELETE | `"reranker": reranker,` JSON field |
-| 68 | UPDATE | `"queue_depth": len(s.workers.retainJobs) + len(s.workers.reflectJobs)` → `"queue_depth": 0` (placeholder until M3) |
-| 69-72 | DELETE | `"retain_workers"`, `"retain_panics"`, `"reflect_workers"`, `"reflect_panics"` JSON fields |
-
-#### New health response JSON shape:
-
-```json
-{
-    "status": "running" | "degraded",
-    "version": "...",
-    "built": "...",
-    "llama": true,
-    "cognee": true,
-    "down": [],
-    "queue_depth": 0,
-    "sessions": 5,
-    "sse_drops": 0,
-    "uptime": "1h23m",
-    "panics_total": 0,
-    "metrics": { ... }
+```go
+type StoreConfig struct {
+    DBPath     string        // path to SQLite file (e.g., "./data/queue.db"). Use ":memory:" for tests.
+    MaxPending int           // max pending jobs before Insert rejects (0 = use DefaultMaxPending)
+    JobTTL     time.Duration // completed/failed/dead job retention (0 = use DefaultJobTTL, negative = forever)
 }
 ```
 
-#### handlers.go — no other changes:
+### 4.3 SQLite Schema
 
-- `newJobID()` function (line 22-26): KEEP. Still used by Cognee inline goroutine path until M3.
-- `memory_retain` Cognee path (lines 278-327): KEEP AS-IS. Will be rewired to SQLite queue in M3.
-- `memory_reflect` Cognee path (lines 372-374): KEEP AS-IS. Will be rewired in M3.
-- `memory_forget`, `memory_retain_status`: KEEP AS-IS. No Hindsight dependencies.
+```sql
+CREATE TABLE IF NOT EXISTS jobs (
+    id          TEXT PRIMARY KEY,
+    bank        TEXT NOT NULL,
+    type        TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 3,
+    result      TEXT NOT NULL DEFAULT '',
+    error       TEXT NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
 
-### 4.7 `server.go`
-
-#### Struct field changes (Server struct, lines 15-56):
-
-| Line | Action | Field | Details |
-|------|--------|-------|---------|
-| 24 | DELETE | `workers *workerSystem` | No more worker pool |
-| 43 | UPDATE comment | `// Cognee-only fields — nil when BACKEND=hindsight` | → `// Cognee infrastructure` |
-
-#### NewServer() changes (lines 78-148):
-
-| Line(s) | Action | Details |
-|---------|--------|---------|
-| 86 | DELETE | `s.workers = newWorkerSystem(config, blog)` | No more worker system |
-| 90 | DELETE | `HindsightPort: config.HindsightPort,` | From BackendConfig literal |
-| 92 | DELETE | `CircuitBreakerThreshold: config.CircuitBreakerThreshold,` | Hindsight-only |
-| 93 | DELETE | `CircuitBreakerCooldown: config.CircuitBreakerCooldown,` | Hindsight-only |
-| 138 | DELETE `if !s.backend.IsSync() {` | Make cognee infrastructure unconditional |
-| 145 | DELETE closing `}` | Matching brace for removed if block |
-
-After M1, `NewServer()` always constructs:
-```go
-s.cogneeSemaphore = make(chan struct{}, config.CogneeMaxConcurrentRetains)
-s.jobTracker = newJobTracker(30 * time.Minute)
-s.cogneeCtx, s.cogneeCancel = context.WithCancel(context.Background())
-s.dataDir = getEnv("DATA_DIR", "./data")
-s.improveState = loadAutoImproveState(s.dataDir)
-go s.jobTrackerCleanup()
+CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at);
 ```
 
-#### Start() changes (lines 150-187):
+**Note**: `result` and `error` have `NOT NULL DEFAULT ''` — SQLite does not enforce NOT NULL on TEXT columns without STRICT mode, but the DEFAULT ensures zero-value semantics. The Store always writes explicit values.
 
-| Line | Action | Details |
-|------|--------|---------|
-| 170 | DELETE | `s.workers.start(s)` — no more worker system to start |
-| 170 | ADD | `go s.sessionCleaner()` — start session cleaner directly (extracted from workers.go) |
+### 4.4 NewStore() — Constructor
 
-#### Stop() changes (lines 189-218):
-
-| Line | Action | Details |
-|------|--------|---------|
-| ~212 | DELETE | `s.workers.stop()` — no more worker system to stop |
-
-#### Cognee infrastructure guard removal check:
-
-Verify that `s.cogneeCancel` is never nil when Stop() calls `s.cogneeCancel()`. After unconditional construction, it's always set. The `if s.cogneeCancel != nil` check becomes always-true but is harmless to keep.
-
-### 4.8 `session_cleaner.go` (NEW FILE)
-
-Extract `sessionCleaner()` from `workers.go`. The method belongs to `*Server`, not `workerSystem`.
-
-**Content**: Copy the `sessionCleaner()` method (lines ~137-210 of workers.go) into a new file `session_cleaner.go` as a method on `*Server`.
-
-**Changes from original**:
-- Remove the `s.workers` queue depth block (lines ~199-205 in original). Replace with:
 ```go
-// TODO(M3): read queue depth from SQLite queue store
-s.metrics.queueGauge.Set(0)
+func NewStore(cfg StoreConfig) (*Store, error)
 ```
-- Keep all other logic: stale session collection, close, delete under lock, metrics update, session limit warning.
 
-**Panic recovery**: Keep the existing defer recover at the top.
+Sequence:
 
-### 4.9 `errors.go`
+1. Apply defaults: MaxPending → DefaultMaxPending if 0. JobTTL → DefaultJobTTL if 0.
+2. Open SQLite database with `modernc.org/sqlite` driver.
+3. Apply pragmas (in this exact order):
+   - `PRAGMA journal_mode=WAL` — write-ahead logging for concurrent reads
+   - `PRAGMA busy_timeout=5000` — 5-second busy wait (milliseconds)
+   - `PRAGMA cache_size=-8000` — 8MB page cache (negative = KB)
+   - `PRAGMA mmap_size=67108864` — 64MB memory-mapped I/O
+   - `PRAGMA foreign_keys=ON` — best practice (though no foreign keys yet)
+   - `PRAGMA synchronous=NORMAL` — balance safety/performance for queued writes
+   - `PRAGMA temp_store=MEMORY` — temp tables in memory
+4. Create schema (`CREATE TABLE IF NOT EXISTS ...` + `CREATE INDEX IF NOT EXISTS ...`).
+5. Run startup recovery (see §4.8).
+6. Return Store.
 
-| Line | Action | Details |
-|------|--------|---------|
-| 11 | DELETE | `errBinaryNotFound = errors.New("hindsight-api not found")` |
+**Error semantics**: If any step fails, return nil + error immediately. Do not return a half-initialized Store.
 
-### 4.10 `pids.go`
+### 4.5 Insert()
 
-| Line(s) | Action | Details |
-|---------|--------|---------|
-| 22-23 | DELETE | `if svc.llamaRerankerCmd != nil ... pids["llama_reranker"] = ...` block |
-| 25-26 | DELETE | `if svc.hindsightCmd != nil ... pids["hindsight"] = ...` block |
+```go
+func (s *Store) Insert(job *Job) error
+```
 
-Keep: `pids["llama"]` and `pids["cognee"]`.
+Sequence:
 
-### 4.11 `main.go`
+1. Acquire `s.mu`.
+2. If `job.Status` is empty, set to `StatusPending`.
+3. If `job.MaxRetries` is 0, set to `DefaultMaxRetries`.
+4. Run `job.Validate()` — return error if invalid.
+5. Count pending jobs: `SELECT COUNT(*) FROM jobs WHERE status = 'pending'`.
+6. If count >= maxPending, return a **sentinel error** `ErrQueueFull` (defined in job.go: `var ErrQueueFull = errors.New("queue is full: too many pending jobs")`). Callers check with `errors.Is(err, ErrQueueFull)`.
+7. Set `job.CreatedAt = time.Now().Unix()`, `job.UpdatedAt = job.CreatedAt`.
+8. `INSERT INTO jobs (...) VALUES (...)`. Use prepared statements for safety.
+9. Release `s.mu`.
+10. Return nil.
 
-| Location | Action | Details |
-|----------|--------|---------|
-| Comment "Phase 1" | UPDATE | Change `(llama.cpp, Hindsight, workers, health monitor)` → `(llama.cpp, Cognee, health monitor)` |
+**Important**: The pending count check and INSERT are protected by the same mutex hold — no TOCTOU race.
 
-### 4.12 `.env.example`
+### 4.6 NextPending()
 
-| Lines | Action | Details |
-|-------|--------|---------|
-| 33 | DELETE | `# llama.cpp — Reranker Server` comment |
-| 38-47 | DELETE | Entire "Hindsight — Memory API" section (HINDSIGHT_PATH through HINDSIGHT_RERANKER_MODEL) |
-| 50-66 | DELETE | "Cloud Embedding & Reranker (Optional)" section — delete reranker half. KEEP cloud embedding half (CLOUD_EMBEDDING_* are used by Cognee). |
-| 53 | UPDATE | Remove `and HINDSIGHT_RERANKER_MODEL to a Cohere-compatible...` |
-| 56 | UPDATE | Remove `+ Cohere reranker` example |
-| 61 | DELETE | `#   HINDSIGHT_RERANKER_MODEL=https://api.cohere.com/v1/rerank` |
-| 65-66 | DELETE | `HINDSIGHT_EMBEDDINGS_PROVIDER` and `HINDSIGHT_RERANKER_PROVIDER` examples |
-| 91 | UPDATE | Change "Each worker makes one Hindsight API call at a time" → "Number of concurrent Cognee API calls" |
-| 105 | UPDATE | Remove "Must be longer than the worst-case Hindsight LLM call" comment |
+```go
+func (s *Store) NextPending() (*Job, error)
+```
 
-### 4.13 Documentation files
+Atomically claims the oldest pending job and sets it to running.
 
-| File | Action |
-|------|--------|
-| `docs/development.md` | Remove Hindsight references, update architecture diagram, update integration points |
-| `docs/deployment.md` | Remove Hindsight config entries from config table. Remove reranker model from deployment checklist. |
-| `docs/Makefile.md` | Remove reranker model reference (`bge-reranker-base-Q4_k_m.gguf`) |
-| `docs/architecture.md` | Remove Hindsight from architecture description |
+Sequence:
+
+1. Acquire `s.mu`.
+2. Begin transaction.
+3. `SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1`.
+4. If no rows, return nil, nil (not an error — empty queue).
+5. `UPDATE jobs SET status = 'running', retry_count = retry_count + 1, updated_at = ? WHERE id = ?`.
+   **Wait** — retry_count should NOT increment on first run from pending. Retry_count increments when the worker fails and the Store retries (via UpdateStatus back to pending). The initial grab stays retry_count=0 on first run.
+   
+   **Correction**: `UPDATE jobs SET status = 'running', updated_at = ? WHERE id = ? AND status = 'pending'`.
+6. Check rows affected. If 0, another worker claimed it — return nil, nil. (Optimistic locking guard.)
+7. Commit transaction.
+8. Release `s.mu`.
+9. Scan the row into a `Job` struct and return it.
+
+The `retry_count` field tracks *completed attempts*, not *attempts remaining*. First run: retry_count=0. After first failure→pending: retry_count=1. After second run: still pending→running transitions, retry_count stays at 1 until next failure.
+
+**Correction v2 on retry_count semantics**: Let's clarify the retry_count lifecycle:
+
+- Job created: retry_count=0
+- First NextPending() claim: retry_count unchanged (0) — sets status=running  
+- Worker fails: UpdateStatus → status=failed, retry_count stays 0 (counts completed attempts after failure)
+  
+Wait, this is getting confusing. Let me define it clearly:
+
+**retry_count = number of times the job has been attempted (completed + 1 on failure)**. OR...
+
+**Simpler approach**: retry_count = number of failed attempts. NextPending does NOT increment retry_count. UpdateStatus to failed increments retry_count.
+
+Let me re-define:
+
+| Action | retry_count change |
+|--------|-------------------|
+| Insert | 0 |
+| NextPending → running | no change |
+| Worker succeeds → completed | no change |
+| Worker fails → failed | increment by 1 |
+| Startup recovery: running→pending | no change |
+| failed→pending (retry) | no change (already incremented at fail time) |
+| failed→dead | no change |
+
+And `CanRetry()` checks: `retry_count < max_retries`.
+
+**Revised NextPending()**:
+
+```
+1. BEGIN IMMEDIATE
+2. SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1
+3. If no row: ROLLBACK, return nil, nil
+4. UPDATE jobs SET status = 'running', updated_at = ? WHERE id = ? AND status = 'pending'
+5. If rows_affected == 0: ROLLBACK, return nil, nil  (raced with another worker)
+6. COMMIT
+7. Scan row → Job, return
+```
+
+### 4.7 UpdateStatus()
+
+```go
+func (s *Store) UpdateStatus(id string, status Status, result string, errStr string) error
+```
+
+Sequence:
+
+1. Acquire `s.mu`.
+2. `UPDATE jobs SET status = ?, result = ?, error = ?, updated_at = ? WHERE id = ?`.
+3. If status is `StatusFailed`, also `UPDATE jobs SET retry_count = retry_count + 1 WHERE id = ?`.
+4. Release `s.mu`.
+5. Return nil.
+
+**Legal transitions enforced by the caller (Worker)**, not by UpdateStatus itself. The store does NOT validate state transitions — the Worker is responsible for calling UpdateStatus with valid transitions. This keeps the Store simple and testable.
+
+### 4.8 Recover() — Startup Recovery
+
+```go
+func (s *Store) Recover() (int, error)
+```
+
+Called once during `NewStore()`. Returns count of recovered jobs.
+
+Sequence:
+
+1. Acquire `s.mu`.
+2. `UPDATE jobs SET status = 'pending', updated_at = ? WHERE status = 'running'` — orphaned running jobs go back to pending. Count rows affected.
+3. `UPDATE jobs SET status = 'pending', updated_at = ? WHERE status = 'failed' AND retry_count < max_retries` — retriable failures go back to pending. Count rows affected.
+4. `UPDATE jobs SET status = 'dead', updated_at = ? WHERE status = 'failed' AND retry_count >= max_retries` — exhausted failures → dead. Count rows affected.
+5. Release `s.mu`.
+6. Return total rows affected.
+
+**Rationale**: Server just started → nothing is actively running → all `running` jobs were orphaned. Jobs with retries remaining get another chance. Exhausted failures are terminal.
+
+### 4.9 Get()
+
+```go
+func (s *Store) Get(id string) (*Job, error)
+```
+
+Simple `SELECT * FROM jobs WHERE id = ?`. Returns nil, nil if not found. No mutex — SQLite handles concurrent reads.
+
+### 4.10 CountByStatus()
+
+```go
+func (s *Store) CountByStatus(status Status) (int, error)
+```
+
+`SELECT COUNT(*) FROM jobs WHERE status = ?`. No mutex needed.
+
+### 4.11 StartTTLCleanup() — Background Goroutine
+
+```go
+func (s *Store) StartTTLCleanup(ctx context.Context, interval time.Duration)
+```
+
+Spawns a single goroutine that periodically deletes expired jobs.
+
+Sequence:
+
+1. If `s.jobTTL <= 0`, return immediately (TTL disabled).
+2. Spawn goroutine:
+   - **defer recover** — log and return (no crash). Use `log.Printf` (stdlib log) for logging — the queue package has no logger dependency.
+   - Ticker at `interval` (default: `DefaultTTLInterval`).
+   - On each tick: `DELETE FROM jobs WHERE status IN ('completed', 'failed', 'dead') AND updated_at < ?` where `? = time.Now().Unix() - jobTTL.Seconds()`.
+   - Exit on `ctx.Done()`.
+
+**CRITICAL**: `StartTTLCleanup` must NOT be called before `NewStore()` returns. It is called by the consumer (M3 server.go) after Store is ready.
+
+### 4.12 Close()
+
+```go
+func (s *Store) Close() error
+```
+
+Closes the SQLite database. Safe to call multiple times (subsequent calls are no-ops — check `db != nil`).
+
+### 4.13 Store sentinel errors
+
+```go
+var (
+    ErrQueueFull   = errors.New("queue is full: too many pending jobs")
+    ErrJobNotFound = errors.New("job not found")
+)
+```
+
+`ErrJobNotFound` is returned by UpdateStatus when no row matched the ID.
 
 ---
 
-## 5. Test File Changes
+## 5. Module 2c: `queue/worker.go` — Worker Pool, Semaphore Gating
 
-Tests are NOT modified in M1. Deletion of Hindsight-specific tests happens in M5. For M1:
-- Tests that reference `IsSync()` or `BackendHindsight` will FAIL to compile. These must be updated just enough to compile.
-- Tests that use deleted config fields must be updated.
+### 5.1 Worker type
 
-**CRITICAL**: The goal is `go build ./...` passes. `go test ./...` may have failures from Hindsight-specific tests — those are documented here for M5 cleanup, but compilation must succeed.
+```go
+type Worker struct {
+    store   *Store
+    sem     chan struct{}
+    count   int
+    process ProcessFunc
+    wg      sync.WaitGroup
+    cancel  context.CancelFunc
+    mu      sync.Mutex   // protects cancel during Stop
+}
+```
 
-### 5.1 Tests that MUST be updated for compilation:
+**Concurrency safety**: Safe for concurrent use. Start() and Stop() are callable from different goroutines. `mu` protects `cancel` assignment during Start/Stop race.
 
-| Test File | Line(s) | Action |
-|-----------|---------|--------|
-| `auto_improve_test.go` | 159 | DELETE `IsSync()` method from mockBackend |
-| `tester_pass1_adversarial_test.go` | 787-803 | DELETE `TestHindsight_ReflectPathUnchanged` — tests IsSync guard that no longer exists |
-| `tester_pass2_autoimprove_boundary_test.go` | 1186-1196 | DELETE `TestMaybeAutoImprove_HindsightPathIsSync` |
-| `tester_pass2_boundary_test.go` | 170-230 | DELETE `allHealthy` cloud mix tests that check Hindsight port — these use `cfg.HindsightPort` which is deleted |
-| `tester_pass2_boundary_test.go` | 347-361 | UPDATE: `healthCache` size changed from [3] to [2] |
-| `tester_pass2_boundary_test.go` | 397-444 | DELETE: cloud reranker tests using `CloudReranker*` fields |
-| `tester_pass2_boundary_test.go` | 517-520 | DELETE: more CloudReranker field tests |
-| `tester_pass2_boundary_test.go` | 556-586 | DELETE: `TestCloud_allHealthy_hindsightOnlyWhenBothCloud` |
-| `tester_pass2_boundary_test.go` | 619-620 | DELETE: HindsightPort in test config |
-| `tester_pass2_boundary_test.go` | 665-692 | DELETE: allHealthy race test with reranker |
-| `tester_pass2_boundary_test.go` | 696-720 | DELETE: `TestCloud_allHealthy_hindsightOnlyWhenBothCloud` |
-| `tester_pass2_boundary_test.go` | 725-870 | DELETE: `startHindsight_envVarInjection` tests |
-| `tester_pass2_venv_boundary_test.go` | 350-1025 | DELETE or SKIP: all `.venv/bin/hindsight-api` discovery tests. Add `t.Skip("hindsight removed in M1")` if deletion is too invasive. |
-| `tester_cloud_adversarial_test.go` | 100-117 | DELETE: `TestCloud_IsCloudReranker_derivation` |
-| `tester_cloud_adversarial_test.go` | 179-339 | UPDATE/SKIP: all references to `RerankerModel`, `CloudReranker*` fields |
-| `tester_cloud_adversarial_test.go` | 503-530 | DELETE: `TestCloud_start_skipsRerankerWhenCloudRerank` |
-| `tester_cloud_adversarial_test.go` | 524-531 | DELETE: default RerankerModel checks |
-| `tester_cloud_adversarial_test.go` | 542-543 | DELETE: reranker model file tests |
-| `tester_cloud_adversarial_test.go` | 566-591 | DELETE: waitAllHealthy cloud both test |
-| `tester_pass1_download_test.go` | 500-560 | DELETE: reranker skip logic tests |
-| `stress/stress_test.go` | 152-153 | UPDATE: remove `Reranker` and `Hindsight` fields from health JSON struct |
-| `stress/stress_test.go` | 1452-1577 | DELETE: `TestStressChaos_KillHindsight` |
-| `deep_test.go` | ~918 | UPDATE: remove `"hindsight"` and `"reranker"` from required health response fields |
-| `tester_adversarial_test.go` | 64-72 | DELETE: `LlamaRerankerPort`, `HindsightPort`, `HindsightPath`, `HindsightRetainTimeout`, `HindsightRecallTimeout`, `HindsightReflectTimeout` |
-| `tester_adversarial_test.go` | 1199 | DELETE: `cfg.HindsightPath = "/nonexistent"` |
-| `tester_pass2_deeper_edgecases_test.go` | 257 | UPDATE: `improveState: nil` comment `// Hindsight path` → remove or update |
+### 5.2 ProcessFunc type
 
-### 5.2 Tests that are SAFE (no changes needed for compilation):
+```go
+type ProcessFunc func(ctx context.Context, job *Job) error
+```
 
-| Test File | Reason |
-|-----------|--------|
-| `auto_improve_test.go` (except line 159) | Only tests Cognee auto-improve path |
-| `tester_pass1_adversarial_test.go` (except Hindsight test) | Cognee path tests |
-| `tester_pass2_autoimprove_boundary_test.go` (except Hindsight test) | Cognee auto-improve tests |
-| `deep_test.go` (except health check) | End-to-end Cognee tests |
-| `internal/testutil/cogneemock/` | Cognee mock — preserved |
+The function receives a context that is cancelled when the worker pool shuts down. Return nil for success (job → completed), non-nil for failure (job → failed).
+
+### 5.3 WorkerConfig
+
+```go
+type WorkerConfig struct {
+    Store    *Store       // required
+    Process  ProcessFunc  // required, called for each dequeued job
+    Count    int          // number of worker goroutines (0 = DefaultWorkerCount)
+    SemSize  int          // max concurrent process calls across all workers (0 = DefaultSemSize)
+}
+```
+
+**Validation**: `Store` and `Process` must be non-nil. If Count <= 0, use DefaultWorkerCount. If SemSize <= 0, use DefaultSemSize. SemSize may be larger than Count — this allows future scaling without changing WorkerCount.
+
+### 5.4 NewWorker()
+
+```go
+func NewWorker(cfg WorkerConfig) *Worker
+```
+
+Pure struct construction. No goroutines spawned. No side effects.
+
+### 5.5 Start()
+
+```go
+func (w *Worker) Start(ctx context.Context)
+```
+
+Sequence:
+
+1. Acquire `w.mu`. If `w.cancel != nil`, release and return (already started — idempotent). Create `workerCtx, w.cancel = context.WithCancel(ctx)`. Release `w.mu`.
+2. Spawn `w.count` goroutines, each running `w.workerLoop(workerCtx, i)` (i = 0..count-1 for logging).
+3. Add to `w.wg` before each goroutine.
+
+### 5.6 workerLoop()
+
+```go
+func (w *Worker) workerLoop(ctx context.Context, id int)
+```
+
+Sequence:
+
+1. `w.wg.Add(1)` — called by Start() before spawning.
+2. `defer w.wg.Done()`.
+3. **Defer recover** — if panic, log via `log.Printf` and return. Do NOT attempt to restart.
+4. Loop:
+   - Acquire semaphore: `select { case w.sem <- struct{}{}: ; case <-ctx.Done(): return }`.
+   - `defer func() { <-w.sem }()` — release on return.
+   - Call `w.store.NextPending()`.
+   - If nil job (empty queue): release sem, sleep 100ms, continue.
+   - Create per-job context with timeout (hardcoded 900s for retain, configurable later).
+   - Call `w.process(jobCtx, job)`.
+   - If process returns nil: `w.store.UpdateStatus(job.ID, StatusCompleted, job.Result, "")`.
+   - If process returns error:
+     - Increment `job.RetryCount` (though UpdateStatus handles this at DB level — the DB is the source of truth). 
+     
+     **Wait** — let me re-think. The ProcessFunc doesn't modify the job. The worker determines retry logic.
+
+     Revised logic:
+     - If `job.CanRetry()`: `w.store.UpdateStatus(job.ID, StatusFailed, "", err.Error())` — this increments retry_count in DB. Then `w.store.UpdateStatus(job.ID, StatusPending, "", "")` — re-queue.
+     
+     **Actually**, that's two UPDATEs. Let me simplify: the Store.UpdateStatus with StatusFailed increments retry_count. Then the worker checks CanRetry() and either re-queues to pending or marks as dead.
+
+     Revised:
+     - `w.store.UpdateStatus(job.ID, StatusFailed, "", processErr.Error())` — sets status=failed, increments retry_count.
+     - Re-read job: `job, _ = w.store.Get(job.ID)`.
+     - If `job.CanRetry()`: `w.store.UpdateStatus(job.ID, StatusPending, "", "")`.
+     - Else: `w.store.UpdateStatus(job.ID, StatusDead, "", "")`.
+
+  **Even simpler**: Have a single UpdateStatus that handles the transition and the retry_count increment atomically. The worker just calls UpdateStatus with the result and then checks CanRetry.
+
+  Let me simplify further. The worker's logic:
+
+  ```
+  job, err := w.store.NextPending()   // pending→running, returns job
+  if job == nil { sleep 100ms; continue }
+  
+  processErr := w.process(ctx, job)
+  
+  if processErr == nil {
+      w.store.UpdateStatus(job.ID, StatusCompleted, "", "")
+  } else {
+      // Mark as failed (increments retry_count in DB)
+      w.store.CompleteAttempt(job.ID, processErr.Error())
+      // Re-read to get updated retry_count
+      job, _ = w.store.Get(job.ID)
+      if job.CanRetry() {
+          w.store.UpdateStatus(job.ID, StatusPending, "", "")
+      } else {
+          w.store.UpdateStatus(job.ID, StatusDead, "", "")
+      }
+  }
+  ```
+
+  Hmm, this needs a separate `CompleteAttempt` method. Let me just make UpdateStatus smart enough:
+
+  Actually, let me KISS. The worker does:
+
+  ```
+  if processErr == nil {
+      w.store.UpdateStatus(job.ID, StatusCompleted, "", "")
+  } else {
+      w.store.UpdateStatus(job.ID, StatusFailed, "", processErr.Error())
+      // Re-read to get updated retry_count from DB
+      job, _ = w.store.Get(job.ID)
+      if job.CanRetry() {
+          w.store.UpdateStatus(job.ID, StatusPending, "", "")
+      } else {
+          w.store.UpdateStatus(job.ID, StatusDead, "", "")
+      }
+  }
+  ```
+
+  UpdateStatus with StatusFailed increments retry_count. That's its behavior. Then worker reads back and decides retry or dead.
+
+5. Loop back to step 4 until `ctx.Done()`.
+
+### 5.7 Stop()
+
+```go
+func (w *Worker) Stop()
+```
+
+Sequence:
+
+1. Acquire `w.mu`. If `w.cancel == nil`, release and return (never started — idempotent). Call `w.cancel()`. Release `w.mu`.
+2. `w.wg.Wait()` — block until all workers exit.
+3. Close the semaphore channel. Actually no — sem is a buffered channel used as semaphore; don't close it, just let GC collect it.
+
+**Wait on semaphore**: During Stop, worker goroutines may be blocked on `w.sem <- struct{}{}`. The `ctx.Done()` case in the select handles this — the worker exits instead of acquiring the semaphore. Workers that already hold the semaphore finish their current job (respecting context cancellation in the process call). 
+
+The `wg.Wait()` ensures all workers have exited before Stop returns.
 
 ---
 
-## 6. Goroutine Inventory (After M1)
+## 6. Goroutine Inventory
 
-All goroutines spawned by the server after M1, with creation point and panic recovery status.
+Every goroutine spawned by the queue package, with creation point and panic recovery status:
 
-| ID | Goroutine | Spawned In | Panic Recovery | Exit Signal |
+| ID | Goroutine | Spawned By | Panic Recovery | Exit Signal |
 |----|-----------|-----------|---------------|-------------|
-| G1 | `s.svc.monitor(ctx, ...)` | `server.go` Start() | YES (defer recover in monitor) | `stopMonitor()` cancels ctx |
-| G2 | `checkAndRestart` for llama | `monitor()` via `go` | YES (defer recover in checkAndRestart) | Returns after one check |
-| G3 | `checkAndRestart` for cognee | `monitor()` via `go` | YES (defer recover in checkAndRestart) | Returns after one check |
-| G4 | `s.sessionCleaner()` | `server.go` Start() | YES (defer recover at top) | `s.shutdown` channel close |
-| G5 | `s.jobTrackerCleanup()` | `server.go` NewServer() | YES (inside jobTracker) | `s.cogneeCancel()` / ctx.Done |
-| G6 | Cognee retain goroutine | `handlers.go` memory_retain | YES (defer recover) | Returns after backend call |
-| G7 | Cognee reflect goroutine | `handlers.go` memory_reflect | YES (defer recover) | Returns after backend call |
-| G8 | Auto-improve goroutine | `auto_improve.go` maybeAutoImprove() | YES (defer recover) | Returns after Reflect + Improve |
-| G9 | SSE handler goroutine | `handleMCPSSE()` per-session | NO (HTTP handler) | `r.Context().Done()` |
-| G10 | MCP message goroutine | `handleMCPMessage()` per-request | YES (safeRouteMCP has defer recover) | Returns after tool call |
-| G11 | Error webhook goroutine | `fireErrorWebhook()` per-error | YES (defer recover) | Returns after webhook call |
-| G12 | `stopProcess` cmd.Wait goroutine | `services.go` stopProcess() | YES (defer recover) | Returns after cmd.Wait |
-| G13 | `allHealthy` llama check | `allHealthy()` → `go func()` | YES (defer recover) | Returns after HTTP health check |
-| G14 | `allHealthy` cognee check | `allHealthy()` → `go func()` | YES (defer recover) | Returns after HTTP health check |
+| QG1-QGN | workerLoop x N | Worker.Start() | YES (defer recover at top of workerLoop) | ctx.Done() from Stop() |
+| QGCleanup | TTL cleanup | Store.StartTTLCleanup() | YES (defer recover at top of goroutine) | ctx.Done() from M3 caller |
 
-### Removed goroutines (present pre-M1, absent post-M1):
-
-| Pre-M1 Goroutine | Removed Because |
-|-----------------|-----------------|
-| Reranker checkAndRestart | No reranker process |
-| Hindsight checkAndRestart | No hindsight process |
-| allHealthy reranker check | No reranker to check |
-| allHealthy hindsight check (replaced by cognee) | Was checking HTTP health of Hindsight API |
-| worker pool retain workers (x RetainWorkers) | workers.go deleted |
-| worker pool reflect workers (x ReflectWorkers) | workers.go deleted |
-| sessionCleaner via workers.start() | Now started directly in server.go Start() |
+**Total: N+1 goroutines**, where N = WorkerConfig.Count (default 4). All have panic recovery.
 
 ---
 
-## 7. Migration Checklist — Config Field Removal
+## 7. Lock Ordering
 
-Every field removal traceable to `config.go`. Fields removed from Config struct:
+The queue package has exactly two locks:
 
-| # | Field | Type | Default | Env Var | Used By (pre-M1) |
-|---|-------|------|---------|---------|-----------------|
-| 1 | `LlamaRerankerPort` | string | `"19091"` | `LLAMA_RERANKER_PORT` | services.go: startLlamaReranker, allHealthy, monitor |
-| 2 | `CloudRerankerAPIKey` | string | `""` | `CLOUD_RERANKER_API_KEY` | services.go: startHindsight env injection |
-| 3 | `CloudRerankerURL` | string | `""` | `CLOUD_RERANKER_URL` | config.go: IsCloudReranker, Validate |
-| 4 | `CloudRerankerModel` | string | `""` | `CLOUD_RERANKER_MODEL` | config.go: Validate |
-| 5 | `HindsightPath` | string | `"hindsight-api"` | `HINDSIGHT_PATH` | services.go: startHindsight binary lookup |
-| 6 | `HindsightPort` | string | `"8888"` | `HINDSIGHT_PORT` | server.go: BackendConfig, services.go: healthURL, monitor, allHealthy |
-| 7 | `LLMProvider` | string | `"openrouter"` | `HINDSIGHT_LLM_PROVIDER` | services.go: startHindsight env injection |
-| 8 | `LLMModel` | string | — | `HINDSIGHT_LLM_MODEL` | services.go: startHindsight env injection |
-| 9 | `LLMAPIKey` | string | — | `OPENROUTER_API_KEY` | services.go: startHindsight env injection |
-| 10 | `LLMBaseURL` | string | — | `OPENROUTER_BASE_URL` | services.go: startHindsight env injection |
-| 11 | `EmbedProvider` | string | — | `HINDSIGHT_EMBEDDINGS_PROVIDER` | services.go: startHindsight env injection |
-| 12 | `EmbedModel` | string | — | `HINDSIGHT_EMBEDDINGS_MODEL` | services.go: startHindsight env injection |
-| 13 | `RerankerProvider` | string | — | `HINDSIGHT_RERANKER_PROVIDER` | services.go: startHindsight env injection |
-| 14 | `RerankerModel` | string | `./model/bge-reranker-base-Q4_k_m.gguf` | `HINDSIGHT_RERANKER_MODEL` | config.go: IsCloudReranker, Validate; services.go: startLlamaReranker, startHindsight |
-| 15 | `HindsightRetainTimeout` | time.Duration | 60s | `HINDSIGHT_RETAIN_TIMEOUT` | services.go: startHindsight env injection |
-| 16 | `HindsightRecallTimeout` | time.Duration | 10s | `HINDSIGHT_RECALL_TIMEOUT` | services.go: startHindsight env injection |
-| 17 | `HindsightReflectTimeout` | time.Duration | 60s | `HINDSIGHT_REFLECT_TIMEOUT` | services.go: startHindsight env injection |
-| 18 | `RetainWorkers` | int | 4 | `MEMORY_RETAIN_WORKERS` | workers.go: Pool size |
-| 19 | `ReflectWorkers` | int | 2 | `MEMORY_REFLECT_WORKERS` | workers.go: Pool size |
-| 20 | `JobBufferSize` | int | 100 | `MEMORY_JOB_BUFFER` | workers.go: chan buffer |
-| 21 | `QueuePushTimeout` | time.Duration | 5s | `MEMORY_QUEUE_PUSH_TIMEOUT` | workers.go: queueJob |
-| 22 | `QueueResponseTimeout` | time.Duration | 60s | `MEMORY_QUEUE_RESPONSE_TIMEOUT` | workers.go: queueJob |
-| 23 | `CircuitBreakerThreshold` | int | 5 | `MEMORY_CIRCUIT_BREAKER_THRESHOLD` | backend/hindsight.go |
-| 24 | `CircuitBreakerCooldown` | time.Duration | 10s | `MEMORY_CIRCUIT_BREAKER_COOLDOWN` | backend/hindsight.go |
+| Lock | Type | Guards |
+|------|------|--------|
+| `Store.mu` | `sync.Mutex` | Serializes Insert/NextPending/UpdateStatus/Recover |
+| `Worker.mu` | `sync.Mutex` | Protects `cancel` during Start/Stop race |
 
-**Total: 24 Config fields removed.**
+**Lock ordering**: `Worker.mu` → `Store.mu` (Worker.Stop acquires Worker.mu, workerLoop acquires Store.mu indirectly via NextPending/UpdateStatus). However, Worker.mu is never held while waiting on Store.mu — they are acquired in separate call chains:
 
----
+- Start() acquires Worker.mu, releases it, then spawns goroutines.
+- Stop() acquires Worker.mu, calls cancel(), releases Worker.mu, then wg.Wait().
+- workerLoop never acquires Worker.mu — it only calls Store methods which acquire Store.mu.
 
-## 8. Migration Checklist — Server Struct Field Removal
+**No ABBA deadlock possible within this package.** The two mutexes are never held simultaneously by any goroutine.
 
-| # | Field | Type | Pre-M1 Purpose |
-|---|-------|------|---------------|
-| 1 | `workers *workerSystem` | pointer | Hindsight worker pool. Deleted. |
+--- 
+
+## 8. Configuration Surface (Environment Variables — M3 wiring)
+
+These env vars will be read by M3's config.go and passed to the queue package as StoreConfig/WorkerConfig. Listed here for completeness:
+
+| Env Var | Default | Dest |
+|---------|---------|------|
+| `QUEUE_DB_PATH` | `./data/queue.db` | StoreConfig.DBPath |
+| `QUEUE_MAX_PENDING` | `1000` | StoreConfig.MaxPending |
+| `QUEUE_JOB_TTL` | `24h` | StoreConfig.JobTTL |
+| `QUEUE_TTL_INTERVAL` | `5m` | StartTTLCleanup interval |
+| `QUEUE_WORKER_COUNT` | `4` | WorkerConfig.Count |
+| `QUEUE_SEM_SIZE` | `3` | WorkerConfig.SemSize |
+
+**None of these are read by the queue package directly.** The queue package takes explicit config structs. M3's config.go reads env vars and passes values.
 
 ---
 
-## 9. Migration Checklist — services Struct Field Removal
+## 9. Acceptance Criteria (M2 Only)
 
-| # | Field | Type | Pre-M1 Purpose |
-|---|-------|------|---------------|
-| 1 | `llamaRerankerCmd *exec.Cmd` | pointer | Reranker subprocess. Deleted. |
-| 2 | `hindsightCmd *exec.Cmd` | pointer | Hindsight subprocess. Deleted. |
-| 3 | `backendName string` | string | Backend dispatch. Deleted. |
-| 4 | `rerankerFails serviceFails` | struct | Reranker fail tracking. Deleted. |
-| 5 | `hindsightFails serviceFails` | struct | Hindsight fail tracking. Deleted. |
-
----
-
-## 10. Acceptance Criteria (M1 Only)
-
-All ACs are testable individually. No ACs from M2-M5 are included.
+All ACs are testable independently of handlers, Cognee, or any external service.
 
 | AC# | Description | Verification Method |
 |-----|-------------|-------------------|
-| AC-M1.1 | `backend/hindsight.go` file is deleted | `ls backend/hindsight.go` returns "No such file" |
-| AC-M1.2 | `workers.go` file is deleted | `ls workers.go` returns "No such file" |
-| AC-M1.3 | `model/bge-reranker-base-Q4_k_m.gguf` file is deleted | `ls model/bge-reranker-base-Q4_k_m.gguf` returns "No such file" |
-| AC-M1.4 | `docs/hindsight.md` file is deleted | `ls docs/hindsight.md` returns "No such file" |
-| AC-M1.5 | `session_cleaner.go` file exists with `sessionCleaner()` method on `*Server` | `ls session_cleaner.go` succeeds; grep confirms method signature |
-| AC-M1.6 | `go build ./...` compiles with zero errors | `go build ./...` exit code 0 |
-| AC-M1.7 | `go vet ./...` passes with zero warnings | `go vet ./...` exit code 0 |
-| AC-M1.8 | `grep -r "IsSync" --include="*.go" ./` returns zero results | Zero matches in non-test, non-vendor Go files |
-| AC-M1.9 | `grep -r "BackendHindsight" --include="*.go" ./` returns zero results | Zero matches |
-| AC-M1.10 | `grep -r "hindsight\|Hindsight\|HINDSIGHT" --include="*.go" ./` returns zero results (in non-test files) | Zero matches in main + backend packages |
-| AC-M1.11 | `grep -r "reranker\|Reranker\|RERANKER" --include="*.go" ./` returns zero results (in non-test files) | Zero matches in main + backend packages |
-| AC-M1.12 | `grep "HindsightPort\|RerankerModel\|CloudReranker" config.go` returns zero results | Zero matches |
-| AC-M1.13 | `services.go` `healthCache` is `[2]bool`, not `[3]bool` | grep confirms |
-| AC-M1.14 | `allHealthy()` returns 2 values `(llama, cognee bool)` | grep confirms signature |
-| AC-M1.15 | `allHealthy()` has ZERO references to `IsCloudReranker`, `BackendHindsight`, `LlamaRerankerPort`, `HindsightPort` | grep on services.go confirms |
-| AC-M1.16 | `services.go` has no `startLlamaReranker`, `startHindsight` functions | grep confirms |
-| AC-M1.17 | `services.go` `start()`, `stop()`, `monitor()` have no `case BackendHindsight:` | grep confirms |
-| AC-M1.18 | `handlers.go` `toolsList()` unconditionally returns 5 tools: retain, recall, reflect, forget, retain_status | Code review + curl to `/mcp/tools` (if server compiles and runs) |
-| AC-M1.19 | `handlers.go` has zero `IsSync()` calls | grep confirms |
-| AC-M1.20 | `handlers.go` has zero `s.workers.` references | grep confirms |
-| AC-M1.21 | `server.go` Cognee infrastructure (semaphore, jobTracker, ctx, dataDir, improveState) is constructed unconditionally — no `if !IsSync()` guard | Code review |
-| AC-M1.22 | `server.go` has no `workers *workerSystem` field | grep confirms |
-| AC-M1.23 | `server.go` `backend.BackendConfig` literal has no `HindsightPort`, `CircuitBreakerThreshold`, `CircuitBreakerCooldown` fields | grep confirms |
-| AC-M1.24 | `server.go` `Start()` explicitly starts `go s.sessionCleaner()` | Code review |
-| AC-M1.25 | `server.go` `Stop()` does not call `s.workers.stop()` | grep confirms |
-| AC-M1.26 | `errors.go` has no `errBinaryNotFound` | grep confirms |
-| AC-M1.27 | `pids.go` has no `hindsight` or `llama_reranker` in `savePids()` | grep confirms |
-| AC-M1.28 | `main.go` Phase 1 comment mentions Cognee, not Hindsight | grep confirms |
-| AC-M1.29 | `.env.example` has no HINDSIGHT_* entries, no CLOUD_RERANKER_* entries | grep confirms |
-| AC-M1.30 | `types.go` has no `MemoryJob` or `MemoryResult` types | grep confirms |
-| AC-M1.31 | `config.go` `Validate()` default error lists only `cognee-python`, `cognee-rust` | Code review |
-| AC-M1.32 | `config.go` `LoadConfig()` Backend default is `"cognee-python"` | Code review |
-| AC-M1.33 | Health endpoint (`GET /health`) returns `llama`, `cognee` fields (not `hindsight`, `reranker`) | curl /health JSON inspection |
-| AC-M1.34 | Health endpoint has no `retain_workers`, `reflect_workers`, `retain_panics`, `reflect_panics` fields | curl /health JSON inspection |
-| AC-M1.35 | `backend.Backend` interface has NO `IsSync()` method | grep on backend/backend.go |
-| AC-M1.36 | `var _ backend.Backend = (*CogneeBackend)(nil)` compiles | `go build ./backend/...` passes |
-| AC-M1.37 | All test files compile without errors | `go build ./...` includes test files? No — build doesn't compile tests. But `go vet ./...` does check test files. |
-| AC-M1.38 | `CGO_ENABLED=0 go build ./...` succeeds | Pure Go — no CGO dependency introduced |
-| AC-M1.39 | `config.go` has exactly 24 fewer fields (count pre vs post) | Diff count of struct fields |
-| AC-M1.40 | Cognee retain goroutine path is the ONLY path in `memory_retain` — no if/else branching on backend type | Code review |
+| AC-M2.1 | `queue/` package compiles with `CGO_ENABLED=0 go build ./queue/...` | Exit code 0 |
+| AC-M2.2 | `queue/` package has zero imports of `mcp-memory` main or backend | `go list -deps ./queue/...` excludes non-stdlib + modernc.org/sqlite |
+| AC-M2.3 | `Store` opens an in-memory SQLite DB (`:memory:`) without error | `NewStore(StoreConfig{DBPath: ":memory:"})` returns non-nil Store, nil error |
+| AC-M2.4 | `Store.Insert()` inserts a job, then `Store.Get()` retrieves it with all fields matching | Insert job with known values → Get → deep-equal check |
+| AC-M2.5 | `Store.Insert()` returns `ErrQueueFull` when pending count >= MaxPending | Insert MaxPending+1 jobs, last one returns ErrQueueFull |
+| AC-M2.6 | `Store.NextPending()` returns oldest pending job and transitions it to running (optimistic locking) | Insert 3 jobs, NextPending 3 times → verify FIFO order and status=running |
+| AC-M2.7 | `Store.NextPending()` returns nil, nil when queue is empty | Call on empty store |
+| AC-M2.8 | `Store.NextPending()` is safe under concurrent callers (no duplicate claims) | 10 goroutines x 10 NextPending calls with 5 jobs → exactly 5 claims, 5 nil returns |
+| AC-M2.9 | `Store.UpdateStatus()` transitions job to completed and sets result field | UpdateStatus(id, StatusCompleted, "result", "") → Get confirms |
+| AC-M2.10 | `Store.UpdateStatus()` with StatusFailed increments retry_count by 1 | Insert job, NextPending, UpdateStatus failed → Get shows retry_count=1 |
+| AC-M2.11 | `Store.Recover()` resets running→pending (orphaned jobs) | Manually INSERT a running job, call Recover → status is pending |
+| AC-M2.12 | `Store.Recover()` resets failed→pending when retry_count < max_retries | INSERT failed job with retry_count=1, max_retries=3 → Recover → pending |
+| AC-M2.13 | `Store.Recover()` sets failed→dead when retry_count >= max_retries | INSERT failed job with retry_count=3, max_retries=3 → Recover → dead |
+| AC-M2.14 | `Store.StartTTLCleanup()` deletes completed jobs older than TTL | Insert completed job with updated_at = now-TTL-1s, run TTL → job gone |
+| AC-M2.15 | `Store.StartTTLCleanup()` does NOT delete completed jobs newer than TTL | Insert completed job with updated_at = now, run TTL → job still present |
+| AC-M2.16 | `Store.StartTTLCleanup()` goroutine exits when ctx is cancelled | Start TTL, cancel ctx, verify goroutine exits within 1s |
+| AC-M2.17 | `Store.StartTTLCleanup()` is a no-op when JobTTL <= 0 | Create store with JobTTL=-1, call StartTTLCleanup → no goroutine spawned |
+| AC-M2.18 | `Worker.Start()` spawns exactly `Count` goroutines | Count=4 → 4 workerLoop goroutines running |
+| AC-M2.19 | `Worker` picks up jobs and calls ProcessFunc with correct job data | Insert job with known payload, ProcessFunc records payload → matches |
+| AC-M2.20 | `Worker` transitions job to completed on ProcessFunc success | ProcessFunc returns nil → job status=completed |
+| AC-M2.21 | `Worker` transitions job to pending (retry) on ProcessFunc failure when CanRetry() | ProcessFunc returns error, retry_count=0, max_retries=3 → job status=pending after retry |
+| AC-M2.22 | `Worker` transitions job to dead when retries exhausted | ProcessFunc returns error 3 times consecutively → job status=dead |
+| AC-M2.23 | `Worker` semaphore gates concurrent process calls | SemSize=1, 2 workers → only 1 process call at a time |
+| AC-M2.24 | `Worker.Stop()` causes all workers to exit (no goroutine leak) | Start workers, Stop, verify goroutine count returns to baseline |
+| AC-M2.25 | `Worker.Stop()` is idempotent (calling twice does not panic) | Stop x2, no panic |
+| AC-M2.26 | `Worker.Start()` is idempotent (calling twice does not double-spawn) | Start x2, verify exactly Count goroutines |
+| AC-M2.27 | Worker panic in ProcessFunc does NOT crash worker (recovery + continue) | ProcessFunc panics → worker logs and continues with next job |
+| AC-M2.28 | Worker panic in workerLoop itself does NOT crash other workers | One worker panics → other workers unaffected, pool still functional |
+| AC-M2.29 | `Job.Validate()` rejects empty ID | Validate() on Job{ID: ""} → error containing "ID" |
+| AC-M2.30 | `Job.Validate()` rejects empty Bank | Validate() on Job{Bank: ""} → error containing "bank" |
+| AC-M2.31 | `Job.Validate()` rejects invalid Type | Validate() on Job{Type: "invalid"} → error containing "type" |
+| AC-M2.32 | `Job.Validate()` rejects empty Content | Validate() on Job{Payload: ""} → error containing "payload" |
+| AC-M2.33 | `Job.Validate()` rejects MaxRetries > 10 | Validate() on Job{MaxRetries: 11} → error containing "max_retries" |
+| AC-M2.34 | `Job.CanRetry()` returns true when StatusFailed and retry_count < max_retries | status=failed, retry_count=0, max_retries=3 → true |
+| AC-M2.35 | `Job.CanRetry()` returns false when retry_count >= max_retries | status=failed, retry_count=3, max_retries=3 → false |
+| AC-M2.36 | `Job.CanRetry()` returns false when status is not failed | status=pending, retry_count=0 → false |
+| AC-M2.37 | SQLite WAL mode is enabled after NewStore | `PRAGMA journal_mode` returns "wal" |
+| AC-M2.38 | All 6 pragmas are applied (WAL, busy_timeout, cache_size, mmap_size, foreign_keys, synchronous) | Query each pragma after NewStore → all match expected values |
+| AC-M2.39 | `Store.Close()` can be called multiple times without panic | Close x3, no panic |
+| AC-M2.40 | `Store.Close()` prevents further operations (db closed error, not panic) | Close then Insert → returns error (not panic) |
+| AC-M2.41 | `go test -race -timeout 240s ./queue/...` passes with zero races | Exit code 0, no race output |
+| AC-M2.42 | `CountByStatus(StatusPending)` returns correct count after Insert | Insert 5 jobs → CountByStatus(pending) = 5 |
+| AC-M2.43 | `StoreConfig` defaults: MaxPending=0 → DefaultMaxPending, JobTTL=0 → DefaultJobTTL | Create store with zero-config → verify defaults applied |
+| AC-M2.44 | NextPending uses `BEGIN IMMEDIATE` (not deferred) to prevent SQLITE_BUSY on concurrent claims | Code review of NextPending SQL |
+| AC-M2.45 | TTL cleanup goroutine recovers from panic (doesn't crash the program) | Inject panic into TTL cleanup via test → goroutine exits gracefully |
 
 ---
 
-## 11. Edge Cases & Risk Mitigation
+## 10. Edge Cases & Risk Mitigation
 
-### 11.1 Compile-time Risks
+### 10.1 SQLite Concurrency
 
 | Risk | Likelihood | Mitigation |
 |------|-----------|-----------|
-| Test files reference deleted `HindsightPort` config field | High | Must update test configs (see §5.1). Tests only need to compile, not pass. |
-| Test mock has `IsSync()` method | Medium | `auto_improve_test.go:159` — delete IsSync from mockBackend |
-| `deep_test.go` checks health fields by name | Medium | Remove `"hindsight"` and `"reranker"` from required field list |
-| Unused import after deleting Hindsight code | Low | Go compiler catches this. Fix imports. |
+| SQLITE_BUSY on concurrent NextPending | Medium | WAL mode allows concurrent reads. `BEGIN IMMEDIATE` prevents concurrent write conflicts. `busy_timeout=5000` gives 5s grace. |
+| SQLITE_LOCKED on TTL cleanup during Insert | Low | WAL mode: reads (TTL DELETE) don't block writes (Insert). `busy_timeout` handles transient locks. |
+| Database file not writable | Low | NewStore returns error immediately. No partial state. |
 
-### 11.2 Runtime Risks
-
-| Risk | Likelihood | Mitigation |
-|------|-----------|-----------|
-| `s.cogneeCancel` nil dereference in Stop() | Low | After unconditional construction, always non-nil. The `if s.cogneeCancel != nil` guard is kept. |
-| SessionCleaner not started | Medium | Explicitly start `go s.sessionCleaner()` in Start(). AC-M1.24 verifies. |
-| Health endpoint breaks clients expecting old field names | Medium | This is a breaking change. Document in M5. For M1, just ensure new shape is valid JSON. |
-| `allHealthy()` returns wrong size array to singleflight | Low | Type assertion `val.([2]bool)` will panic if wrong. Compile-time check ensures consistency. |
-| Metrics `queueGauge` set to 0 loses observability | Low | Documented as known limitation until M3. `queue_depth` in health response is 0. |
-
-### 11.3 Data Risks
+### 10.2 Worker Edge Cases
 
 | Risk | Likelihood | Mitigation |
 |------|-----------|-----------|
-| Reranker model file deletion breaks nothing | None | Verify only used by Hindsight's llama reranker. Delete is safe. |
-| Hindsight binary still on disk | None | Not deleted — only code references removed. Binary cleanup is manual. |
+| Worker exits during long ProcessFunc | Low | ProcessFunc receives ctx — should respect cancellation. Worker's defer recovers panics. |
+| ProcessFunc never returns (hangs forever) | Low | The ProcessFunc is caller-supplied. Worker does not add its own timeout (M3 wiring may add one). Documented in godoc comments. |
+| Semaphore starvation | Low | First-come-first-served via channel select. Single channel for all workers. |
+
+### 10.3 Recovery Edge Cases
+
+| Risk | Likelihood | Mitigation |
+|------|-----------|-----------|
+| Recover called twice (NewStore called twice on same DB) | Low | Recover is idempotent — running→pending on an already-pending row is a no-op. |
+| Orphaned running jobs with updated_at years ago | Low | Recover handles them same as recent orphans. TTL cleanup will eventually delete them if they complete. |
+| Jobs with retry_count > max_retries (data corruption) | Very Low | Recover's WHERE clause `retry_count >= max_retries` catches them → dead. |
+
+### 10.4 Backpressure Edge Cases
+
+| Risk | Likelihood | Mitigation |
+|------|-----------|-----------|
+| MaxPending=0 → no jobs accepted | Low | DefaultMaxPending=1000 applies when config value is 0. Config value must be explicitly set to a negative value to disable. Document this. Actually, simpler: 0 → DefaultMaxPending. Negative → no limit (but document as "use at your own risk"). |
+| CountByStatus slow under 100K pending jobs | Low | SQLite with index on status handles SELECT COUNT efficiently. If this becomes a bottleneck in M3, add periodic caching. |
 
 ---
 
-## 12. Lock Ordering (Post-M1)
+## 11. Test Strategy (Guidance for Coder & Tester)
 
-No changes to lock ordering. M1 is purely deletion. Lock ordering pre-M1 and post-M1 is identical:
+### 11.1 Coder-delivered tests (queue/*_test.go)
 
-1. `s.mu` (Server state R/W lock) — outermost, acquired in Start/Stop
-2. `s.sessionsMu` — protects sessions map
-3. `svc.mu` — protects cmd pointers in services
-4. `svc.healthMu` — protects healthCache
+The coder must deliver at minimum:
 
-No ABBA risk because goroutines acquire at most one lock at a time.
+1. **store_test.go**: TestInsert, TestNextPending, TestNextPendingConcurrent, TestUpdateStatus, TestRecover, TestTTLCleanup, TestErrQueueFull, TestDefaults, TestClose, TestPragmaVerification.
+2. **worker_test.go**: TestWorkerStartStop, TestWorkerProcessSuccess, TestWorkerRetry, TestWorkerDeadAfterRetries, TestWorkerSemaphoreGate, TestWorkerPanicRecovery, TestWorkerIdempotentStartStop, TestWorkerEmptyQueue.
+3. **job_test.go**: TestValidate, TestCanRetry, TestClone.
 
----
+All tests must use `:memory:` database. No filesystem dependency.
 
-## 13. Verification After M1 (Orchestrator Checklist)
+### 11.2 Tester-created tests
 
-After the Coder completes M1, the Orchestrator MUST verify:
+The tester will write adversarial tests in separate test files. These are NOT required for M2 pass but are expected for full SDLC:
 
-1. `git diff --stat` shows the expected files deleted and modified
-2. `go build ./...` exits 0
-3. `go vet ./...` exits 0
-4. `grep -r "IsSync" --include="*.go" ./` returns 0 results
-5. `grep -r "hindsight\|Hindsight" --include="*.go" ./` returns 0 results in non-test files
-6. `grep -r "reranker\|Reranker" --include="*.go" ./` returns 0 results in non-test files
-7. `ls backend/hindsight.go workers.go model/bge-reranker-base-Q4_k_m.gguf docs/hindsight.md` all fail with "No such file"
-8. `ls session_cleaner.go` succeeds
-9. Health endpoint JSON shape matches §4.6
+- 1000 concurrent Insert + NextPending race
+- Worker pool under sustained retry load
+- TTL cleanup during active processing
+- Store operations after Close (panic-free error)
+- NextPending optimistic locking under extreme contention (50 goroutines)
 
 ---
 
-## 14. Handoff Notes for Coder
+## 12. Handoff Notes for Coder
 
-1. **Order of operations**: Delete files first (backend/hindsight.go, workers.go, model file, docs), then modify remaining files. This ensures you find all compilation errors early.
-2. **allHealthy() singleflight**: The `val.([2]bool)` type assertion must match the `return [2]bool{l, c}, nil` inside the singleflight function. Mismatch causes runtime panic.
-3. **Session cleaner extraction**: Copy the method body verbatim from workers.go. Only change the `s.workers` queue depth block to `// TODO(M3)` + `s.metrics.queueGauge.Set(0)`.
-4. **Import cleanup**: After deleting Hindsight code, run `goimports` or manually remove unused imports. `context` may become unused in handlers.go if only used by deleted code — check carefully.
-5. **Test compilation**: Run `go vet ./...` to catch test file compilation errors. Tests do NOT need to pass — only compile.
-6. **Zero new features**: This module is pure deletion. No new functions, no new types, no SQLite, no queue. If you find yourself writing new logic, you're doing it wrong.
+1. **Package is self-contained**: Do NOT import `mcp-memory` main, backend, config, handlers, logger, or metrics. Use `log.Printf` for logging, `fmt.Errorf` for errors.
+2. **modernc.org/sqlite**: Import as `_ "modernc.org/sqlite"` in store.go for driver registration. Use `database/sql` standard interface with driver name `"sqlite"`.
+3. **BEGIN IMMEDIATE**: Use `db.Begin()` — Go's `database/sql` doesn't directly support `BEGIN IMMEDIATE`. Instead, use `db.Exec("BEGIN IMMEDIATE")` before the SELECT+UPDATE in a raw transaction, or use `db.Exec()` for the whole operation with the mutex providing serialization. Since Store.mu already serializes NextPending calls, `BEGIN IMMEDIATE` is a safety net, not the sole protection. Use `db.Exec("BEGIN IMMEDIATE")` pattern.
+4. **Prepared statements**: Use `db.Prepare()` for Insert (reused per Insert call). QueryRow for Get/NextPending.
+5. **retry_count semantics**: UpdateStatus with StatusFailed `UPDATE jobs SET retry_count = retry_count + 1, ...`. This is the ONLY place retry_count increments.
+6. **Semaphore**: `w.sem` is `make(chan struct{}, semSize)`. Workers acquire with `select { case w.sem <- struct{}{}: case <-ctx.Done(): return }` and release with `<-w.sem` in defer.
+7. **No external config reading**: All config comes from StoreConfig/WorkerConfig structs. The M3 config.go package reads env vars.
+8. **Error wrapping**: Use `fmt.Errorf("...: %w", err)` for underlying SQLite errors. Sentinel errors (ErrQueueFull, ErrJobNotFound) are equality-checkable.
+9. **Zero dependencies beyond stdlib + modernc.org/sqlite**: No ORM, no migration framework, no third-party logger.
+10. **Test isolation**: Each test creates its own `:memory:` Store. No shared state between tests.

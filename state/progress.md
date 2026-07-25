@@ -2,8 +2,8 @@
 
 | Module | Status | Scout | Architect | Spec | Coder | Tester | QA |
 |--------|--------|-------|-----------|------|-------|--------|-----|
-| M1 — Hindsight Removal | 🔵 In Progress | ✅ | ✅ | ⬜ rewriting | ⬜ | ⬜ | ⬜ |
-| M2 — SQLite Queue Package | ⬛ Pending | ✅ | ✅ | ✅ | ⬜ | ⬜ | ⬜ |
+| M1 — Hindsight Removal | ✅ Done | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| M2 — SQLite Queue Package | 🔵 In Progress | ✅ | ✅ | ✅ | 🔄 | ⬜ | ⬜ |
 | M3 — Wire Queue into Handlers | ⬛ Pending | ✅ | ✅ | ✅ | ⬜ | ⬜ | ⬜ |
 | M4 — Auto-Reflect Scheduling | ⬛ Pending | ✅ | ✅ | ✅ | ⬜ | ⬜ | ⬜ |
 | M5 — Cleanup + Production Readiness | ⬛ Pending | ✅ | ✅ | ✅ | ⬜ | ⬜ | ⬜ |
