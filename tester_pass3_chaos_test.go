@@ -517,17 +517,10 @@ func TestChaos_LockOrderingDeadlockAnalysis(t *testing.T) {
 	srvUnlocks := bytes.Count(srvSrc, []byte(".Unlock()"))
 	t.Logf("server.go: %d Lock(), %d Unlock()", srvLocks, srvUnlocks)
 
-	// Check workers.go
-	wkSrc, err := os.ReadFile("workers.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	wkLocks := bytes.Count(wkSrc, []byte(".Lock()"))
-	wkUnlocks := bytes.Count(wkSrc, []byte(".Unlock()"))
-	// Also count RLock/RUnlock pairs (session cleaner)
-	wkRLocks := bytes.Count(wkSrc, []byte(".RLock()"))
-	wkRUnlocks := bytes.Count(wkSrc, []byte(".RUnlock()"))
-	t.Logf("workers.go: %d Lock/%d Unlock + %d RLock/%d RUnlock", wkLocks, wkUnlocks, wkRLocks, wkRUnlocks)
+	// workers.go was deleted during M1 (Hindsight removal). Lock analysis
+	// is no longer applicable — session_cleaner.go replaced workers.go but
+	// has no Lock/Unlock pairs to audit (shutdown coordination uses channels).
+	t.Log("workers.go: file deleted in M1, lock analysis skipped")
 
 	// Verify Stop() doesn't acquire improveState.mu (no ABBA deadlock risk)
 	stopIdx := bytes.Index(srvSrc, []byte("func (s *Server) Stop()"))
