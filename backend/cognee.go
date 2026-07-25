@@ -8,21 +8,27 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"regexp"
+	"strconv"
 	"time"
 )
+
+var yearRE = regexp.MustCompile(`\b(19|20)\d{2}\b`)
 
 // CogneeBackend implements the Backend interface for Cognee (Python and Rust).
 // Both variants expose identical REST APIs — only the subprocess binary differs.
 type CogneeBackend struct {
-	baseURL        string
-	httpClient     *http.Client
-	breaker        *CircuitBreaker
-	retryAttempts  int
-	retryDelay     time.Duration
-	retryMaxDelay  time.Duration
-	retainTimeout  time.Duration
-	recallTimeout  time.Duration
-	reflectTimeout time.Duration
+	baseURL         string
+	httpClient      *http.Client
+	breaker         *CircuitBreaker
+	retryAttempts   int
+	retryDelay      time.Duration
+	retryMaxDelay   time.Duration
+	retainTimeout   time.Duration
+	recallTimeout   time.Duration
+	reflectTimeout  time.Duration
+	temporalCognify bool
+	memoryOnly      bool
 }
 
 // Compile-time interface assertion.
@@ -36,15 +42,17 @@ func newCogneeBackend(cfg BackendConfig) *CogneeBackend {
 		clientTimeout = cfg.CogneeRetainTimeout
 	}
 	return &CogneeBackend{
-		baseURL:        fmt.Sprintf("http://localhost:%s", cfg.CogneePort),
-		httpClient:     &http.Client{Timeout: clientTimeout},
-		breaker:        NewCircuitBreaker(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerCooldown),
-		retryAttempts:  cfg.RetryAttempts,
-		retryDelay:     cfg.RetryDelay,
-		retryMaxDelay:  cfg.RetryMaxDelay,
-		retainTimeout:  cfg.BackendRetainTimeout,
-		recallTimeout:  cfg.BackendRecallTimeout,
-		reflectTimeout: cfg.BackendReflectTimeout,
+		baseURL:         fmt.Sprintf("http://localhost:%s", cfg.CogneePort),
+		httpClient:      &http.Client{Timeout: clientTimeout},
+		breaker:         NewCircuitBreaker(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerCooldown),
+		retryAttempts:   cfg.RetryAttempts,
+		retryDelay:      cfg.RetryDelay,
+		retryMaxDelay:   cfg.RetryMaxDelay,
+		retainTimeout:   clientTimeout,
+		recallTimeout:   cfg.BackendRecallTimeout,
+		reflectTimeout:  clientTimeout,
+		temporalCognify: cfg.TemporalCognify,
+		memoryOnly:      cfg.MemoryOnly,
 	}
 }
 
@@ -83,6 +91,13 @@ func (c *CogneeBackend) Retain(ctx context.Context, bank string, content string)
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 	_ = writer.WriteField("datasetName", bank)
+	_ = writer.WriteField("temporalCognify", strconv.FormatBool(c.temporalCognify))
+
+	// Auto-stamp current date if content lacks a year, so temporal_cognify
+	// can build a timeline even for undated facts.
+	if !yearRE.MatchString(content) {
+		content = content + " [" + time.Now().Format("2006-01-02") + "]"
+	}
 	part, err := writer.CreateFormFile("data", "data.txt")
 	if err != nil {
 		return "", fmt.Errorf("create form file: %w", err)
@@ -166,7 +181,7 @@ func (c *CogneeBackend) Forget(ctx context.Context, bank string, contentID strin
 	payload := map[string]interface{}{
 		"dataset":     bank,
 		"data_id":     contentID,
-		"memory_only": true,
+		"memory_only": c.memoryOnly,
 	}
 	data, _ := json.Marshal(payload)
 

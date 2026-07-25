@@ -113,6 +113,8 @@ type Config struct {
 	CogneeEmbeddingProvider  string        // COGNEE_EMBEDDING_PROVIDER (default "openai")
 	CogneeMaxConcurrentRetains int         // COGNEE_MAX_CONCURRENT_RETAINS, default 10
 	CogneeRetainTimeout      time.Duration // COGNEE_RETAIN_TIMEOUT, default 900s (15 min)
+	TemporalCognify          bool          // COGNEE_TEMPORAL_COGNIFY, default true
+	MemoryOnly               bool          // COGNEE_MEMORY_ONLY, default true
 
 	// Auto-improve
 	AutoImproveAfterN  int           // AUTO_IMPROVE_AFTER_N, 0=disabled, default 0
@@ -232,6 +234,8 @@ func LoadConfig() Config {
 		CogneeEmbeddingProvider:  getEnv("COGNEE_EMBEDDING_PROVIDER", "openai"),
 		CogneeMaxConcurrentRetains: getEnvInt("COGNEE_MAX_CONCURRENT_RETAINS", 10),
 		CogneeRetainTimeout:      getEnvDuration("COGNEE_RETAIN_TIMEOUT", 900*time.Second),
+		TemporalCognify:          getEnvBool("COGNEE_TEMPORAL_COGNIFY", true),
+		MemoryOnly:               getEnvBool("COGNEE_MEMORY_ONLY", true),
 
 		// Auto-improve
 		AutoImproveAfterN:  getEnvInt("AUTO_IMPROVE_AFTER_N", 0),
@@ -266,6 +270,14 @@ func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
 		log.Printf("WARN: invalid duration for %s=%q, using default %v", key, v, defaultValue)
 	}
 	return defaultValue
+}
+
+func getEnvBool(key string, defaultValue bool) bool {
+	v := strings.ToLower(os.Getenv(key))
+	if v == "" {
+		return defaultValue
+	}
+	return v == "true" || v == "1" || v == "yes"
 }
 
 // clampDuration returns d if d >= min, otherwise returns min.

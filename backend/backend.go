@@ -50,6 +50,9 @@ type BackendConfig struct {
 	RetryMaxDelay         time.Duration
 	CircuitBreakerThreshold int
 	CircuitBreakerCooldown  time.Duration
+	// Cognee-specific feature flags (env: COGNEE_TEMPORAL_COGNIFY, COGNEE_MEMORY_ONLY)
+	TemporalCognify bool
+	MemoryOnly      bool
 }
 
 // New creates the appropriate Backend based on the config.

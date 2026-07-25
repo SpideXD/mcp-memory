@@ -98,6 +98,8 @@ func NewServer(config Config) *Server {
 		RetryMaxDelay:           config.RetryMaxDelay,
 		CircuitBreakerThreshold: config.CircuitBreakerThreshold,
 		CircuitBreakerCooldown:  config.CircuitBreakerCooldown,
+		TemporalCognify:         config.TemporalCognify,
+		MemoryOnly:              config.MemoryOnly,
 	}
 
 	s := &Server{

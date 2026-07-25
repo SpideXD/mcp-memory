@@ -1,35 +1,47 @@
 LLAMA_VERSION ?= b10085
 LLAMA_DIR := bin/llama
+COGNEE_BINARY := bin/cognee-http-server
 
-.PHONY: setup run build clean test stop vet download-llama download-models
+.PHONY: setup run build clean test stop vet download-llama download-models build-cognee
 
 MODEL_DIR := model
 EMBED_MODEL := $(MODEL_DIR)/qwen3-embedding-0.6b-Q8_0.gguf
-RERANK_MODEL := $(MODEL_DIR)/bge-reranker-base-Q4_k_m.gguf
 
 # Hugging Face download URLs
 EMBED_URL := https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf
-RERANK_URL := https://huggingface.co/sinjab/bge-reranker-base-Q4_K_M-GGUF/resolve/main/bge-reranker-base-Q4_K_M.gguf
 
 setup:
-	@command -v python3 >/dev/null 2>&1 || { echo "Error: python3 is required but not installed."; exit 1; }
-	@test -d .venv || python3 -m venv .venv
-	.venv/bin/pip install 'hindsight-api-slim[embedded-db]==0.8.2' && \
-	.venv/bin/pip install hindsight-client==0.8.2
-	@$(MAKE) download-llama
-	@$(MAKE) download-models
+	@command -v go >/dev/null 2>&1 || { echo "Error: go is required but not installed."; exit 1; }
+	@command -v cargo >/dev/null 2>&1 || { echo "Error: cargo is required but not installed. Install from https://rustup.rs"; exit 1; }
+	git submodule update --init --recursive
+	$(MAKE) download-llama
+	$(MAKE) download-models
+	$(MAKE) build-cognee
 
 run:
 	@if [ ! -x $(LLAMA_DIR)/llama-server ]; then \
 		echo "Hint: run 'make setup' to download llama-server, or install it system-wide and ensure it's on PATH."; \
+	fi
+	@if [ ! -x $(COGNEE_BINARY) ]; then \
+		echo "Hint: run 'make build-cognee' to build the Cognee Rust binary."; \
 	fi
 	go run .
 
 build:
 	go build -o bin/mcp-memory .
 
+build-cognee:
+	@if [ ! -d cognee-rs ]; then \
+		echo "cognee-rs submodule not found. Run: git submodule update --init --recursive"; \
+		exit 1; \
+	fi
+	cd cognee-rs && cargo build --release -p cognee-http-server
+	cp cognee-rs/target/release/cognee-http-server $(COGNEE_BINARY)
+	@echo "Cognee Rust binary built: $(COGNEE_BINARY)"
+
 clean:
-	rm -rf .venv bin/mcp-memory mcp-memory $(LLAMA_DIR)
+	rm -rf bin/mcp-memory $(COGNEE_BINARY) $(LLAMA_DIR)
+	cd cognee-rs && cargo clean 2>/dev/null || true
 
 test:
 	go test -race -count=1 -timeout 240s ./...
@@ -72,13 +84,6 @@ download-models:
 		echo "Embedding model downloaded."; \
 	else \
 		echo "Embedding model already present: $(EMBED_MODEL)"; \
-	fi
-	@if [ ! -f $(RERANK_MODEL) ]; then \
-		echo "Downloading reranker model (209MB)..."; \
-		curl -fSL --connect-timeout 30 --max-time 600 -o $(RERANK_MODEL) "$(RERANK_URL)"; \
-		echo "Reranker model downloaded."; \
-	else \
-		echo "Reranker model already present: $(RERANK_MODEL)"; \
 	fi
 
 stop:

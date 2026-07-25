@@ -591,26 +591,49 @@ func (svc *services) startHindsight() error {
 	return nil
 }
 
-// cogneeEnv returns the shared env var block for Cognee subprocesses.
-// Deduplicates the mapping between startCogneePython and startCogneeRust.
-func (svc *services) cogneeEnv() []string {
+// cogneeBaseEnv returns shared env vars common to both Cognee Python and Rust.
+func (svc *services) cogneeBaseEnv() []string {
 	return append(os.Environ(),
-		// LLM config — uses Cognee-specific config fields (P2-C5 fix)
+		// LLM config
 		"LLM_API_KEY="+svc.config.CogneeLLMApiKey,
 		"LLM_MODEL="+svc.config.CogneeLLMModel,
 		"LLM_ENDPOINT="+svc.config.CogneeLLMEndpoint,
 		"LLM_PROVIDER=openai",
 		// Embedding config
 		"EMBEDDING_ENDPOINT="+svc.config.CogneeEmbeddingEndpoint,
-		"EMBEDDING_PROVIDER="+svc.config.CogneeEmbeddingProvider,
 		"EMBEDDING_API_KEY=not-needed",
+		"EMBEDDING_DIMENSIONS=1024",
 		// Data isolation
 		"COGNEE_DATA_DIR="+svc.config.CogneeDataDir,
 		"HTTP_API_PORT="+svc.config.CogneePort,
-		// Database providers (defaults in env, overridable by user)
+		// Database providers
 		"COGNEE_DB_PROVIDER="+getEnvOrDefault("COGNEE_DB_PROVIDER", "sqlite"),
-		"COGNEE_VECTOR_DB_PROVIDER="+getEnvOrDefault("COGNEE_VECTOR_DB_PROVIDER", "lancedb"),
-		"COGNEE_GRAPH_DB_PROVIDER="+getEnvOrDefault("COGNEE_GRAPH_DB_PROVIDER", "ladybug"),
+		"VECTOR_DB_PROVIDER="+getEnvOrDefault("COGNEE_VECTOR_DB_PROVIDER", "lancedb"),
+		"GRAPH_DB_PROVIDER="+getEnvOrDefault("COGNEE_GRAPH_DB_PROVIDER", "ladybug"),
+		"ENABLE_BACKEND_ACCESS_CONTROL=false",
+	)
+}
+
+// cogneePythonEnv returns env vars for the Cognee Python (uvicorn) subprocess.
+// Uses instructor JSON mode to avoid tool_choice incompatibility with DeepSeek.
+func (svc *services) cogneePythonEnv() []string {
+	return append(svc.cogneeBaseEnv(),
+		"LLM_INSTRUCTOR_MODE=json_mode",
+		"EMBEDDING_PROVIDER=llama_cpp",
+		"COGNEE_SKIP_CONNECTION_TEST=true",
+	)
+}
+
+// cogneeRustEnv returns env vars for the Cognee Rust (http-server) subprocess.
+// Uses openai_compatible embedding provider (Rust does not support llama_cpp).
+func (svc *services) cogneeRustEnv() []string {
+	dataDir := svc.config.CogneeDataDir
+	return append(svc.cogneeBaseEnv(),
+		"EMBEDDING_PROVIDER=openai_compatible",
+		"EMBEDDING_MODEL_NAME=qwen3-embedding-0.6b",
+		// Rust binary uses DATA_ROOT_DIRECTORY / SYSTEM_ROOT_DIRECTORY
+		"DATA_ROOT_DIRECTORY="+dataDir+"/data",
+		"SYSTEM_ROOT_DIRECTORY="+dataDir+"/system",
 	)
 }
 
@@ -620,7 +643,7 @@ func (svc *services) startCogneePython() error {
 	cmd := exec.Command(pythonPath, "-m", "uvicorn", "cognee.api.client:app",
 		"--host", "0.0.0.0", "--port", svc.config.CogneePort)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = svc.cogneeEnv()
+	cmd.Env = svc.cogneePythonEnv()
 
 	wd, _ := os.Getwd()
 	f, _ := os.OpenFile(filepath.Join(wd, "logs", "cognee-crash.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -645,7 +668,7 @@ func (svc *services) startCogneeRust() error {
 
 	cmd := exec.Command(binaryPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = svc.cogneeEnv()
+	cmd.Env = svc.cogneeRustEnv()
 
 	wd, _ := os.Getwd()
 	f, _ := os.OpenFile(filepath.Join(wd, "logs", "cognee-crash.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)

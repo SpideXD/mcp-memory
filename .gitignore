@@ -3,6 +3,8 @@
 
 # Secrets
 .env
+.env.cognee
+.env.cognee-rust
 
 # Python virtual environment
 .venv/
@@ -19,6 +21,9 @@ logs/*
 
 # macOS
 .DS_Store
+
+# Cognee backend source (reference, not compiled into release)
+cognee-python/
 
 # SDLC development artifacts
 .agents/

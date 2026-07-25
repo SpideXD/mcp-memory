@@ -25,6 +25,8 @@ func main() {
 		os.MkdirAll(filepath.Join(wd, "logs"), 0755)
 	}
 	loadEnv()
+	// Load backend-specific env file (overrides .env values)
+	loadEnvFile(backendEnvFile())
 	cleanupOrphans()  // Kill orphans from previous crash
 	config := LoadConfig()
 	if err := config.Validate(); err != nil {
@@ -111,10 +113,26 @@ func main() {
 	}
 }
 
+// backendEnvFile returns the backend-specific .env filename based on BACKEND.
+func backendEnvFile() string {
+	switch os.Getenv("BACKEND") {
+	case "cognee-python":
+		return ".env.cognee"
+	case "cognee-rust":
+		return ".env.cognee-rust"
+	default:
+		return ""
+	}
+}
+
 // loadEnv reads .env file and sets environment variables.
 // Does NOT overwrite already-set environment variables.
-func loadEnv() {
-	envFile := ".env"
+func loadEnv() { loadEnvFile(".env") }
+
+func loadEnvFile(envFile string) {
+	if envFile == "" {
+		return
+	}
 	if _, err := os.Stat(envFile); os.IsNotExist(err) {
 		return
 	}
