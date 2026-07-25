@@ -37,8 +37,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	// Compute composite status based on actual service health
-	llama, reranker, hindsight := s.svc.allHealthy()
-	allHealthy := llama && reranker && hindsight
+	llama, cognee := s.svc.allHealthy()
+	allHealthy := llama && cognee
 
 	status := state
 	if state == "running" && !allHealthy {
@@ -48,29 +48,20 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// Build list of down services
 	var down []string
 	if !llama { down = append(down, "llama (embedder)") }
-	if !reranker { down = append(down, "llama (reranker)") }
-	if !hindsight { down = append(down, "hindsight") }
+	if !cognee { down = append(down, "cognee") }
 	if down == nil { down = []string{} } // Prevent JSON null
 	s.sessionsMu.RLock()
 	n := len(s.sessions)
 	s.sessionsMu.RUnlock()
 
-	retainStats := s.workers.retainPool.Stats()
-	reflectStats := s.workers.reflectPool.Stats()
-
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":          status,
 		"version":         Version,
 		"built":           BuildTime,
-		"hindsight":       hindsight,
 		"llama":           llama,
-		"reranker":        reranker,
+		"cognee":          cognee,
 		"down":            down,
-		"queue_depth":     len(s.workers.retainJobs) + len(s.workers.reflectJobs),
-		"retain_workers":  retainStats["workers"],
-		"retain_panics":   retainStats["panics"],
-		"reflect_workers": reflectStats["workers"],
-		"reflect_panics":  reflectStats["panics"],
+		"queue_depth":     0,
 		"sessions":        n,
 		"sse_drops":       s.metrics.sseDrops.Value(),
 		"uptime":          time.Since(s.startTime).String(),

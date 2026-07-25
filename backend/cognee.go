@@ -44,7 +44,7 @@ func newCogneeBackend(cfg BackendConfig) *CogneeBackend {
 	return &CogneeBackend{
 		baseURL:         fmt.Sprintf("http://localhost:%s", cfg.CogneePort),
 		httpClient:      &http.Client{Timeout: clientTimeout},
-		breaker:         NewCircuitBreaker(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerCooldown),
+		breaker:         NewCircuitBreaker(5, 30*time.Second),
 		retryAttempts:   cfg.RetryAttempts,
 		retryDelay:      cfg.RetryDelay,
 		retryMaxDelay:   cfg.RetryMaxDelay,
@@ -59,8 +59,6 @@ func newCogneeBackend(cfg BackendConfig) *CogneeBackend {
 // Name returns "cognee".
 func (c *CogneeBackend) Name() string { return "cognee" }
 
-// IsSync returns false — Cognee operations are dispatched in detached goroutines.
-func (c *CogneeBackend) IsSync() bool { return false }
 
 // Health checks Cognee API connectivity. GET /health
 func (c *CogneeBackend) Health(ctx context.Context) error {

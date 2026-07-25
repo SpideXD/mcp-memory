@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"sync/atomic"
 	"time"
 )
@@ -45,17 +44,3 @@ func (s *MCPSession) IsClosed() bool {
 	return s.closed.Load()
 }
 
-// MemoryJob is a work item for the channel worker pool.
-type MemoryJob struct {
-	Bank    string
-	Method  string // "retain" or "reflect"
-	Data    string
-	Result  chan MemoryResult
-	Ctx     context.Context    // cancelled when queueJob times out
-	Cancel  context.CancelFunc // called by queueJob on timeout
-}
-
-type MemoryResult struct {
-	Data string
-	Err  error
-}

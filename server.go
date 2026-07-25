@@ -24,7 +24,6 @@ type Server struct {
 	sessions   map[string]*MCPSession
 	sessionsMu sync.RWMutex
 
-	workers     *workerSystem
 	panics      atomic.Int64
 	stopMonitor context.CancelFunc
 	shutdown    chan struct{}
@@ -40,7 +39,7 @@ type Server struct {
 	log     *logger.Logger
 	metrics *serverMetrics
 
-	// Cognee-only fields — nil when BACKEND=hindsight
+	// Cognee infrastructure
 	cogneeSemaphore chan struct{} // buffered, bounds concurrent retains
 	jobTracker      *jobTracker  // in-memory job result map + TTL cleanup
 	cogneeCtx       context.Context    // cancelled on Stop() for goroutine coordination
@@ -87,7 +86,6 @@ func NewServer(config Config) *Server {
 
 	backendCfg := backend.BackendConfig{
 		Backend:                 string(config.Backend),
-		HindsightPort:           config.HindsightPort,
 		CogneePort:              config.CogneePort,
 		BackendRetainTimeout:    config.BackendRetainTimeout,
 		BackendRecallTimeout:    config.BackendRecallTimeout,
@@ -96,8 +94,6 @@ func NewServer(config Config) *Server {
 		RetryAttempts:           config.RetryAttempts,
 		RetryDelay:              config.RetryDelay,
 		RetryMaxDelay:           config.RetryMaxDelay,
-		CircuitBreakerThreshold: config.CircuitBreakerThreshold,
-		CircuitBreakerCooldown:  config.CircuitBreakerCooldown,
 		TemporalCognify:         config.TemporalCognify,
 		MemoryOnly:              config.MemoryOnly,
 	}
@@ -108,7 +104,6 @@ func NewServer(config Config) *Server {
 		backend:  backend.New(backendCfg),
 		svc:      newServices(config, blog, alertClient),
 		sessions: make(map[string]*MCPSession),
-		workers:  newWorkerSystem(config, blog),
 		log:      blog,
 		shutdown: make(chan struct{}),
 		alerts:   alertClient,
@@ -134,15 +129,13 @@ func NewServer(config Config) *Server {
 		},
 	}
 
-	// Cognee infrastructure exists iff backend is async
-	if !s.backend.IsSync() {
-		s.cogneeSemaphore = make(chan struct{}, config.CogneeMaxConcurrentRetains)
-		s.jobTracker = newJobTracker(30 * time.Minute)
-		s.cogneeCtx, s.cogneeCancel = context.WithCancel(context.Background())
-		s.dataDir = getEnv("DATA_DIR", "./data")
-		s.improveState = loadAutoImproveState(s.dataDir)
-		go s.jobTrackerCleanup()
-	}
+	// Cognee infrastructure — always constructed
+	s.cogneeSemaphore = make(chan struct{}, config.CogneeMaxConcurrentRetains)
+	s.jobTracker = newJobTracker(30 * time.Minute)
+	s.cogneeCtx, s.cogneeCancel = context.WithCancel(context.Background())
+	s.dataDir = getEnv("DATA_DIR", "./data")
+	s.improveState = loadAutoImproveState(s.dataDir)
+	go s.jobTrackerCleanup()
 
 	return s
 }
@@ -168,7 +161,7 @@ func (s *Server) Start() error {
 	}
 	s.svc.savePids()  // Persist child PIDs for crash recovery
 
-	s.workers.start(s)
+	go s.sessionCleaner()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go s.svc.monitor(ctx, &s.panics)
@@ -216,8 +209,6 @@ func (s *Server) Stop() {
 		s.cogneeWg.Wait()
 		s.log.Info("all cognee goroutines drained")
 	}
-
-	s.workers.stop()
 
 	s.sessionsMu.Lock()
 	for id, sess := range s.sessions {
