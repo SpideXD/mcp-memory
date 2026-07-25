@@ -154,3 +154,78 @@ The data race was CAUGHT by the race detector, proving B4 is a genuine data race
 | B4 | `store.go:285,307,321` | Get/CountByStatus/Stats read `s.closed` without acquiring `s.mu`. Add RLock-style access or acquire mu. |
 | B5 | `store.go:388` | Recover() doesn't check `s.closed` before operating on `s.db`. Add early return if closed. |
 | B6 | `store.go:251-264` | UpdateStatus with StatusFailed unconditionally increments retry_count. Add state validation or document behavior. |
+
+---
+
+# Tester Report — M2 Pass 3: Chaos & Fuzz Final
+
+**Tester**: Pass 3 — Chaos & Fuzz
+**Date**: 2026-07-26  
+**File**: `queue/tester_pass3_test.go`
+
+## Summary
+
+Executed 8 chaos/fuzz tests targeting resource exhaustion, concurrency storms, and lifecycle edge cases. **Zero new bugs found (B7 candidates all pass).**
+
+### Chaos Test Results
+
+| # | Test | Duration | Result | Notes |
+|----|------|----------|--------|-------|
+| C1 | Rapid start/stop cycles (x50) | 10.49s | PASS | 0 goroutine leak (baseline=3, after=3). No panic or deadlock. Store functional after cycles. |
+| C2 | Disk full simulation | 0.05s | PASS | NewStore in read-only dir returns graceful error. Operations after DB file deletion do NOT panic (modernc caches in memory). 1MB payloads insert OK. |
+| C3 | 1000 concurrent inserts | 2.25s | PASS | 1000/1000 succeeded. 0 failures. 0 duplicates detected. Payload integrity verified. |
+| C4 | 100 concurrent NextPending | 0.08s | PASS | Exactly 1 of 100 goroutines claimed the single job (race-safe). All 100 got nil on empty queue. |
+| C5 | Worker storm (50 workers, SemSize=1, 200 jobs) | 0.69s | PASS | All 200 jobs completed in 341ms (586 jobs/sec). FIFO claim order via NextPending. |
+| C6 | Context cancellation during processing | 0.22s | PASS | 0 goroutine leak. Workers exited cleanly. Jobs retried from failed→pending via CanRetry(). |
+| C7 | Stats under fire (20 inserters + workers, 100 Stats calls) | 1.96s | PASS | No panic. No negative or impossible values. All stats internally consistent. |
+| C8 | Memory after 10K jobs | 147.31s | PASS | HeapAlloc delta: -5KB (returned to baseline after GC). TotalAlloc: ~4KB/job (allocation overhead, not leak). No unbounded growth. |
+
+### Key Findings
+
+**C1 (Rapid cycles)**: 50 consecutive Start→Stop→Start→Stop cycles leave zero goroutine leak. The Worker's idempotent Start() and Stop() correctly handle repeated lifecycle transitions. Mutex-guarded cancel field prevents double-close panic.
+
+**C2 (Disk full)**: 
+- `NewStore` on a read-only directory returns a graceful error (`apply pragma: unable to open database file`), not a panic.
+- After DB file deletion, the modernc.org/sqlite driver continues to operate using cached in-memory state. Operations succeed without panic. This is a design characteristic of the driver, not a bug — once the connection is established, the driver holds its own file handle.
+- Large payloads (1KB through 1MB) insert and retrieve correctly on file-backed stores.
+
+**C3 (1000 concurrent inserts)**: All 1000 goroutines successfully inserted their jobs. No duplicate IDs (PRIMARY KEY constraint enforced by SQLite). No lost jobs — `Get()` found every successfully-inserted job with correct payload.
+
+**C4 (100 concurrent NextPending)**: The mutex-based serialization in NextPending correctly prevents duplicate claims under extreme contention. Exactly 1 of 100 goroutines got the job. The remaining 99 correctly received `nil, nil`.
+
+**C5 (Worker storm)**: With 50 workers and SemSize=1, the semaphore correctly limits concurrent processing to exactly 1. All 200 jobs completed at 586 jobs/sec. Jobs are claimed in NextPending order (ORDER BY created_at ASC + mutex serialization).
+
+**C6 (Context cancellation)**: Workers exit cleanly when the pool context is cancelled mid-processing. The processFunc receives the cancelled context and returns ctx.Err(). The worker's error handling path correctly marks the job as failed, increments retry_count, and re-queues for retry via CanRetry(). Zero goroutine leak after Stop().
+
+**C7 (Stats consistency)**: Under 20 concurrent inserters + 5 workers + 100 Stats calls, no panic occurred. No negative counts or impossible values. Stats() without mutex protection (by design) may show eventual inconsistency, but all values are valid.
+
+**C8 (Memory)**: 10K jobs inserted and processed. HeapAlloc returned to baseline after GC (-5KB delta). TotalAlloc of ~4KB/job reflects per-job allocation overhead (Job struct + payload + Go runtime + SQLite internals). No unbounded memory growth detected. After Close() + GC, memory fully returns to baseline.
+
+### Notable Design Observations
+
+1. **Context cancellation → retry**: When the worker pool context is cancelled during processing, a job that receives `ctx.Err()` from ProcessFunc is treated as a failure and retried (failed→pending). An alternative design would leave it as `running` for startup recovery. Current behavior is valid but worth noting.
+
+2. **modernc.org/sqlite file caching**: After deleting the DB file, operations continue to succeed because the driver caches state in memory. If the process restarts, the data is lost. This is a property of the pure-Go SQLite driver.
+
+3. **Insert throughput**: `:memory:` insertion of 10K jobs took ~135 seconds (74 jobs/sec). This is a known performance characteristic of modernc.org/sqlite compared to C SQLite. For production, file-backed store with WAL mode may have different performance characteristics.
+
+### Test Execution
+
+```
+$ go test -race -count=1 -timeout 240s -run 'TestChaos' ./queue/...
+ok  mcp-memory/queue  164.573s
+```
+
+All 8 chaos tests PASS with zero races.
+
+### Verdict
+
+**PASS** — Zero new bugs found. All 8 chaos scenarios handled gracefully.
+
+| Test | Verdict | Bugs Found |
+|------|---------|-----------|
+| Pass 1 (Adversarial) | FAIL | B1 (CRITICAL), B2 (HIGH), B3 (MEDIUM) |
+| Pass 2 (Deep Edge) | FAIL | B4 (HIGH), B5 (MEDIUM), B6 (MEDIUM) |
+| Pass 3 (Chaos Final) | **PASS** | **Zero new bugs** |
+
+**M2 PASS 3: NO NEW BUGS**
