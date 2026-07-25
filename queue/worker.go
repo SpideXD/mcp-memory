@@ -94,11 +94,6 @@ func (w *Worker) Stop() {
 // workerLoop is the main loop for a single worker goroutine.
 func (w *Worker) workerLoop(ctx context.Context, id int) {
 	defer w.wg.Done()
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("queue: worker %d panicked: %v", id, r)
-		}
-	}()
 
 	for {
 		select {
@@ -107,16 +102,24 @@ func (w *Worker) workerLoop(ctx context.Context, id int) {
 		default:
 		}
 
+		// Wrap work in closure so panic recovery keeps the worker alive
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("queue: worker %d panicked: %v", id, r)
+				}
+			}()
+
 		job, err := w.store.NextPending()
 		if err != nil {
 			log.Printf("queue: worker %d NextPending error: %v", id, err)
 			time.Sleep(100 * time.Millisecond)
-			continue
+			return
 		}
 		if job == nil {
 			// Empty queue — backoff
 			time.Sleep(100 * time.Millisecond)
-			continue
+			return
 		}
 
 		// Acquire semaphore (B1 fix: use helper function so defer runs per-iteration)
@@ -127,6 +130,7 @@ func (w *Worker) workerLoop(ctx context.Context, id int) {
 		}
 
 		w.processWithSemaphore(ctx, job)
+		}()
 	}
 }
 
