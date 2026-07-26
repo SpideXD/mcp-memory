@@ -1,436 +1,589 @@
-# M4 Spec: Auto-Reflect Scheduling
+# M5 Spec: Cleanup + Production Readiness
 
-**Status:** Draft | **Date:** 2026-07-23 | **Module:** M4 (additive to M3 queue system)
-
----
-
-## 1. Goal
-
-Add automatic reflect-job triggers into the M3 SQLite queue system. After N successful retains for a given memory bank, OR after X hours have elapsed since the last auto-reflect (whichever comes first), the system automatically inserts a `type="reflect"` job with payload `"_auto"` into the SQLite queue. This is a pure additive feature — no modifications to handlers, queue internals, or the backend interface.
+**Status:** FINAL
+**Module:** M5 (Final)
+**Dependencies:** M3 (queue), M4 (auto-reflect) must be complete
+**Estimated scope:** ~200 lines net new code, ~300 lines doc changes, ~5 lines deleted
 
 ---
 
-## 2. Module Decomposition
+## Goal
 
-This is a single module (Extra Small — one new file, two file modifications). No sub-module decomposition needed.
-
-### 2.1 Files to Create
-
-| # | File | Purpose |
-|---|------|---------|
-| 1 | `auto_reflect.go` | Per-bank reflect state tracking, trigger logic, `checkAutoReflect(bank)` method on `*Server` |
-
-### 2.2 Files to Modify
-
-| # | File | Change |
-|---|------|--------|
-| 1 | `config.go` | Add `AutoReflectAfterN` and `AutoReflectTimeout` fields to `Config` struct and `LoadConfig()` |
-| 2 | `server.go` | Add `reflectStates sync.Map` field to `Server` struct; add one call to `s.checkAutoReflect(job.Bank)` in `processQueueJob` after `s.maybeAutoImprove(job.Bank)` |
+M5 is the final polish and cleanup module. No new architectural components. Eight discrete sub-tasks that prepare the codebase for production: a debug endpoint, dead-letter webhook, env template finalization, doc rewrites, structured job logging, stale comment removal, a stale file deletion, and a final vet pass.
 
 ---
 
-## 3. Data Model
+## Module Decomposition
 
-### 3.1 reflectState
+Since all M5 tasks are independent and touch disjoint code areas, they are listed as a flat checklist. The coder implements all 8 tasks in sequence, and the tester verifies them all in a single batch.
 
-```go
-// reflectState tracks auto-reflect triggers for a single memory bank.
-// Safe for concurrent use — all field access is guarded by mu.
-type reflectState struct {
-    mu          sync.Mutex
-    retainCount int       // successful retains since last auto-reflect
-    lastReflect time.Time // time of last auto-reflect trigger (UTC)
+| # | Task | Files Touched |
+|---|------|---------------|
+| 1 | GET /debug/queue endpoint | `main.go`, `handlers.go`, `server.go` |
+| 2 | Dead-letter webhook on StatusDead | `queue/worker.go` |
+| 3 | .env.example finalization | `.env.example` |
+| 4 | Docs update | `docs/architecture.md`, `docs/deployment.md`, `docs/development.md` |
+| 5 | Structured job logging | `handlers.go`, `server.go` (`processQueueJob`) |
+| 6 | Stale comment removal | `config.go`, `backend/doRequest.go`, `auto_improve.go`, `session_cleaner.go` |
+| 7 | Delete .anon_id | `.anon_id` |
+| 8 | Final vet pass | `go vet ./...` |
+
+---
+
+## Task 1: GET /debug/queue Endpoint
+
+### Purpose
+
+Expose live queue state as JSON for operational monitoring. No authentication required (same as /health).
+
+### Route
+
+```
+GET /debug/queue
+```
+
+Registered in `main.go` mux alongside existing routes.
+
+### Response JSON Schema
+
+```json
+{
+  "pending": 42,
+  "running": 3,
+  "completed_total": 1503,
+  "failed_total": 12,
+  "dead_total": 5,
+  "oldest_pending_age_s": 127.5,
+  "workers": 4,
+  "max_concurrent": 3,
+  "db_size_kb": 512
 }
 ```
 
-- **Fields are NOT exported.** All access goes through methods on `reflectState`.
-- **Zero-value meaning:** A zero-value `reflectState` (retainCount=0, lastReflect=time.Time{}) means the bank has never had an auto-reflect triggered. The timeout trigger is suppressed when retainCount==0, and time.Time{}.IsZero() causes the timeout branch to behave correctly: `time.Since(zeroTime)` is a large positive duration, so the first retain after startup with timeout enabled will fire the timeout trigger if the timeout has elapsed since epoch. **Mitigation:** Initialize `lastReflect` to `time.Now()` on first LoadOrStore so timeout starts counting from server start, not epoch.
+### Field Definitions
 
-### 3.2 Server field
+| Field | Type | Source |
+|-------|------|--------|
+| `pending` | int | `s.queueStore.Stats().Pending` |
+| `running` | int | `s.queueStore.Stats().Running` |
+| `completed_total` | int | `s.queueStore.Stats().Completed` |
+| `failed_total` | int | `s.queueStore.Stats().Failed` |
+| `dead_total` | int | `s.queueStore.Stats().Dead` |
+| `oldest_pending_age_s` | float64 | `time.Now().Unix() - stats.OldestPending`, 0 if no pending |
+| `workers` | int | `s.config.QueueWorkerCount` |
+| `max_concurrent` | int | `s.config.QueueMaxConcurrent` |
+| `db_size_kb` | int | `os.Stat(s.config.QueueDBPath).Size() / 1024`, 0 if missing |
 
-Add to `Server` struct in `server.go`:
+### Null-Safety
 
-```go
-// Auto-reflect state
-reflectStates sync.Map // map[string]*reflectState — per-bank reflect tracking
+If `s.queueStore` is nil (server starting/shutting down), return:
+```json
+{"pending":0,"running":0,"completed_total":0,"failed_total":0,"dead_total":0,"oldest_pending_age_s":0,"workers":0,"max_concurrent":0,"db_size_kb":0}
 ```
 
-- **`sync.Map` chosen per mission design.** LoadOrStore provides atomic get-or-create semantics. The per-entry `reflectState.mu` protects the mutable fields (retainCount, lastReflect). No additional package-level or server-level mutex is needed for the map itself.
-- **Callers provide no synchronization beyond calling the exported method.**
+### DB Size Computation
 
-### 3.3 Config fields
+Use `os.Stat(s.config.QueueDBPath)` with error handling. If stat fails (file missing, permissions), set `db_size_kb` to 0. Do nothing else — no error response, no logging.
 
-Add to `Config` struct in `config.go`:
+### Implementation
 
-```go
-// Auto-reflect
-AutoReflectAfterN int           // AUTO_REFLECT_AFTER_N, 0=disabled, default 10
-AutoReflectTimeout time.Duration // AUTO_REFLECT_TIMEOUT, 0=disabled, default 6h
-```
-
-Add to `LoadConfig()`:
+Add a method `handleDebugQueue` on `*Server` in `handlers.go`. The method signature:
 
 ```go
-AutoReflectAfterN:  getEnvInt("AUTO_REFLECT_AFTER_N", 10),
-AutoReflectTimeout: getEnvDuration("AUTO_REFLECT_TIMEOUT", 6*time.Hour),
+func (s *Server) handleDebugQueue(w http.ResponseWriter, r *http.Request)
 ```
 
-**Validation rules (applied inline, not in `Validate()`):**
+- Method check: only GET, return 405 otherwise
+- Content-Type: `application/json`
+- Build response using `map[string]interface{}`
+- `json.NewEncoder(w).Encode(response)`
+- No auth check — same as `/health`
 
-| Field | Rule | Invalid Behavior |
-|-------|------|------------------|
-| `AutoReflectAfterN` | negative → clamped to 0 (disabled) | Applied in `checkAutoReflect` |
-| `AutoReflectTimeout` | negative → clamped to 0 (disabled) | Applied in `checkAutoReflect` |
-| `AutoReflectAfterN` | non-parseable env → default 10 | `getEnvInt` returns default |
-| `AutoReflectTimeout` | non-parseable env → default 6h | `getEnvDuration` returns default |
+Register in main.go:
+
+```go
+mux.HandleFunc("/debug/queue", srv.handleDebugQueue)
+```
 
 ---
 
-## 4. Core Algorithm: checkAutoReflect
+## Task 2: Dead-Letter Webhook on StatusDead
 
-### 4.1 Signature
+### Purpose
 
-```go
-func (s *Server) checkAutoReflect(bank string)
-```
+When a job transitions to `StatusDead` in `worker.go`, fire the error webhook so operators are notified of permanently failed jobs.
 
-### 4.2 Pseudocode
+### Implementation
 
-```
-function checkAutoReflect(bank):
-    // Guard 1: both triggers disabled → fast return
-    if s.config.AutoReflectAfterN <= 0 AND s.config.AutoReflectTimeout <= 0:
-        return
+In `queue/worker.go`, `processJob` method: after the `else` branch that does `UpdateStatus(job.ID, StatusDead, ...)`, add a call to fire the error webhook.
 
-    // Guard 2: defensive bank validation
-    if bank is empty OR does not match bankNamePattern:
-        return
+However, the `Worker` struct does not have access to the webhook. There are two approaches:
 
-    // Get or create per-bank state, initialize lastReflect if new
-    stateI, _ := s.reflectStates.LoadOrStore(bank, &reflectState{lastReflect: time.Now()})
-    st := stateI.(*reflectState)
+**Approach A (KISS — chosen):** Use a callback. Add an `OnDeadFunc` to `WorkerConfig`. When a job transitions to dead, call it. The `Server` provides a closure that calls `fireErrorWebhook`.
 
-    st.mu.Lock()
-    defer st.mu.Unlock()
+**Approach B (Scalable):** Add a webhook URL directly to WorkerConfig. Rejected — Worker is a generic queue package; webhook is application-specific.
 
-    // Increment retain counter (saturate at MaxInt to prevent overflow wrap)
-    if st.retainCount < math.MaxInt:
-        st.retainCount++
+### Concrete Changes
 
-    // Check count-based trigger
-    countTrigger := false
-    if s.config.AutoReflectAfterN > 0 AND st.retainCount >= s.config.AutoReflectAfterN:
-        countTrigger = true
-
-    // Check timeout-based trigger
-    timeoutTrigger := false
-    if s.config.AutoReflectTimeout > 0 AND st.retainCount > 0:
-        if time.Since(st.lastReflect) > s.config.AutoReflectTimeout:
-            timeoutTrigger = true
-
-    // No trigger condition met → return
-    if NOT countTrigger AND NOT timeoutTrigger:
-        return
-
-    // Fire: reset state BEFORE Insert (so re-queue on Insert failure is safe)
-    st.retainCount = 0
-    st.lastReflect = time.Now().UTC()
-    st.mu.Unlock()  // release lock before I/O
-
-    // Guard 3: queue store may be nil (server starting up)
-    if s.queueStore == nil:
-        s.log.Warn("auto_reflect: queue store not available", "bank", bank)
-        return
-
-    // Insert reflect job
-    job := &queue.Job{
-        ID:         newJobID(),
-        Bank:       bank,
-        Type:       "reflect",
-        Payload:    "_auto",
-        MaxRetries: 0,  // uses default (3)
-    }
-    err := s.queueStore.Insert(job)
-    if err != nil:
-        if errors.Is(err, queue.ErrQueueFull):
-            s.log.Warn("auto_reflect: queue full", "bank", bank)
-        else:
-            s.log.Error("auto_reflect: insert failed", "bank", bank, logger.Error(err))
-        // Note: state already reset. Reflect will be retried on next trigger cycle.
-        return
-
-    s.log.Info("auto_reflect: job inserted", "bank", bank, "job_id", job.ID,
-               "trigger", triggerReason(countTrigger, timeoutTrigger))
-    s.metrics.cogneePending.Set(pendingCount(s.queueStore))
-```
-
-### 4.3 Trigger reason logging
-
-The `triggerReason` helper returns:
-- `"count"` when only countTrigger is true
-- `"timeout"` when only timeoutTrigger is true
-- `"both"` when both are true (possible if N=1 and timeout also elapsed — fires once, logged as "both")
-
-### 4.4 Locking detail
-
-The mutex is released BEFORE calling `s.queueStore.Insert()`. This is critical:
-- `Insert` may block on the store's mutex and perform disk I/O.
-- Holding `st.mu` across I/O would serialize all auto-reflect checks across all banks.
-- State is reset before the Insert attempt. If Insert fails (queue full, DB error), the reflect is lost for this cycle but will be retried on the next trigger cycle (either count or timeout). This is intentional — no persistent "pending reflect" flag needed.
-
-### 4.5 Why reset state before Insert (not after)
-
-| Order | Risk |
-|-------|------|
-| Reset after Insert success | If Insert panics (unlikely), state is stale but safe. However, inserting then resetting means a crash between Insert and reset would leave the job in queue AND not reset counters, causing duplicate reflects on restart. |
-| **Reset before Insert (chosen)** | If Insert fails, state is already reset. The reflect opportunity is lost for this cycle but will trigger again naturally. No duplicate risk on crash. |
-
----
-
-## 5. Integration Point
-
-### 5.1 Call site
-
-In `server.go`, `processQueueJob()` method, inside the `case "retain":` block, after `s.maybeAutoImprove(job.Bank)` and before `return nil`:
+1. **Add `OnDeadFunc` to `WorkerConfig`:**
 
 ```go
-// Existing (do not remove):
-s.maybeAutoImprove(job.Bank)
-
-// NEW — M4: check auto-reflect triggers
-s.checkAutoReflect(job.Bank)
-
-return nil
+// WorkerConfig — add field:
+OnDead func(job *Job) // optional callback when job reaches StatusDead
 ```
 
-### 5.2 Why after maybeAutoImprove
+Nil check before calling.
 
-Order does not matter functionally (auto-improve and auto-reflect are independent), but:
-- `maybeAutoImprove` was there first — placing new code after it minimizes diff and preserves blame.
-- Both must run. Neither should block the other. If `checkAutoReflect` panics, we must not lose the auto-improve work already done. See panic recovery below.
+2. **Call OnDeadFunc in `processJob`:**
 
-### 5.3 Execution context
-
-`checkAutoReflect` runs inside the queue worker goroutine's `processJob` → `processQueueJob` call chain. The worker already has panic recovery at the `processJob` level. However, a panic in `checkAutoReflect` would mark the retain job as FAILED (since the worker's defer catches panics and marks the current job as failed). **This is unacceptable:** a successfully completed retain must not be marked failed because auto-reflect tripped.
-
-**Mitigation:** `checkAutoReflect` must have its own deferred panic recovery. See Section 7.3.
-
----
-
-## 6. Disabled States
-
-### 6.1 Both disabled (N=0 AND TIMEOUT=0)
-
-The guard at the top of `checkAutoReflect` returns immediately. Zero allocations, zero `sync.Map` operations. Equivalent to the feature not existing.
-
-### 6.2 N=0 only (count disabled, timeout active)
-
-Count-based trigger is suppressed (`AutoReflectAfterN > 0` check fails). Only timeout trigger is active. `retainCount` is still incremented because the timeout trigger requires `retainCount > 0`.
-
-### 6.3 TIMEOUT=0 only (timeout disabled, count active)
-
-Timeout-based trigger is suppressed (`AutoReflectTimeout > 0` check fails). Only count trigger is active.
-
-### 6.4 Auto-improve vs Auto-reflect independence
-
-Auto-reflect and auto-improve are completely independent. Disabling one has zero effect on the other. They share no state, no mutexes, no code paths beyond the call site ordering in `processQueueJob`.
-
----
-
-## 7. Goroutine Safety and Panic Recovery
-
-### 7.1 Enumerated goroutines
-
-| # | Goroutine | Spawned By | Recovery |
-|---|-----------|------------|----------|
-| 1 | Queue worker goroutines (N workers) | `queue.Worker.Start()` | YES — `workerLoop` defer recover |
-
-`checkAutoReflect` does NOT spawn any new goroutines. All work is synchronous within the caller's goroutine.
-
-### 7.2 Concurrency safety
-
-| Resource | Protection | Rationale |
-|----------|-----------|-----------|
-| `s.reflectStates` (sync.Map) | Built-in sync.Map concurrency | LoadOrStore is atomic |
-| `reflectState.retainCount` | `reflectState.mu` | Multiple workers may process retains for the same bank simultaneously |
-| `reflectState.lastReflect` | `reflectState.mu` | Same mutex as retainCount |
-| `s.queueStore.Insert()` | `queue.Store.mu` (internal) | Store serializes writes |
-| `s.config` fields | Read-only after startup | Config never mutates after LoadConfig |
-
-### 7.3 Panic recovery in checkAutoReflect
+In `processJob`, after the `else` branch that sets `StatusDead`:
 
 ```go
-func (s *Server) checkAutoReflect(bank string) {
-    defer func() {
-        if r := recover(); r != nil {
-            s.panics.Add(1)
-            s.log.Error("auto_reflect: panic", "bank", bank, "panic", fmt.Sprintf("%v", r))
-            // Do NOT re-panic. The retain job succeeded and must stay completed.
-        }
-    }()
-    // ... body ...
+// existing: w.store.UpdateStatus(job.ID, StatusDead, "", processErr.Error())
+
+// NEW: notify via callback
+if w.onDead != nil {
+    w.onDead(job)
 }
 ```
 
-**Critical:** The deferred recover MUST NOT re-panic, MUST NOT return an error that would propagate to the worker, and MUST NOT affect the retain job's status. The retain already succeeded.
+Store `onDead` as a field in `Worker` struct.
 
-### 7.4 Lock ordering
+3. **Wire from Server:**
 
-Only one lock is held at any time:
-1. `reflectState.mu` is acquired, work done, released — before any store operation.
-2. `queue.Store.mu` is acquired internally by `Store.Insert()`.
+In `server.go` `Start()`, when creating Worker:
 
-No nested locks. No ABBA deadlock potential.
+```go
+worker, err := queue.NewWorker(queue.WorkerConfig{
+    Store:   s.queueStore,
+    Process: processFunc,
+    Count:   s.config.QueueWorkerCount,
+    SemSize: s.config.QueueMaxConcurrent,
+    OnDead: func(job *queue.Job) {
+        s.fireErrorWebhook(job.Bank, job.ID, job.Error, job.Type)
+    },
+})
+```
 
----
+### fireErrorWebhook Signature
 
-## 8. Edge Cases
-
-| # | Scenario | Behavior |
-|---|----------|----------|
-| E1 | Bank name is empty string | Guard returns immediately, no state created |
-| E2 | Bank name contains invalid chars | Guard returns immediately (bankNamePattern mismatch) |
-| E3 | `queueStore` is nil (server starting up) | Guard after state reset: log warning, return, no panic |
-| E4 | Queue is full (ErrQueueFull) | Log warning, return. State already reset — retries on next cycle |
-| E5 | DB error on Insert | Log error, return. Same as E4 |
-| E6 | `AUTO_REFLECT_AFTER_N=1` and `AUTO_REFLECT_TIMEOUT=1ns` | Both triggers fire simultaneously. State reset once (they share the same reset). One reflect job inserted. Logged as trigger="both". |
-| E7 | Bank receives 0 retains after server start, timeout elapses | Timeout check: retainCount is 0, suppressed. No reflect. Correct — no work to reflect on. |
-| E8 | Server restart: counters reset to 0 | Acceptable — `reflectStates` is in-memory only. Timeout starts counting from first retain after restart (lastReflect initialized to `time.Now()` on first LoadOrStore). |
-| E9 | Negative config values | Clamped to 0 (disabled) at check time in `checkAutoReflect` |
-| E10 | `retainCount` overflow after math.MaxInt retains | Saturates at `math.MaxInt`. No wrap to negative. Trigger fires on next check. |
-| E11 | Auto-reflect inserts reflect job, and user manually calls memory_reflect | Both jobs are legitimate. Both are queued and processed independently. No conflict. |
-| E12 | Auto-reflect job is in queue when server stops | `queue.Worker.Stop()` drains in-flight jobs. Remaining pending jobs survive in SQLite and are recovered on restart. Auto-reflect state (counters) is lost on restart — acceptable. |
-| E13 | Bank with exactly 0 successful retains since startup, N=10 | retainCount=0 after increment → 1. 1 < 10, no trigger. Correct. |
-| E14 | Timeout fires, then next retain comes 1ms later | State was reset (retainCount=0, lastReflect=now). Next retain: increment to 1, check timeout → time.Since(now) ≈ 1ms < 6h → no trigger. Correct debounce. |
+Existing `fireErrorWebhook(bank, jobID, errMsg, operation string)` already accepts the needed parameters. The `operation` parameter gets `job.Type` ("retain" or "reflect").
 
 ---
 
-## 9. Metrics Impact
+## Task 3: .env.example Finalization
 
-No new metrics are introduced. Existing metric `memory.cognee_jobs_pending` is updated via `s.metrics.cogneePending.Set(pendingCount(s.queueStore))` after Insert, consistent with how manual retains/reflects update the gauge.
+### Purpose
 
----
+`.env.example` must reflect the current runtime config exactly. Add all M2-M4 config vars that are missing. Remove all Hindsight/reranker references.
 
-## 10. Acceptance Criteria (20 ACs)
+### Variables to ADD
 
-### Config
+Under a new `# ============================================================================` section "Queue":
 
-| ID | Criterion | Verification |
-|----|-----------|-------------|
-| **AC-M4.01** | `AUTO_REFLECT_AFTER_N` env var is parsed as int, default 10. Value 0 disables count-based trigger. | `LoadConfig()` returns Config with AutoReflectAfterN=0 when env is "0". checkAutoReflect returns immediately for count branch when N=0. |
-| **AC-M4.02** | `AUTO_REFLECT_TIMEOUT` env var is parsed as duration, default 6h. Value 0 disables timeout-based trigger. | `LoadConfig()` returns Config with AutoReflectTimeout=0 when env is "0". checkAutoReflect returns immediately for timeout branch when TIMEOUT=0. |
-| **AC-M4.03** | Negative config values for either field are clamped to 0 at check time (disabled). | Pass -1 via env → config field is -1 (or default). checkAutoReflect treats -1 as <= 0 → disabled. No panic, no negative counters. |
+```
+# ============================================================================
+# Queue (SQLite-backed job queue for retain/reflect)
+# ============================================================================
+# Path to SQLite database file. Uses WAL mode, safe for concurrent access.
+QUEUE_DB_PATH=./data/queue.db
+# Maximum pending jobs before insertion is rejected.
+QUEUE_MAX_PENDING=1000
+# Number of worker goroutines polling for jobs.
+QUEUE_WORKERS=4
+# Maximum concurrent in-flight backend calls (semaphore).
+QUEUE_MAX_CONCURRENT=3
+# How long completed/failed/dead jobs are retained before TTL cleanup.
+QUEUE_JOB_TTL=24h
+# How often TTL cleanup runs.
+QUEUE_TTL_INTERVAL=5m
+```
 
-### State Management
+Under a new `# ============================================================================` section "Auto-Improve":
 
-| ID | Criterion | Verification |
-|----|-----------|-------------|
-| **AC-M4.04** | `reflectState` struct contains `retainCount int` and `lastReflect time.Time`, each guarded by an embedded `sync.Mutex`. | Type assertion: `reflectState` has mu, retainCount, lastReflect fields. All field writes happen under mu.Lock(). |
-| **AC-M4.05** | Per-bank isolation: retains in bank "alpha" do not increment the counter for bank "beta". | Call checkAutoReflect("alpha") N-1 times, then checkAutoReflect("beta") once. Verify only "alpha" triggers (its count reaches N), "beta" does not (its count is 1). |
-| **AC-M4.06** | Concurrent workers incrementing different banks produce no data races. | `go test -race`: 4 goroutines, each calling checkAutoReflect for a different bank 100 times. Zero races. |
-| **AC-M4.07** | Concurrent workers incrementing the SAME bank produce no data races. | `go test -race`: 4 goroutines, each calling checkAutoReflect for bank "shared" 25 times (N=100). All increments counted correctly, trigger fires exactly once. |
+```
+# ============================================================================
+# Auto-Improve (periodic graph optimization)
+# ============================================================================
+# Number of retains before triggering auto-improve. 0 = disabled.
+AUTO_IMPROVE_AFTER_N=0
+# Minimum time between auto-improve triggers.
+AUTO_IMPROVE_COOLDOWN=120s
+```
 
-### Trigger Logic — Count
+Under a new `# ============================================================================` section "Auto-Reflect":
 
-| ID | Criterion | Verification |
-|----|-----------|-------------|
-| **AC-M4.08** | After exactly N successful retain calls for a bank, a reflect job is inserted into the queue with Type="reflect", Bank=<bank>, Payload="_auto". | Set N=5. Call checkAutoReflect 5 times. On 5th call, verify `queueStore.Insert` is called with a Job matching those fields. Verify the job appears in the store. |
-| **AC-M4.09** | After TIMEOUT elapses since lastReflect AND retainCount > 0, a reflect job is inserted. | Set N=9999 (effectively infinite), TIMEOUT=1ms. Call checkAutoReflect once. Advance clock by 2ms. Call checkAutoReflect again. Verify reflect job inserted on 2nd call. |
-| **AC-M4.10** | After a trigger fires, retainCount is reset to 0 and lastReflect is set to current time. | Trigger fire. Immediately inspect reflectState fields. retainCount==0 AND lastReflect ≈ time.Now() (within 1s tolerance). |
-| **AC-M4.11** | Inserted auto-reflect job has MaxRetries=0 (uses default 3), Status="" (defaults to pending in Insert). | Query queue store for the job after insert. Verify MaxRetries==3 (default applied by Store.Insert), Status=="pending". |
-| **AC-M4.12** | When retainCount < N AND timeout has not elapsed, no reflect job is inserted and counters are preserved. | Set N=10, TIMEOUT=1h. Call checkAutoReflect 5 times. Verify 0 jobs in queue. Verify retainCount==5 (not reset). |
+```
+# ============================================================================
+# Auto-Reflect (periodic memory synthesis)
+# ============================================================================
+# Number of retains before triggering auto-reflect. 0 = disabled.
+AUTO_REFLECT_AFTER_N=10
+# Maximum time since last reflect before triggering. 0 = disabled.
+AUTO_REFLECT_TIMEOUT=6h
+```
 
-### Disabled States
+Under the existing "Cognee" section (if one exists) or in a logical location, add:
 
-| ID | Criterion | Verification |
-|----|-----------|-------------|
-| **AC-M4.13** | When AUTO_REFLECT_AFTER_N=0, count-based trigger never fires regardless of retainCount. | Set N=0, TIMEOUT=1h. Call checkAutoReflect 100 times. Verify 0 reflect jobs inserted. Count-based branch never entered. |
-| **AC-M4.14** | When AUTO_REFLECT_TIMEOUT=0, timeout-based trigger never fires regardless of elapsed time. | Set N=5, TIMEOUT=0. Call checkAutoReflect 1 time. Advance clock by 100h. Call checkAutoReflect 1 more time. No timeout trigger on 2nd call. Only fires when count reaches 5. |
+```
+# Error webhook URL — POSTed when jobs permanently fail (dead letter).
+ERROR_WEBHOOK_URL=
+```
 
-### Integration
+### Variables to REMOVE
 
-| ID | Criterion | Verification |
-|----|-----------|-------------|
-| **AC-M4.15** | checkAutoReflect is called ONLY after backend.Retain returns success (nil error). Failed retains skip the check. | Mock backend.Retain to return error. Verify checkAutoReflect is never invoked. Mock backend.Retain to succeed. Verify checkAutoReflect IS invoked. |
-| **AC-M4.16** | checkAutoReflect executes in the queue worker goroutine, not in the HTTP handler. | Add a goroutine ID assertion or trace log in checkAutoReflect. Verify the goroutine is a worker goroutine (not the HTTP handler goroutine). |
-| **AC-M4.17** | A failed retain (backend.Retain returns error) does NOT increment retainCount. | Mock retain to fail 5 times, then succeed once. Verify retainCount==1 after the success, not 6. Timeout trigger does not fire spuriously from failed attempts. |
+Delete any lines referencing:
+- `HINDSIGHT_*` (all: PORT, PATH, LLM_PROVIDER, LLM_MODEL, EMBEDDINGS_PROVIDER, EMBEDDINGS_MODEL, RERANKER_PROVIDER, RERANKER_MODEL, RETAIN_TIMEOUT, RECALL_TIMEOUT, REFLECT_TIMEOUT, CIRCUIT_BREAKER_THRESHOLD, CIRCUIT_BREAKER_COOLDOWN)
+- `RERANK_MODEL`
+- `CLOUD_RERANKER_*` (API_KEY, URL, MODEL)
+- `BACKEND`
+- `MEMORY_RETAIN_WORKERS`, `MEMORY_REFLECT_WORKERS`, `MEMORY_JOB_BUFFER`, `MEMORY_QUEUE_PUSH_TIMEOUT`, `MEMORY_QUEUE_RESPONSE_TIMEOUT`
+- `LLAMA_RERANKER_PORT`
+- `COGNEE_MAX_CONCURRENT_RETAINS`
 
-### Edge Cases & Robustness
+### Variables to KEEP
 
-| ID | Criterion | Verification |
-|----|-----------|-------------|
-| **AC-M4.18** | Empty bank name or bank name failing `bankNamePattern` causes immediate no-op return. No state created, no panic. | Call checkAutoReflect(""). Call checkAutoReflect("bank with spaces!!!"). Verify no entry in reflectStates, no log at ERROR level, no panic. |
-| **AC-M4.19** | When `s.queueStore` is nil, reflect job insertion is skipped with a warning log. No panic. | Set queueStore=nil. Call checkAutoReflect enough times to trigger. Verify WARN log emitted, no nil pointer dereference, no panic. |
-| **AC-M4.20** | When QueueMaxPending is reached, `Store.Insert` returns ErrQueueFull. checkAutoReflect logs a warning and returns cleanly. State was already reset — next trigger cycle will retry. | Fill queue to max. Trigger auto-reflect. Verify WARN log, no panic, state is reset (retainCount==0, lastReflect updated). |
+- All `MCP_*`, `LLAMA_*`, `CLOUD_EMBEDDING_*`, `COGNEE_*`, `OPENROUTER_*`, `HTTP_*`, `SERVICE_*`, `HEALTH_*`, `ALERT_*`
 
----
+### Result
 
-## 11. Spec-implementation Consistency Verification
-
-### 11.1 Pairwise AC ↔ Body trace
-
-| AC | Body Section | Consistent? |
-|----|-------------|-------------|
-| AC-M4.01 | 3.3, 6.2 | YES — config field + disabled check |
-| AC-M4.02 | 3.3, 6.3 | YES — config field + disabled check |
-| AC-M4.03 | 3.3 (validation table), 4.2 (clamp in pseudocode) | YES |
-| AC-M4.04 | 3.1 (struct definition) | YES |
-| AC-M4.05 | 4.2 (LoadOrStore keyed by bank) | YES |
-| AC-M4.06 | 7.2 (concurrency table) | YES |
-| AC-M4.07 | 7.2 (concurrency table) | YES |
-| AC-M4.08 | 4.2 (pseudocode: countTrigger branch) | YES |
-| AC-M4.09 | 4.2 (pseudocode: timeoutTrigger branch) | YES |
-| AC-M4.10 | 4.2 (pseudocode: reset block) | YES |
-| AC-M4.11 | 4.2 (pseudocode: Job construction), 3.2 (Job.Validate rules) | YES |
-| AC-M4.12 | 4.2 (pseudocode: early return when neither trigger fires) | YES |
-| AC-M4.13 | 6.2 (N=0 only) | YES |
-| AC-M4.14 | 6.3 (TIMEOUT=0 only) | YES |
-| AC-M4.15 | 5.1 (call site in processQueueJob), 5.3 (execution context) | YES |
-| AC-M4.16 | 5.3 (worker goroutine context) | YES |
-| AC-M4.17 | 5.1 (call site: only after retain success path, error path returns early) | YES |
-| AC-M4.18 | 4.2 (Guard 2: bank validation) | YES |
-| AC-M4.19 | 4.2 (Guard 3: queueStore nil) | YES |
-| AC-M4.20 | 4.2 (Insert error handling), Edge case E4 | YES |
-
-### 11.2 Goroutine enumeration
-
-| Goroutine | Recovery | Body Ref |
-|-----------|----------|----------|
-| Queue worker goroutines (N workers) — existing, unchanged | YES — `workerLoop` defer recover | 7.1 |
-
-No NEW goroutines are spawned. `checkAutoReflect` runs synchronously in the caller's goroutine.
-
-### 11.3 Lock ordering verification
-
-Single lock path: `reflectState.mu` → release → `queue.Store.mu` (inside Insert). No nested locks. No ABBA potential. Documented in Section 7.4.
-
-### 11.4 Concurrency safety declaration
-
-| Type | Declaration | Section |
-|------|------------|---------|
-| `reflectState` | "Safe for concurrent use — mu guards all field access" | 3.1 |
-| `Server.reflectStates` (sync.Map) | "Safe for concurrent use — sync.Map" | 3.2 |
-| `Config.AutoReflectAfterN` / `AutoReflectTimeout` | "Read-only after startup" | 7.2 |
+The final `.env.example` must contain exactly the env vars referenced by `config.go` `LoadConfig()` — no more, no less.
 
 ---
 
-## 12. Deliverable Checklist
+## Task 4: Docs Update
 
-- [ ] `auto_reflect.go`: New file with `checkAutoReflect(bank string)` method on `*Server`
-- [ ] `config.go`: Add `AutoReflectAfterN int` and `AutoReflectTimeout time.Duration` fields
-- [ ] `config.go`: Add env var parsing in `LoadConfig()`
-- [ ] `server.go`: Add `reflectStates sync.Map` to `Server` struct
-- [ ] `server.go`: Add `s.checkAutoReflect(job.Bank)` call in `processQueueJob` after `s.maybeAutoImprove`
-- [ ] All 20 ACs are implemented and traceable to spec body
+### 4a: `docs/architecture.md`
+
+**Delete sections:**
+- The ASCII diagram showing Hindsight + reranker columns — replace with simplified diagram showing only llama.cpp embedder + Cognee
+- "Circuit Breaker (`hindsight.go`)" section — remove entirely
+- "Exponential Backoff (`hindsight.go`)" section — remove entirely (backoff now lives in `backend/doRequest.go`)
+- "Cloud Embedding/Reranker Support" — remove reranker half, keep only cloud embedding
+- "Memory Budget" table — remove reranker + Hindsight rows, update to reflect current ~650MB total
+
+**Replace sections:**
+- "Worker Pools" — replace with "SQLite Queue (`queue/`)" describing queue architecture:
+  - Store: SQLite with WAL, schema, startup recovery
+  - Worker: pool of N goroutines, semaphore-bounded, panic-safe
+  - State machine: pending -> running -> completed/failed/dead
+  - Retry: failed jobs with retries left go back to pending
+  - TTL: periodic cleanup of completed/failed/dead jobs
+
+**Add section:**
+- New "Debug Endpoints" section documenting `GET /debug/queue`
+
+### 4b: `docs/deployment.md`
+
+**Delete sections:**
+- "Hindsight" config table
+- "Hindsight API Timeouts" table
+- "Circuit Breaker" table
+- "Workers & Queue" table (old worker pool vars)
+- "Cloud Reranker" section
+- Reranker model from prerequisites
+- `LLAMA_RERANKER_PORT` from llama table
+
+**Add sections:**
+- "Queue" config table with: `QUEUE_DB_PATH`, `QUEUE_MAX_PENDING`, `QUEUE_WORKERS`, `QUEUE_MAX_CONCURRENT`, `QUEUE_JOB_TTL`, `QUEUE_TTL_INTERVAL`
+- "Auto-Improve" config table with: `AUTO_IMPROVE_AFTER_N`, `AUTO_IMPROVE_COOLDOWN`
+- "Auto-Reflect" config table with: `AUTO_REFLECT_AFTER_N`, `AUTO_REFLECT_TIMEOUT`
+- "Error Webhook" row: `ERROR_WEBHOOK_URL`
+- Health example JSON update: `{"status":"running","llama":true,"cognee":true}`
+
+**Update:**
+- Troubleshooting table: remove Hindsight rows, add queue row: "jobs stuck pending" -> check worker logs
+- RAM budget: ~650MB (no reranker, no Hindsight)
+
+### 4c: `docs/development.md`
+
+**Delete:**
+- `hindsight.go` from project structure tree
+- "New Hindsight operation" from Adding a New Feature
+- Hindsight references in debug section (hindsight-crash.log, circuit breaker)
+- `worker/` from project structure tree (if it still exists, but queue/ should be listed)
+
+**Add:**
+- `queue/` package to project structure tree: `queue/job.go`, `queue/store.go`, `queue/worker.go`
+- "New queue behavior" to Adding a New Feature section
+
+**Update:**
+- "Quick Reference" — `make setup` description: remove "install Hindsight"
+- Conventions: replace "Worker pools: use worker.NewPool()" with "Queue: use queue.NewStore() + queue.NewWorker()"
+- Debug section: replace `curl ... | jq '.hindsight'` with `curl ... | jq '.cognee'`
+- Circuit breaker section: remove entirely
 
 ---
 
-## 13. What M4 Does NOT Do
+## Task 5: Structured Job Logging
 
-- Does NOT modify `handlers.go`, `queue/`, `backend/`, `auto_improve.go`, `services.go`, or any test file.
-- Does NOT introduce new metrics.
-- Does NOT persist reflect state to disk (in-memory only, resets on restart).
-- Does NOT spawn new goroutines.
-- Does NOT change the queue schema, worker loop, or job processing.
-- Does NOT affect manual `memory_reflect` MCP tool behavior.
-- Does NOT require changes to `Validate()` in config.go (clamping is inline).
+### Purpose
+
+Every state transition in the job lifecycle must emit a structured log line for observability. See Appendix F.
+
+### Log Points (all via `s.log.Info`)
+
+| Event | Message Key | Logged Where | Fields |
+|-------|-------------|-------------|--------|
+| Job queued (retain) | `job_queued` | `handlers.go` handleToolCall, retain case | `job_id`, `bank`, `type=retain` |
+| Job queued (reflect) | `job_queued` | `handlers.go` handleToolCall, reflect case | `job_id`, `bank`, `type=reflect` |
+| Job queued (auto-reflect) | `job_queued` | `auto_reflect.go` checkAutoReflect | `job_id`, `bank`, `type=reflect`, `trigger=(count\|timeout\|both)` |
+| Job dequeued (worker picks up) | `job_dequeued` | `server.go` processQueueJob, top of function | `job_id`, `bank`, `type` |
+| Job completed | `job_completed` | `server.go` processQueueJob, retain success path | `job_id`, `bank`, `type`, `duration_ms` |
+| Job completed | `job_completed` | `server.go` processQueueJob, reflect success path | `job_id`, `bank`, `type`, `duration_ms` |
+| Job failed (retryable) | `job_failed` | `queue/worker.go` processJob, after UpdateStatus(StatusFailed) and CanRetry() | NOT NEEDED — already logged by server processQueueJob error path |
+| Job dead (permanent) | `job_dead` | `queue/worker.go` processJob, after UpdateStatus(StatusDead) | `job_id`, `bank`, `type`, `error`, `retry_count`, `max_retries` |
+
+### Detailed Implementation
+
+#### In handlers.go — retain case (already partially exists):
+
+Current:
+```go
+s.log.Info("retain_queued", "bank", bank, "job_id", jobID)
+```
+
+Change to:
+```go
+s.log.Info("job_queued", "job_id", jobID, "bank", bank, "type", "retain")
+```
+
+#### In handlers.go — reflect case (already partially exists):
+
+Current:
+```go
+s.log.Info("reflect_queued", "bank", bank, "job_id", jobID)
+```
+
+Change to:
+```go
+s.log.Info("job_queued", "job_id", jobID, "bank", bank, "type", "reflect")
+```
+
+#### In auto_reflect.go (already partially exists):
+
+Current:
+```go
+s.log.Info("auto_reflect triggered", "bank", bank, "trigger", triggerReason(...))
+```
+
+Change to add job_id:
+```go
+s.log.Info("job_queued", "job_id", job.ID, "bank", bank, "type", "reflect", "trigger", triggerReason(countTrigger, timeoutTrigger))
+```
+
+And keep the "auto_reflect triggered" line as well (it contains trigger reason).
+
+#### In server.go processQueueJob:
+
+At function top (replaces existing):
+```go
+s.log.Info("job_dequeued", "job_id", job.ID, "type", job.Type, "bank", job.Bank)
+```
+
+Retain success path (modifies existing):
+```go
+s.log.Info("job_completed", "job_id", job.ID, "bank", job.Bank, "type", "retain", "duration_ms", duration.Milliseconds())
+```
+
+Reflect success path (modifies existing):
+```go
+s.log.Info("job_completed", "job_id", job.ID, "bank", job.Bank, "type", "reflect", "duration_ms", duration.Milliseconds())
+```
+
+#### In queue/worker.go processJob — dead path:
+
+The `Worker` struct has no logger. Options:
+1. Add a `Logger` field to WorkerConfig — over-engineered for KISS
+2. Log in the `OnDead` callback — the callback runs in the Server context and has access to `s.log`
+
+**Chosen: Log in OnDead callback.** In `server.go`:
+
+```go
+OnDead: func(job *queue.Job) {
+    s.log.Error("job_dead", "job_id", job.ID, "bank", job.Bank, "type", job.Type,
+        "error", job.Error, "retry_count", job.RetryCount, "max_retries", job.MaxRetries)
+    s.fireErrorWebhook(job.Bank, job.ID, job.Error, job.Type)
+},
+```
+
+This covers all required log messages without adding complexity to the queue package.
+
+### Log Levels
+
+| Event | Level |
+|-------|-------|
+| `job_queued` | Info |
+| `job_dequeued` | Info |
+| `job_completed` | Info |
+| `job_dead` | Error |
+
+---
+
+## Task 6: Stale Comment Removal
+
+### Files and Lines to Change
+
+#### `config.go`
+
+Search for "hindsight" (case-insensitive) in comments. None found in current code — already cleaned in M3. No changes needed.
+
+#### `backend/doRequest.go`
+
+Line 13:
+```go
+// It returns the response body on success. Used by both Hindsight and Cognee backends.
+```
+
+Change to:
+```go
+// It returns the response body on success.
+```
+
+#### `session_cleaner.go`
+
+Line 9:
+```go
+// Extracted from workers.go during M1 (Hindsight removal).
+```
+
+Change to:
+```go
+// Periodically closes and removes idle MCP sessions.
+```
+
+#### `auto_improve.go`
+
+Search for "hindsight" — none found. Already clean from M3.
+
+### Verification
+
+After changes, run:
+```bash
+grep -ri "hindsight" *.go backend/ queue/ --include="*.go"
+```
+Must return zero results in non-test files. Test files may contain "hindsight" in test names — those are fine (they test the absence).
+
+---
+
+## Task 7: Delete .anon_id
+
+### Action
+
+```bash
+rm .anon_id
+```
+
+### Verification
+
+File must not exist after deletion. Add to `.gitignore` if not already there to prevent accidental re-creation.
+
+---
+
+## Task 8: Final Vet Pass
+
+### Action
+
+```bash
+go vet ./...
+```
+
+Must return zero errors. If `go vet` reports any issues, fix them.
+
+### Common Issues to Check
+
+- Unreachable code (from removed IsSync branches)
+- Unused imports
+- Formatting (`gofmt -s -w .`)
+
+---
+
+## Acceptance Criteria
+
+| ID | Criterion | Verification |
+|----|-----------|-------------|
+| AC-M5.01 | GET /debug/queue returns 200 with valid JSON | `curl http://localhost:8899/debug/queue` returns all 9 fields with correct types |
+| AC-M5.02 | GET /debug/queue returns 405 for non-GET methods | `curl -X POST .../debug/queue` returns 405 |
+| AC-M5.03 | GET /debug/queue works when queueStore is nil (returns all zeros) | Test with server in early startup |
+| AC-M5.04 | `/debug/queue` Content-Type is `application/json` | Check response headers |
+| AC-M5.05 | `oldest_pending_age_s` is 0 when no pending jobs | Validate after queue drains |
+| AC-M5.06 | `db_size_kb` is 0 when DB file is missing | Delete queue.db, restart, check |
+| AC-M5.07 | `workers` and `max_concurrent` match `QueueWorkerCount` and `QueueMaxConcurrent` config | Compare against config values |
+| AC-M5.08 | Dead-letter webhook fires when job transitions to StatusDead | Insert job, exhaust retries, verify webhook endpoint receives POST |
+| AC-M5.09 | Dead-letter webhook payload contains job_id, bank, error, operation | Inspect webhook body |
+| AC-M5.10 | OnDead callback is nil-safe (no crash if not set) | Create Worker without OnDead, process a permanent failure |
+| AC-M5.11 | `.env.example` contains QUEUE_DB_PATH, QUEUE_MAX_PENDING, QUEUE_WORKERS, QUEUE_MAX_CONCURRENT, QUEUE_JOB_TTL, QUEUE_TTL_INTERVAL | grep for each var |
+| AC-M5.12 | `.env.example` contains AUTO_REFLECT_AFTER_N, AUTO_REFLECT_TIMEOUT | grep for each var |
+| AC-M5.13 | `.env.example` contains AUTO_IMPROVE_AFTER_N, AUTO_IMPROVE_COOLDOWN | grep for each var |
+| AC-M5.14 | `.env.example` contains ERROR_WEBHOOK_URL | grep |
+| AC-M5.15 | `.env.example` does NOT contain any HINDSIGHT_* var, RERANK_MODEL, CLOUD_RERANKER_*, LLAMA_RERANKER_PORT, MEMORY_RETAIN_WORKERS, MEMORY_REFLECT_WORKERS, COGNEE_MAX_CONCURRENT_RETAINS, BACKEND | grep -v for each |
+| AC-M5.16 | `docs/architecture.md` has no "Hindsight" references, no reranker references, no circuit breaker section | grep -i "hindsight\|reranker\|circuit breaker" returns 0 |
+| AC-M5.17 | `docs/architecture.md` documents queue architecture, state machine, and debug endpoints | Visual inspection |
+| AC-M5.18 | `docs/deployment.md` has no Hindsight/Reranker config tables, has Queue + Auto-Improve + Auto-Reflect tables | Visual inspection |
+| AC-M5.19 | `docs/development.md` has no Hindsight references, has queue/ in project structure, has updated conventions | Visual inspection |
+| AC-M5.20 | All `s.log.Info("job_queued", ...)` calls emit with `job_id`, `bank`, `type` in both handlers.go retain+reflect paths | Code grep |
+| AC-M5.21 | `s.log.Info("job_dequeued", ...)` emitted at top of processQueueJob | Code grep |
+| AC-M5.22 | `s.log.Info("job_completed", ...)` emitted with `job_id`, `bank`, `type`, `duration_ms` in retain AND reflect success paths | Code grep |
+| AC-M5.23 | `s.log.Error("job_dead", ...)` emitted in OnDead callback | Code grep |
+| AC-M5.24 | `grep -ri "hindsight" *.go backend/*.go queue/*.go auto_*.go session_*.go` returns zero results in non-test files | Shell command |
+| AC-M5.25 | `backend/doRequest.go` comment no longer says "Used by both Hindsight and Cognee backends" | grep |
+| AC-M5.26 | `session_cleaner.go` top comment no longer says "Extracted from workers.go during M1 (Hindsight removal)" | grep |
+| AC-M5.27 | `.anon_id` file does not exist | `test -f .anon_id && echo FAIL || echo PASS` |
+| AC-M5.28 | `go vet ./...` returns zero output, exit code 0 | Run command |
+
+---
+
+## Edge Cases
+
+### EC-M5.01: db_size_kb on missing DB file
+`os.Stat` returns `os.ErrNotExist` for `:memory:` and fresh installs. `db_size_kb` must be 0, no log spam.
+
+### EC-M5.02: OnDead callback panic
+If `OnDead` panic, worker goroutine already has defer-recover. The panic is caught and job stays dead. Ensure the dead-job UpdateStatus already happened before OnDead is called, so recovery doesn't resurrect the job.
+
+### EC-M5.03: .env.example merge conflicts
+If the user has already partially updated .env.example, the coder must read the current file and surgically add/remove lines. Do not blindly overwrite.
+
+### EC-M5.04: queue/worker.go OnDead field
+Adding OnDead to Worker struct means test code in queue/store_test.go, queue/tester_pass2_test.go, queue/tester_pass3_test.go, queue/tester_adversarial_test.go that constructs `queue.WorkerConfig{}` must still compile. The field is optional (nil default = no-op).
+
+### EC-M5.05: Job dead log contains full error
+`job.Error` may be long. `s.log.Error` handles this — structured logging doesn't truncate. No additional truncation needed.
+
+### EC-M5.06: /debug/queue and CORS
+Same as /health — no CORS headers needed. This is an internal debug endpoint.
+
+---
+
+## New Goroutines
+
+None. No new goroutines are spawned by any M5 task.
+
+- Task 1: synchronous HTTP handler, same as /health
+- Task 2: OnDead callback runs synchronously inside existing worker goroutine
+- Task 5: structured logging runs synchronously inside existing flow
+
+---
+
+## Non-Goals (Out of Scope for M5)
+
+- Adding authentication to /debug/queue
+- Adding Prometheus metrics for queue
+- Adding a /debug/queue HTML dashboard
+- Changing any existing API response shape
+- Adding a queue admin API (pause/resume/flush)
+- Removing `circuit_breaker.go` compatibility shim (it's harmless and tests may reference it)
+- Reformatting or restructuring existing code beyond the 8 tasks
+
+---
+
+## Verification Checklist (for Tester)
+
+1. `go build ./...` compiles with zero errors
+2. `go vet ./...` returns zero output, exit code 0
+3. All 28 ACs pass
+4. `grep -ri "hindsight" --include="*.go" . | grep -v "_test.go" | grep -v "queue-design.md"` returns zero non-test hits
+5. `.anon_id` file is deleted
+6. `.env.example` diff shows only additions of queue/auto vars, removal of Hindsight/reranker vars
+7. `/debug/queue` endpoint returns correct data with running server
+8. Dead-letter webhook fires on permanent job failure
