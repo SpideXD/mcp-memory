@@ -394,6 +394,7 @@ func TestM3P2_QueueDepthRaceWithClose(t *testing.T) {
 func TestM3P2_ConfigValidation_QueueWorkersZero(t *testing.T) {
 	cfg := Config{
 		Backend:                    BackendCogneePython,
+		RetryAttempts:              3,
 		MaxSessions:                10,
 		MaxContentBytes:            1 << 20,
 		StartTimeout:               10 * time.Second,
@@ -418,6 +419,7 @@ func TestM3P2_ConfigValidation_QueueWorkersZero(t *testing.T) {
 func TestM3P2_ConfigValidation_QueueMaxPendingZero(t *testing.T) {
 	cfg := Config{
 		Backend:                    BackendCogneePython,
+		RetryAttempts:              3,
 		MaxSessions:                10,
 		MaxContentBytes:            1 << 20,
 		StartTimeout:               10 * time.Second,
@@ -442,6 +444,7 @@ func TestM3P2_ConfigValidation_QueueMaxPendingZero(t *testing.T) {
 func TestM3P2_ConfigValidation_QueueMaxConcurrentZero(t *testing.T) {
 	cfg := Config{
 		Backend:                    BackendCogneePython,
+		RetryAttempts:              3,
 		MaxSessions:                10,
 		MaxContentBytes:            1 << 20,
 		StartTimeout:               10 * time.Second,
@@ -468,6 +471,7 @@ func TestM3P2_ConfigValidation_QueueMaxConcurrentZero(t *testing.T) {
 func TestM3P2_ConfigValidation_MaxConcurrentGreaterThanWorkers(t *testing.T) {
 	cfg := Config{
 		Backend:                    BackendCogneePython,
+		RetryAttempts:              3,
 		MaxSessions:                10,
 		MaxContentBytes:            1 << 20,
 		StartTimeout:               10 * time.Second,

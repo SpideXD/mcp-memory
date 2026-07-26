@@ -262,6 +262,9 @@ func (c Config) Validate() error {
 	if c.StartTimeout <= 0 || c.StopTimeout <= 0 || c.ShutdownTimeout <= 0 {
 		return fmt.Errorf("timeouts must be positive")
 	}
+	if c.RetryAttempts < 1 {
+		return fmt.Errorf("MCP_RETRY_ATTEMPTS must be >= 1, got %d", c.RetryAttempts)
+	}
 
 	// Branch validation per backend type
 	switch c.Backend {

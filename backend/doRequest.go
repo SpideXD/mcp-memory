@@ -9,8 +9,21 @@ import (
 	"time"
 )
 
+// Cancellable sleep waits for d or until ctx is cancelled.
+// Returns ctx.Err() if cancelled, nil if the duration elapsed.
+func sleepCancel(ctx context.Context, d time.Duration) error {
+	select {
+	case <-time.After(d):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // doRequest executes an HTTP request with retry logic and exponential backoff.
-// It returns the response body on success.
+// Backoff is cancellation-aware (sleepCancel respects ctx.Done()).
+// 4xx responses are returned immediately without retry.
+// 5xx and connection errors are retried with backoff up to retryAttempts times.
 func doRequest(client *http.Client, req *http.Request, timeout time.Duration, retryAttempts int, retryDelay, retryMaxDelay time.Duration) ([]byte, error) {
 	if req.Body == nil {
 		return nil, fmt.Errorf("request body is nil")
@@ -22,7 +35,6 @@ func doRequest(client *http.Client, req *http.Request, timeout time.Duration, re
 	}
 
 	ctx := req.Context()
-	// Apply per-request timeout to context
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -31,13 +43,11 @@ func doRequest(client *http.Client, req *http.Request, timeout time.Duration, re
 	}
 
 	var lastErr error
-	maxBody := int64(10 << 20) // 10MB response limit
+	maxBody := int64(10 << 20) // 10 MB
 
 	for attempt := 0; attempt < retryAttempts; attempt++ {
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("request cancelled: %w", ctx.Err())
-		default:
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("request cancelled: %w", err)
 		}
 
 		retryReq := req.Clone(ctx)
@@ -48,39 +58,62 @@ func doRequest(client *http.Client, req *http.Request, timeout time.Duration, re
 		resp, err := client.Do(retryReq)
 		if err != nil {
 			lastErr = err
-			backoff := retryDelay * (1 << uint(attempt))
-			if backoff > retryMaxDelay {
-				backoff = retryMaxDelay
+			// Don't sleep after the last attempt
+			if attempt < retryAttempts-1 {
+				backoff := retryDelay * (1 << uint(attempt))
+				if backoff > retryMaxDelay {
+					backoff = retryMaxDelay
+				}
+				if cerr := sleepCancel(ctx, backoff); cerr != nil {
+					return nil, fmt.Errorf("request cancelled during backoff: %w", cerr)
+				}
 			}
-			time.Sleep(backoff)
 			continue
 		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+
+		// Detect truncation — if LimitReader hit the limit, the body was cut.
+		lr := io.LimitReader(resp.Body, maxBody+1)
+		body, readErr := io.ReadAll(lr)
 		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			backoff := retryDelay * (1 << uint(attempt))
-			if backoff > retryMaxDelay {
-				backoff = retryMaxDelay
+		if readErr != nil {
+			lastErr = readErr
+			if attempt < retryAttempts-1 {
+				backoff := retryDelay * (1 << uint(attempt))
+				if backoff > retryMaxDelay {
+					backoff = retryMaxDelay
+				}
+				if cerr := sleepCancel(ctx, backoff); cerr != nil {
+					return nil, fmt.Errorf("request cancelled during backoff: %w", cerr)
+				}
 			}
-			time.Sleep(backoff)
 			continue
 		}
+		if int64(len(body)) > maxBody {
+			return nil, fmt.Errorf("response body exceeds %d byte limit (got %d bytes)", maxBody, len(body))
+		}
+
 		if resp.StatusCode != 200 {
 			lastErr = fmt.Errorf("HTTP error (%d): %s", resp.StatusCode, string(body))
-			// 4xx = client error, not a backend failure — don't retry
+			// 4xx = client error — don't retry
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 				return nil, lastErr
 			}
-			// 5xx = server error — retry with backoff
-			backoff := retryDelay * (1 << uint(attempt))
-			if backoff > retryMaxDelay {
-				backoff = retryMaxDelay
+			// 5xx — retry with backoff
+			if attempt < retryAttempts-1 {
+				backoff := retryDelay * (1 << uint(attempt))
+				if backoff > retryMaxDelay {
+					backoff = retryMaxDelay
+				}
+				if cerr := sleepCancel(ctx, backoff); cerr != nil {
+					return nil, fmt.Errorf("request cancelled during backoff: %w", cerr)
+				}
 			}
-			time.Sleep(backoff)
 			continue
 		}
 		return body, nil
+	}
+	if lastErr == nil {
+		return nil, fmt.Errorf("request failed after %d attempts", retryAttempts)
 	}
 	return nil, fmt.Errorf("request failed after %d attempts: %v", retryAttempts, lastErr)
 }
