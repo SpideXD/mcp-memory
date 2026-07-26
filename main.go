@@ -85,10 +85,20 @@ func main() {
 		MaxHeaderBytes: int(srv.config.MaxBodyBytes),
 	}
 
-	// Phase 3: Handle shutdown — stop HTTP first, then drain services
+	// Phase 3: Handle shutdown — stop HTTP first, then drain services.
+	//
+	// shutdownDone gates main's return. httpSrv.Shutdown closes the listener
+	// before it waits for connections, so ListenAndServe below returns
+	// ErrServerClosed almost immediately. Without this gate main falls off the
+	// end, the process exits, and this goroutine is killed part-way through
+	// srv.Stop() — leaking the Cognee/llama child processes and leaving a stale
+	// .mcp-pids.json behind. Stop() takes seconds (each child gets SIGTERM and
+	// a 5s grace period), so it loses that race almost every time.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-sigChan
 		println("[MCP] shutting down...")
 		srv.log.Info("shutdown signal received")
@@ -100,18 +110,24 @@ func main() {
 			srv.log.Error("http shutdown error", "error", err.Error())
 		}
 
-		// Drain workers, close sessions, stop services
+		// Drain workers, close sessions, stop services.
+		// Stop() logs "shutdown complete" once everything is torn down; do not
+		// log it again here or every clean shutdown reports twice.
 		srv.Stop()
-
-		srv.log.Info("shutdown complete")
-		os.Exit(0)
 	}()
 
 	srv.log.Info("http server started", "addr", addr)
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		// Serving never started (port in use, bad address). Services are
+		// already running at this point, so tear them down before exiting or
+		// they outlive us as orphans.
 		srv.log.Error("http server failed", "error", err.Error())
+		srv.Stop()
 		os.Exit(1)
 	}
+
+	// Listener closed by Shutdown — wait for the drain to finish before exiting.
+	<-shutdownDone
 }
 
 // backendEnvFile returns the backend-specific .env filename based on BACKEND.
