@@ -28,3 +28,9 @@ cognee-python/
 # SDLC development artifacts
 .agents/
 state/
+# Test binaries
+*.test
+
+# Runtime data
+data/
+.anon_id

@@ -1,12 +1,12 @@
 // Package main — M3 Tester Pass 3: Chaos Tests
 //
 // Six chaos scenarios designed to stress the queue/worker/backend:
-//   1. 50 concurrent retains — all return queued immediately
-//   2. Rapid retain+recall cycles — 10x interleaved
-//   3. Crash recovery — file-based store persistence
-//   4. Goroutine leak — 100 start/stop cycles
-//   5. Memory leak — 1000 jobs processed
-//   6. Performance — 1000 inserts under 1 second
+//  1. 50 concurrent retains — all return queued immediately
+//  2. Rapid retain+recall cycles — 10x interleaved
+//  3. Crash recovery — file-based store persistence
+//  4. Goroutine leak — 100 start/stop cycles
+//  5. Memory leak — 1000 jobs processed
+//  6. Performance — 1000 inserts under 1 second
 package main
 
 import (

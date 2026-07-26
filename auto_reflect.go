@@ -14,6 +14,7 @@ type reflectState struct {
 	mu          sync.Mutex
 	retainCount int       // successful retains since last auto-reflect
 	lastReflect time.Time // time of last auto-reflect trigger (UTC)
+	lastAccess  time.Time // last time this state was accessed (for TTL eviction)
 }
 
 // checkAutoReflect checks whether an auto-reflect job should be inserted
@@ -47,6 +48,7 @@ func (s *Server) checkAutoReflect(bank string) {
 
 	// Lock for the check-and-update phase
 	rs.mu.Lock()
+	rs.lastAccess = time.Now()
 
 	rs.retainCount++
 
@@ -111,4 +113,41 @@ func triggerReason(countTrigger, timeoutTrigger bool) string {
 		return "count"
 	}
 	return "timeout"
+}
+
+// cleanupReflectStates removes reflectState entries that haven't been accessed
+// within the given TTL. Called periodically by a background goroutine to prevent
+// unbounded memory growth from one-shot banks (M4 QA finding).
+func (s *Server) cleanupReflectStates(ttl time.Duration) {
+	cutoff := time.Now().Add(-ttl)
+	s.reflectStates.Range(func(key, value interface{}) bool {
+		rs := value.(*reflectState)
+		rs.mu.Lock()
+		stale := rs.lastAccess.Before(cutoff)
+		rs.mu.Unlock()
+		if stale {
+			s.reflectStates.Delete(key)
+		}
+		return true
+	})
+}
+
+// autoReflectCleanup periodically evicts stale reflectState entries.
+func (s *Server) autoReflectCleanup(shutdown chan struct{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.panics.Add(1)
+			s.log.Error("autoReflectCleanup panicked", "panic", r)
+		}
+	}()
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.cleanupReflectStates(24 * time.Hour)
+		case <-shutdown:
+			return
+		}
+	}
 }

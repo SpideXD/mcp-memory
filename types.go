@@ -43,4 +43,3 @@ func (s *MCPSession) Close() {
 func (s *MCPSession) IsClosed() bool {
 	return s.closed.Load()
 }
-

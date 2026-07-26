@@ -30,12 +30,12 @@ type Config struct {
 	CloudEmbeddingModel  string // env: CLOUD_EMBEDDING_MODEL
 
 	// Service timeouts
-	StartTimeout   time.Duration
-	StopTimeout    time.Duration
-	HealthTimeout  time.Duration
-	RequestTimeout time.Duration
-	RetryAttempts  int
-	RetryDelay     time.Duration
+	StartTimeout    time.Duration
+	StopTimeout     time.Duration
+	HealthTimeout   time.Duration
+	RequestTimeout  time.Duration
+	RetryAttempts   int
+	RetryDelay      time.Duration
 	ShutdownTimeout time.Duration
 
 	// HTTP server
@@ -63,22 +63,22 @@ type Config struct {
 	Backend Backend
 
 	// Cognee
-	CogneePort               string        // COGNEE_PORT, default "8000"
-	CogneeDataDir            string        // COGNEE_DATA_DIR, default "./cognee-data"
-	CogneeBinary             string        // COGNEE_BINARY, Rust binary path
-	CogneePythonPath         string        // COGNEE_PYTHON_PATH, Python venv path
-	CogneeLLMApiKey          string        // COGNEE_LLM_API_KEY (defaults to OPENROUTER_API_KEY if unset)
-	CogneeLLMModel           string        // COGNEE_LLM_MODEL (default "deepseek/deepseek-v4-flash")
-	CogneeLLMEndpoint        string        // COGNEE_LLM_ENDPOINT (default "https://openrouter.ai/api/v1")
-	CogneeEmbeddingEndpoint  string        // COGNEE_EMBEDDING_ENDPOINT (default "http://localhost:8080/v1")
-	CogneeEmbeddingProvider  string        // COGNEE_EMBEDDING_PROVIDER (default "openai")
-	CogneeMaxConcurrentRetains int         // COGNEE_MAX_CONCURRENT_RETAINS, default 10
-	CogneeRetainTimeout      time.Duration // COGNEE_RETAIN_TIMEOUT, default 900s (15 min)
-	TemporalCognify          bool          // COGNEE_TEMPORAL_COGNIFY, default true
-	MemoryOnly               bool          // COGNEE_MEMORY_ONLY, default true
+	CogneePort                 string        // COGNEE_PORT, default "8000"
+	CogneeDataDir              string        // COGNEE_DATA_DIR, default "./cognee-data"
+	CogneeBinary               string        // COGNEE_BINARY, Rust binary path
+	CogneePythonPath           string        // COGNEE_PYTHON_PATH, Python venv path
+	CogneeLLMApiKey            string        // COGNEE_LLM_API_KEY (defaults to OPENROUTER_API_KEY if unset)
+	CogneeLLMModel             string        // COGNEE_LLM_MODEL (default "deepseek/deepseek-v4-flash")
+	CogneeLLMEndpoint          string        // COGNEE_LLM_ENDPOINT (default "https://openrouter.ai/api/v1")
+	CogneeEmbeddingEndpoint    string        // COGNEE_EMBEDDING_ENDPOINT (default "http://localhost:8080/v1")
+	CogneeEmbeddingProvider    string        // COGNEE_EMBEDDING_PROVIDER (default "openai")
+	CogneeMaxConcurrentRetains int           // COGNEE_MAX_CONCURRENT_RETAINS, default 10
+	CogneeRetainTimeout        time.Duration // COGNEE_RETAIN_TIMEOUT, default 900s (15 min)
+	TemporalCognify            bool          // COGNEE_TEMPORAL_COGNIFY, default true
+	MemoryOnly                 bool          // COGNEE_MEMORY_ONLY, default true
 
 	// Auto-improve
-	AutoImproveAfterN  int           // AUTO_IMPROVE_AFTER_N, 0=disabled, default 0
+	AutoImproveAfterN   int           // AUTO_IMPROVE_AFTER_N, 0=disabled, default 0
 	AutoImproveCooldown time.Duration // AUTO_IMPROVE_COOLDOWN, default 120s
 
 	// Auto-reflect
@@ -158,22 +158,22 @@ func LoadConfig() Config {
 		Backend: Backend(getEnv("BACKEND", "cognee-python")),
 
 		// Cognee
-		CogneePort:               getEnv("COGNEE_PORT", "8000"),
-		CogneeDataDir:            getEnv("COGNEE_DATA_DIR", "./cognee-data"),
-		CogneeBinary:             getEnv("COGNEE_BINARY", ""),
-		CogneePythonPath:         getEnv("COGNEE_PYTHON_PATH", ""),
-		CogneeLLMApiKey:          getEnv("COGNEE_LLM_API_KEY", getEnv("OPENROUTER_API_KEY", "")),
-		CogneeLLMModel:           getEnv("COGNEE_LLM_MODEL", "deepseek/deepseek-v4-flash"),
-		CogneeLLMEndpoint:        getEnv("COGNEE_LLM_ENDPOINT", "https://openrouter.ai/api/v1"),
-		CogneeEmbeddingEndpoint:  getEnv("COGNEE_EMBEDDING_ENDPOINT", "http://localhost:"+getEnv("LLAMA_PORT", "8080")+"/v1"),
-		CogneeEmbeddingProvider:  getEnv("COGNEE_EMBEDDING_PROVIDER", "openai"),
+		CogneePort:                 getEnv("COGNEE_PORT", "8000"),
+		CogneeDataDir:              getEnv("COGNEE_DATA_DIR", "./cognee-data"),
+		CogneeBinary:               getEnv("COGNEE_BINARY", ""),
+		CogneePythonPath:           getEnv("COGNEE_PYTHON_PATH", ""),
+		CogneeLLMApiKey:            getEnv("COGNEE_LLM_API_KEY", getEnv("OPENROUTER_API_KEY", "")),
+		CogneeLLMModel:             getEnv("COGNEE_LLM_MODEL", "deepseek/deepseek-v4-flash"),
+		CogneeLLMEndpoint:          getEnv("COGNEE_LLM_ENDPOINT", "https://openrouter.ai/api/v1"),
+		CogneeEmbeddingEndpoint:    getEnv("COGNEE_EMBEDDING_ENDPOINT", "http://localhost:"+getEnv("LLAMA_PORT", "8080")+"/v1"),
+		CogneeEmbeddingProvider:    getEnv("COGNEE_EMBEDDING_PROVIDER", "openai"),
 		CogneeMaxConcurrentRetains: getEnvInt("COGNEE_MAX_CONCURRENT_RETAINS", 10),
-		CogneeRetainTimeout:      getEnvDuration("COGNEE_RETAIN_TIMEOUT", 900*time.Second),
-		TemporalCognify:          getEnvBool("COGNEE_TEMPORAL_COGNIFY", true),
-		MemoryOnly:               getEnvBool("COGNEE_MEMORY_ONLY", true),
+		CogneeRetainTimeout:        getEnvDuration("COGNEE_RETAIN_TIMEOUT", 900*time.Second),
+		TemporalCognify:            getEnvBool("COGNEE_TEMPORAL_COGNIFY", true),
+		MemoryOnly:                 getEnvBool("COGNEE_MEMORY_ONLY", true),
 
 		// Auto-improve
-		AutoImproveAfterN:  getEnvInt("AUTO_IMPROVE_AFTER_N", 0),
+		AutoImproveAfterN:   getEnvInt("AUTO_IMPROVE_AFTER_N", 0),
 		AutoImproveCooldown: clampDuration(getEnvDuration("AUTO_IMPROVE_COOLDOWN", 120*time.Second), 0),
 
 		// Auto-reflect
@@ -199,21 +199,27 @@ func LoadConfig() Config {
 }
 
 func getEnv(key, defaultValue string) string {
-	if v := os.Getenv(key); v != "" { return v }
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
 	return defaultValue
 }
 
 func getEnvInt(key string, defaultValue int) int {
 	if v := os.Getenv(key); v != "" {
 		var i int
-		if _, err := fmt.Sscanf(v, "%d", &i); err == nil { return i }
+		if _, err := fmt.Sscanf(v, "%d", &i); err == nil {
+			return i
+		}
 	}
 	return defaultValue
 }
 
 func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
-		if d, err := time.ParseDuration(v); err == nil { return d }
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
 		log.Printf("WARN: invalid duration for %s=%q, using default %v", key, v, defaultValue)
 	}
 	return defaultValue
@@ -244,8 +250,6 @@ func isCloudURL(s string) bool {
 // IsCloudEmbedding returns true iff ModelPath is an HTTP/HTTPS URL,
 // indicating the embedding service should use a cloud endpoint.
 func (c Config) IsCloudEmbedding() bool { return isCloudURL(c.ModelPath) }
-
-
 
 // Validate checks the configuration for common mistakes.
 func (c Config) Validate() error {

@@ -51,19 +51,19 @@ func newM3Fixture(t *testing.T, opts ...m3FixtureOption) *m3Fixture {
 
 	// Default config
 	cfg := Config{
-		AutoImproveAfterN:  0, // disabled by default
-		AutoImproveCooldown: 120 * time.Second,
-		QueueDBPath:        ":memory:",
-		QueueMaxPending:    1000,
-		QueueJobTTL:        24 * time.Hour,
-		QueueTTLInterval:   5 * time.Minute,
-		QueueWorkerCount:   1,
-		QueueMaxConcurrent: 1,
-		CogneePort:         fmt.Sprintf("%d", mockCognee.Port()),
-		CogneeRetainTimeout: 30 * time.Second,
+		AutoImproveAfterN:     0, // disabled by default
+		AutoImproveCooldown:   120 * time.Second,
+		QueueDBPath:           ":memory:",
+		QueueMaxPending:       1000,
+		QueueJobTTL:           24 * time.Hour,
+		QueueTTLInterval:      5 * time.Minute,
+		QueueWorkerCount:      1,
+		QueueMaxConcurrent:    1,
+		CogneePort:            fmt.Sprintf("%d", mockCognee.Port()),
+		CogneeRetainTimeout:   30 * time.Second,
 		BackendReflectTimeout: 30 * time.Second,
-		BackendRecallTimeout: 10 * time.Second,
-		BackendRetainTimeout: 30 * time.Second,
+		BackendRecallTimeout:  10 * time.Second,
+		BackendRetainTimeout:  30 * time.Second,
 	}
 
 	// Apply options

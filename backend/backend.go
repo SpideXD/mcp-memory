@@ -33,7 +33,7 @@ type Backend interface {
 // BackendConfig is the flat configuration struct passed to the New factory.
 // It avoids circular imports by not referencing the main package's Config.
 type BackendConfig struct {
-	Backend               string        // "cognee-python", "cognee-rust"
+	Backend               string // "cognee-python", "cognee-rust"
 	CogneePort            string
 	BackendRetainTimeout  time.Duration
 	BackendRecallTimeout  time.Duration

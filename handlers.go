@@ -86,32 +86,44 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	// Build list of down services
 	var down []string
-	if !llama { down = append(down, "llama (embedder)") }
-	if !cognee { down = append(down, "cognee") }
-	if down == nil { down = []string{} } // Prevent JSON null
+	if !llama {
+		down = append(down, "llama (embedder)")
+	}
+	if !cognee {
+		down = append(down, "cognee")
+	}
+	if down == nil {
+		down = []string{}
+	} // Prevent JSON null
 	s.sessionsMu.RLock()
 	n := len(s.sessions)
 	s.sessionsMu.RUnlock()
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":          status,
-		"version":         Version,
-		"built":           BuildTime,
-		"llama":           llama,
-		"cognee":          cognee,
-		"down":            down,
-		"queue_depth":     queueDepth(s.queueStore),
-		"sessions":        n,
-		"sse_drops":       s.metrics.sseDrops.Value(),
-		"uptime":          time.Since(s.startTime).String(),
-		"panics_total":    s.panics.Load(),
-		"metrics":         metrics.Snapshot("memory"),
+		"status":       status,
+		"version":      Version,
+		"built":        BuildTime,
+		"llama":        llama,
+		"cognee":       cognee,
+		"down":         down,
+		"queue_depth":  queueDepth(s.queueStore),
+		"sessions":     n,
+		"sse_drops":    s.metrics.sseDrops.Value(),
+		"uptime":       time.Since(s.startTime).String(),
+		"panics_total": s.panics.Load(),
+		"metrics":      metrics.Snapshot("memory"),
 	})
 }
 
 func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost { http.Error(w, "method not allowed", 405); return }
-	if !s.checkAuth(r) { http.Error(w, `{"error":"unauthorized"}`, 401); return }
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	if !s.checkAuth(r) {
+		http.Error(w, `{"error":"unauthorized"}`, 401)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	s.mu.RLock()
 	running := s.state == StateRunning
@@ -120,13 +132,23 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"status": "already running"})
 		return
 	}
-	if err := s.Start(); err != nil { w.WriteHeader(500); json.NewEncoder(w).Encode(map[string]string{"error": err.Error()}); return }
+	if err := s.Start(); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	json.NewEncoder(w).Encode(map[string]string{"status": "started"})
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost { http.Error(w, "method not allowed", 405); return }
-	if !s.checkAuth(r) { http.Error(w, `{"error":"unauthorized"}`, 401); return }
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	if !s.checkAuth(r) {
+		http.Error(w, `{"error":"unauthorized"}`, 401)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "shutting down"})
 	// Stop in goroutine so HTTP response can be sent before the server dies
@@ -134,7 +156,10 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMCPSSE(w http.ResponseWriter, r *http.Request) {
-	if !s.checkAuth(r) { http.Error(w, `{"error":"unauthorized"}`, 401); return }
+	if !s.checkAuth(r) {
+		http.Error(w, `{"error":"unauthorized"}`, 401)
+		return
+	}
 	// Parse and validate bank from URL
 	bank := ""
 	if raw := r.URL.Query().Get("bank"); raw != "" {
@@ -179,13 +204,19 @@ func (s *Server) handleMCPSSE(w http.ResponseWriter, r *http.Request) {
 	defer func() { s.sessionsMu.Lock(); delete(s.sessions, id); s.sessionsMu.Unlock() }()
 
 	fmt.Fprintf(w, "event: endpoint\ndata: /mcp/message?session_id=%s\n\n", id)
-	if f, ok := w.(http.Flusher); ok { f.Flush() }
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 	for {
 		select {
 		case msg, ok := <-ch:
-			if !ok { return }
+			if !ok {
+				return
+			}
 			fmt.Fprintf(w, "event: message\ndata: %s\n\n", msg)
-			if f, ok := w.(http.Flusher); ok { f.Flush() }
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
 			sess.LastActive = time.Now()
 		case <-r.Context().Done():
 			return
@@ -194,16 +225,41 @@ func (s *Server) handleMCPSSE(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMCPMessage(w http.ResponseWriter, r *http.Request) {
-	if !s.checkAuth(r) { http.Error(w, `{"error":"unauthorized"}`, 401); return }
-	if r.Method != "POST" { http.Error(w, "method not allowed", 405); return }
+	if !s.checkAuth(r) {
+		http.Error(w, `{"error":"unauthorized"}`, 401)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, s.config.MaxBodyBytes)
 	sid := r.URL.Query().Get("session_id")
-	if sid == "" { http.Error(w, "session_id required", 400); return }
-	s.sessionsMu.RLock(); _, ok := s.sessions[sid]; s.sessionsMu.RUnlock()
-	if !ok { http.Error(w, "invalid session", 400); return }
-	var req struct{ JSONRPC string `json:"jsonrpc"`; ID interface{} `json:"id"`; Method string `json:"method"`; Params json.RawMessage `json:"params"` }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil { s.mcpError(sid, nil, -32700, "Parse error"); return }
-	if req.JSONRPC != "2.0" { s.mcpError(sid, nil, -32600, "Invalid Request: jsonrpc must be 2.0"); return }
+	if sid == "" {
+		http.Error(w, "session_id required", 400)
+		return
+	}
+	s.sessionsMu.RLock()
+	_, ok := s.sessions[sid]
+	s.sessionsMu.RUnlock()
+	if !ok {
+		http.Error(w, "invalid session", 400)
+		return
+	}
+	var req struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      interface{}     `json:"id"`
+		Method  string          `json:"method"`
+		Params  json.RawMessage `json:"params"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.mcpError(sid, nil, -32700, "Parse error")
+		return
+	}
+	if req.JSONRPC != "2.0" {
+		s.mcpError(sid, nil, -32600, "Invalid Request: jsonrpc must be 2.0")
+		return
+	}
 	w.WriteHeader(202)
 	go s.safeRouteMCP(sid, req.Method, req.ID, req.Params)
 }
@@ -238,17 +294,31 @@ func (s *Server) routeMCP(sid string, method string, id interface{}, params json
 }
 
 func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessage) {
-	var c struct{ Name string `json:"name"`; Arguments json.RawMessage `json:"arguments"` }
-	if json.Unmarshal(params, &c) != nil { s.mcpError(sid, id, -32602, "invalid params"); return }
+	var c struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if json.Unmarshal(params, &c) != nil {
+		s.mcpError(sid, id, -32602, "invalid params")
+		return
+	}
 
 	// Generate per-request trace ID for end-to-end tracing
 	reqID := fmt.Sprintf("%s-%s", c.Name, sid[:8])
 	start := time.Now()
 
-	s.sessionsMu.RLock(); sess, ok := s.sessions[sid]; s.sessionsMu.RUnlock()
-	if !ok { s.mcpError(sid, id, -32000, "session not found"); return }
+	s.sessionsMu.RLock()
+	sess, ok := s.sessions[sid]
+	s.sessionsMu.RUnlock()
+	if !ok {
+		s.mcpError(sid, id, -32000, "session not found")
+		return
+	}
 	bank := sess.Bank
-	if bank == "" { s.mcpError(sid, id, -32000, "bank is required: connect with ?bank=name"); return }
+	if bank == "" {
+		s.mcpError(sid, id, -32000, "bank is required: connect with ?bank=name")
+		return
+	}
 
 	logReq := func(result string, err error) {
 		d := time.Since(start)
@@ -268,7 +338,9 @@ func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessa
 
 	switch c.Name {
 	case "memory_recall":
-		var a struct{ Query string `json:"query"` }
+		var a struct {
+			Query string `json:"query"`
+		}
 		if err := json.Unmarshal(c.Arguments, &a); err != nil || a.Query == "" {
 			s.mcpError(sid, id, -32602, "query is required")
 			logReq("", fmt.Errorf("missing query"))
@@ -277,12 +349,18 @@ func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessa
 		s.metrics.recallCalls.Inc()
 		s.metrics.recallTotal.Inc()
 		r, err := s.backend.Recall(context.Background(), bank, a.Query)
-		if err != nil { s.mcpError(sid, id, -32000, err.Error()); logReq("", err); return }
+		if err != nil {
+			s.mcpError(sid, id, -32000, err.Error())
+			logReq("", err)
+			return
+		}
 		s.mcpToolResult(sid, id, r)
 		logReq("ok", nil)
 
 	case "memory_retain":
-		var a struct{ Content string `json:"content"` }
+		var a struct {
+			Content string `json:"content"`
+		}
 		if err := json.Unmarshal(c.Arguments, &a); err != nil || a.Content == "" {
 			s.mcpError(sid, id, -32602, "content is required")
 			logReq("", fmt.Errorf("missing content"))
@@ -325,7 +403,9 @@ func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessa
 		logReq("ok", nil)
 
 	case "memory_reflect":
-		var a struct{ Query string `json:"query"` }
+		var a struct {
+			Query string `json:"query"`
+		}
 		if err := json.Unmarshal(c.Arguments, &a); err != nil {
 			s.mcpError(sid, id, -32602, "invalid arguments")
 			logReq("", fmt.Errorf("invalid arguments"))
@@ -379,7 +459,9 @@ func initResponse() map[string]interface{} {
 
 func (s *Server) checkAuth(r *http.Request) bool {
 	token := s.config.AuthToken
-	if token == "" { return true } // No token configured = open access
+	if token == "" {
+		return true
+	} // No token configured = open access
 	return r.Header.Get("Authorization") == "Bearer "+token
 }
 
@@ -394,12 +476,12 @@ func (s *Server) toolsList() map[string]interface{} {
 	tools = append(tools,
 		map[string]interface{}{
 			"name":        "memory_forget",
-			"description":  "Remove a specific memory from storage",
+			"description": "Remove a specific memory from storage",
 			"inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"content_id": map[string]interface{}{"type": "string"}}, "required": []string{"content_id"}},
 		},
 		map[string]interface{}{
 			"name":        "memory_retain_status",
-			"description":  "Check the status of an async retain job",
+			"description": "Check the status of an async retain job",
 			"inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"job_id": map[string]interface{}{"type": "string"}}, "required": []string{"job_id"}},
 		},
 	)
@@ -408,7 +490,9 @@ func (s *Server) toolsList() map[string]interface{} {
 
 // handleForget removes a specific memory from the backend.
 func (s *Server) handleForget(sid string, id interface{}, bank string, args json.RawMessage, logReq func(string, error)) {
-	var a struct{ ContentID string `json:"content_id"` }
+	var a struct {
+		ContentID string `json:"content_id"`
+	}
 	if err := json.Unmarshal(args, &a); err != nil || a.ContentID == "" {
 		s.mcpError(sid, id, -32602, "content_id is required")
 		logReq("", fmt.Errorf("missing content_id"))
@@ -427,7 +511,9 @@ func (s *Server) handleForget(sid string, id interface{}, bank string, args json
 
 // handleRetainStatus checks the status of an async retain job.
 func (s *Server) handleRetainStatus(sid string, id interface{}, args json.RawMessage, logReq func(string, error)) {
-	var a struct{ JobID string `json:"job_id"` }
+	var a struct {
+		JobID string `json:"job_id"`
+	}
 	if err := json.Unmarshal(args, &a); err != nil || a.JobID == "" {
 		s.mcpError(sid, id, -32602, "job_id is required")
 		logReq("", fmt.Errorf("missing job_id"))
@@ -504,15 +590,15 @@ func (s *Server) handleDebugQueue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := map[string]interface{}{
-		"pending":             pending,
-		"running":             running,
-		"completed_total":     completed,
-		"failed_total":        failed,
-		"dead_total":          dead,
+		"pending":              pending,
+		"running":              running,
+		"completed_total":      completed,
+		"failed_total":         failed,
+		"dead_total":           dead,
 		"oldest_pending_age_s": oldestPendingAgeS,
-		"workers":             s.config.QueueWorkerCount,
-		"max_concurrent":      s.config.QueueMaxConcurrent,
-		"db_size_kb":          dbSizeKB,
+		"workers":              s.config.QueueWorkerCount,
+		"max_concurrent":       s.config.QueueMaxConcurrent,
+		"db_size_kb":           dbSizeKB,
 	}
 	json.NewEncoder(w).Encode(response)
 }

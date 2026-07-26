@@ -63,8 +63,12 @@ func (svc *services) start() error {
 	if svc.config.IsCloudEmbedding() {
 		svc.log.Info("llama.cpp skipped (cloud embedding mode)")
 	} else if svc.check(llamaURL) != nil {
-		if err := svc.startLlama(); err != nil { return err }
-		if err := svc.wait(context.Background(), llamaURL, svc.config.StartTimeout); err != nil { return err }
+		if err := svc.startLlama(); err != nil {
+			return err
+		}
+		if err := svc.wait(context.Background(), llamaURL, svc.config.StartTimeout); err != nil {
+			return err
+		}
 		svc.log.Info("llama.cpp started")
 	} else {
 		svc.log.Info("llama.cpp already running")
@@ -74,8 +78,12 @@ func (svc *services) start() error {
 	case BackendCogneePython:
 		cogneeURL := healthURL(svc.config.CogneePort)
 		if svc.check(cogneeURL) != nil {
-			if err := svc.startCogneePython(); err != nil { return err }
-			if err := svc.wait(context.Background(), cogneeURL, svc.config.StartTimeout); err != nil { return err }
+			if err := svc.startCogneePython(); err != nil {
+				return err
+			}
+			if err := svc.wait(context.Background(), cogneeURL, svc.config.StartTimeout); err != nil {
+				return err
+			}
 			svc.log.Info("cognee-python started")
 		} else {
 			svc.log.Info("cognee-python already running")
@@ -84,8 +92,12 @@ func (svc *services) start() error {
 	case BackendCogneeRust:
 		cogneeURL := healthURL(svc.config.CogneePort)
 		if svc.check(cogneeURL) != nil {
-			if err := svc.startCogneeRust(); err != nil { return err }
-			if err := svc.wait(context.Background(), cogneeURL, svc.config.StartTimeout); err != nil { return err }
+			if err := svc.startCogneeRust(); err != nil {
+				return err
+			}
+			if err := svc.wait(context.Background(), cogneeURL, svc.config.StartTimeout); err != nil {
+				return err
+			}
 			svc.log.Info("cognee-rust started")
 		} else {
 			svc.log.Info("cognee-rust already running")
@@ -203,7 +215,9 @@ func (svc *services) checkAndRestart(
 
 	// Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s (max 30s)
 	backoff := time.Duration(1<<uint(min(restarts, 5))) * time.Second
-	if backoff < 1*time.Second { backoff = 1 * time.Second }
+	if backoff < 1*time.Second {
+		backoff = 1 * time.Second
+	}
 	if restarts > 0 {
 		svc.log.Info("backing off before restart", "name", name, "backoff", backoff)
 		select {
@@ -266,17 +280,27 @@ func (svc *services) allHealthy() (llama, cognee bool) {
 		var wg sync.WaitGroup
 
 		nChecks := 1 // cognee
-		if !svc.config.IsCloudEmbedding() { nChecks++ }
+		if !svc.config.IsCloudEmbedding() {
+			nChecks++
+		}
 		wg.Add(nChecks)
 		if !svc.config.IsCloudEmbedding() {
 			go func() {
-				defer func() { if rec := recover(); rec != nil { svc.log.Error("allHealthy panic", "service", "llama", "panic", fmt.Sprintf("%v", rec)) } }()
+				defer func() {
+					if rec := recover(); rec != nil {
+						svc.log.Error("allHealthy panic", "service", "llama", "panic", fmt.Sprintf("%v", rec))
+					}
+				}()
 				defer wg.Done()
 				l = svc.check(healthURL(svc.config.LlamaPort)) == nil
 			}()
 		}
 		go func() {
-			defer func() { if rec := recover(); rec != nil { svc.log.Error("allHealthy panic", "service", "cognee", "panic", fmt.Sprintf("%v", rec)) } }()
+			defer func() {
+				if rec := recover(); rec != nil {
+					svc.log.Error("allHealthy panic", "service", "cognee", "panic", fmt.Sprintf("%v", rec))
+				}
+			}()
 			defer wg.Done()
 			c = svc.check(healthURL(svc.config.CogneePort)) == nil
 		}()
@@ -300,11 +324,17 @@ func healthURL(port string) string { return "http://localhost:" + port + "/healt
 
 func (svc *services) check(url string) error {
 	timeout := svc.config.HealthTimeout
-	if timeout > 5*time.Second { timeout = 5 * time.Second } // Cap health pings
+	if timeout > 5*time.Second {
+		timeout = 5 * time.Second
+	} // Cap health pings
 	resp, err := httpGet(svc.httpClient, url, timeout)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	resp.Body.Close()
-	if resp.StatusCode != 200 { return fmt.Errorf("health check: status %d", resp.StatusCode) }
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("health check: status %d", resp.StatusCode)
+	}
 	return nil
 }
 
@@ -317,7 +347,10 @@ func (svc *services) wait(ctx context.Context, url string, timeout time.Duration
 		default:
 		}
 		resp, err := httpGet(svc.httpClient, url, 2*time.Second)
-		if err == nil { resp.Body.Close(); return nil }
+		if err == nil {
+			resp.Body.Close()
+			return nil
+		}
 		time.Sleep(1 * time.Second)
 	}
 	return errTimeout
@@ -351,7 +384,8 @@ func (svc *services) resolveLlamaPath() (string, error) {
 func (svc *services) startLlama() error {
 	modelPath := svc.config.ModelPath
 	if !filepath.IsAbs(modelPath) {
-		wd, _ := os.Getwd(); modelPath = filepath.Join(wd, modelPath)
+		wd, _ := os.Getwd()
+		modelPath = filepath.Join(wd, modelPath)
 	}
 	if _, err := os.Stat(modelPath); os.IsNotExist(err) {
 		return errModelNotFound(modelPath)
@@ -373,7 +407,9 @@ func (svc *services) startLlama() error {
 	if cmd == nil {
 		return fmt.Errorf("failed to spawn llama.cpp embedder")
 	}
-	svc.mu.Lock(); svc.llamaCmd = cmd; svc.mu.Unlock()
+	svc.mu.Lock()
+	svc.llamaCmd = cmd
+	svc.mu.Unlock()
 	return nil
 }
 
@@ -435,7 +471,9 @@ func (svc *services) startCogneePython() error {
 	f, _ := os.OpenFile(filepath.Join(wd, "logs", "cognee-crash.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	cmd.Stdout, cmd.Stderr = f, f
 	if err := cmd.Start(); err != nil {
-		if f != nil { f.Close() }
+		if f != nil {
+			f.Close()
+		}
 		return err
 	}
 	svc.mu.Lock()
@@ -460,7 +498,9 @@ func (svc *services) startCogneeRust() error {
 	f, _ := os.OpenFile(filepath.Join(wd, "logs", "cognee-crash.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	cmd.Stdout, cmd.Stderr = f, f
 	if err := cmd.Start(); err != nil {
-		if f != nil { f.Close() }
+		if f != nil {
+			f.Close()
+		}
 		return err
 	}
 	svc.mu.Lock()
@@ -552,7 +592,12 @@ func (svc *services) stopProcess(cmdPtr **exec.Cmd, name string) {
 	syscall.Kill(-pid, syscall.SIGTERM)
 	done := make(chan error, 1)
 	go func() {
-		defer func() { if r := recover(); r != nil { svc.log.Error("stopProcess panic", "name", name, "panic", fmt.Sprintf("%v", r)); done <- errProcessPanic } }()
+		defer func() {
+			if r := recover(); r != nil {
+				svc.log.Error("stopProcess panic", "name", name, "panic", fmt.Sprintf("%v", r))
+				done <- errProcessPanic
+			}
+		}()
 		done <- cmd.Wait()
 	}()
 	t := time.NewTimer(svc.config.StopTimeout)
@@ -586,7 +631,9 @@ func (svc *services) waitAllHealthy(timeout time.Duration) error {
 			return fmt.Errorf("services not healthy after %v: llama=%v cognee=%v", timeout, l, c)
 		case <-ticker.C:
 			l, c := svc.allHealthy()
-			if l && c { return nil }
+			if l && c {
+				return nil
+			}
 		}
 	}
 }

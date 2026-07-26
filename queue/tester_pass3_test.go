@@ -30,9 +30,9 @@ func TestChaos1_RapidStartStopCycles(t *testing.T) {
 	s := newTestStore(t)
 
 	const (
-		cycles     = 50
-		workerCnt  = 4
-		semSize    = 2
+		cycles    = 50
+		workerCnt = 4
+		semSize   = 2
 	)
 
 	processFunc := func(ctx context.Context, job *Job) error {
@@ -429,9 +429,9 @@ func TestChaos5_WorkerStormFIFO(t *testing.T) {
 	s := newTestStoreWithConfig(t, StoreConfig{MaxPending: 500})
 
 	const (
-		numWorkers  = 50
-		semSize     = 1
-		numJobs     = 200
+		numWorkers = 50
+		semSize    = 1
+		numJobs    = 200
 	)
 
 	// Insert 200 jobs sequentially (so IDs reflect insertion order)
@@ -442,8 +442,8 @@ func TestChaos5_WorkerStormFIFO(t *testing.T) {
 	var (
 		completedCount atomic.Int64
 		// Track the order of first claims vs completions for FIFO analysis
-		claimOrder    = make([]string, 0, numJobs)
-		claimMu       sync.Mutex
+		claimOrder = make([]string, 0, numJobs)
+		claimMu    sync.Mutex
 	)
 
 	processFunc := func(ctx context.Context, job *Job) error {
@@ -653,15 +653,15 @@ func TestChaos7_StatsUnderFire(t *testing.T) {
 	const (
 		numInserters = 20
 		numWorkers   = 5
-		numJobsEach  = 50   // each inserter adds this many jobs
+		numJobsEach  = 50 // each inserter adds this many jobs
 		statCalls    = 100
 	)
 
 	var (
-		wg             sync.WaitGroup
-		statsErrors    atomic.Int64
-		workersWg      sync.WaitGroup
-		stopWorkers    atomic.Bool
+		wg          sync.WaitGroup
+		statsErrors atomic.Int64
+		workersWg   sync.WaitGroup
+		stopWorkers atomic.Bool
 	)
 
 	// Worker pool — continuously dequeue until told to stop

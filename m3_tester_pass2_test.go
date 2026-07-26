@@ -393,17 +393,17 @@ func TestM3P2_QueueDepthRaceWithClose(t *testing.T) {
 
 func TestM3P2_ConfigValidation_QueueWorkersZero(t *testing.T) {
 	cfg := Config{
-		Backend:               BackendCogneePython,
-		MaxSessions:           10,
-		MaxContentBytes:       1 << 20,
-		StartTimeout:          10 * time.Second,
-		StopTimeout:           5 * time.Second,
-		ShutdownTimeout:       5 * time.Second,
+		Backend:                    BackendCogneePython,
+		MaxSessions:                10,
+		MaxContentBytes:            1 << 20,
+		StartTimeout:               10 * time.Second,
+		StopTimeout:                5 * time.Second,
+		ShutdownTimeout:            5 * time.Second,
 		CogneeMaxConcurrentRetains: 3,
-		CogneeRetainTimeout:  900 * time.Second,
-		QueueMaxPending:       100,
-		QueueWorkerCount:      0,  // INVALID
-		QueueMaxConcurrent:    3,
+		CogneeRetainTimeout:        900 * time.Second,
+		QueueMaxPending:            100,
+		QueueWorkerCount:           0, // INVALID
+		QueueMaxConcurrent:         3,
 	}
 	err := cfg.Validate()
 	if err == nil {
@@ -417,17 +417,17 @@ func TestM3P2_ConfigValidation_QueueWorkersZero(t *testing.T) {
 
 func TestM3P2_ConfigValidation_QueueMaxPendingZero(t *testing.T) {
 	cfg := Config{
-		Backend:               BackendCogneePython,
-		MaxSessions:           10,
-		MaxContentBytes:       1 << 20,
-		StartTimeout:          10 * time.Second,
-		StopTimeout:           5 * time.Second,
-		ShutdownTimeout:       5 * time.Second,
+		Backend:                    BackendCogneePython,
+		MaxSessions:                10,
+		MaxContentBytes:            1 << 20,
+		StartTimeout:               10 * time.Second,
+		StopTimeout:                5 * time.Second,
+		ShutdownTimeout:            5 * time.Second,
 		CogneeMaxConcurrentRetains: 3,
-		CogneeRetainTimeout:  900 * time.Second,
-		QueueMaxPending:       0,  // INVALID
-		QueueWorkerCount:      4,
-		QueueMaxConcurrent:    3,
+		CogneeRetainTimeout:        900 * time.Second,
+		QueueMaxPending:            0, // INVALID
+		QueueWorkerCount:           4,
+		QueueMaxConcurrent:         3,
 	}
 	err := cfg.Validate()
 	if err == nil {
@@ -441,17 +441,17 @@ func TestM3P2_ConfigValidation_QueueMaxPendingZero(t *testing.T) {
 
 func TestM3P2_ConfigValidation_QueueMaxConcurrentZero(t *testing.T) {
 	cfg := Config{
-		Backend:               BackendCogneePython,
-		MaxSessions:           10,
-		MaxContentBytes:       1 << 20,
-		StartTimeout:          10 * time.Second,
-		StopTimeout:           5 * time.Second,
-		ShutdownTimeout:       5 * time.Second,
+		Backend:                    BackendCogneePython,
+		MaxSessions:                10,
+		MaxContentBytes:            1 << 20,
+		StartTimeout:               10 * time.Second,
+		StopTimeout:                5 * time.Second,
+		ShutdownTimeout:            5 * time.Second,
 		CogneeMaxConcurrentRetains: 3,
-		CogneeRetainTimeout:  900 * time.Second,
-		QueueMaxPending:       100,
-		QueueWorkerCount:      4,
-		QueueMaxConcurrent:    0,  // INVALID
+		CogneeRetainTimeout:        900 * time.Second,
+		QueueMaxPending:            100,
+		QueueWorkerCount:           4,
+		QueueMaxConcurrent:         0, // INVALID
 	}
 	err := cfg.Validate()
 	if err == nil {
@@ -467,17 +467,17 @@ func TestM3P2_ConfigValidation_QueueMaxConcurrentZero(t *testing.T) {
 // This test documents that the config doesn't enforce this relationship.
 func TestM3P2_ConfigValidation_MaxConcurrentGreaterThanWorkers(t *testing.T) {
 	cfg := Config{
-		Backend:               BackendCogneePython,
-		MaxSessions:           10,
-		MaxContentBytes:       1 << 20,
-		StartTimeout:          10 * time.Second,
-		StopTimeout:           5 * time.Second,
-		ShutdownTimeout:       5 * time.Second,
+		Backend:                    BackendCogneePython,
+		MaxSessions:                10,
+		MaxContentBytes:            1 << 20,
+		StartTimeout:               10 * time.Second,
+		StopTimeout:                5 * time.Second,
+		ShutdownTimeout:            5 * time.Second,
 		CogneeMaxConcurrentRetains: 3,
-		CogneeRetainTimeout:  900 * time.Second,
-		QueueMaxPending:       100,
-		QueueWorkerCount:      1,
-		QueueMaxConcurrent:    10, // > workers — inconsistent but not harmful
+		CogneeRetainTimeout:        900 * time.Second,
+		QueueMaxPending:            100,
+		QueueWorkerCount:           1,
+		QueueMaxConcurrent:         10, // > workers — inconsistent but not harmful
 	}
 	err := cfg.Validate()
 	if err != nil {

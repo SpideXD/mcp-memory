@@ -34,14 +34,14 @@ func countLines(data []byte) int {
 // ---- Construction Edge Cases ----
 
 func TestNew_AllValidLevels(t *testing.T) {
-	levels := []struct{
-		name   string
-		level  string
-		logFn  func(*Logger, string, ...any)
+	levels := []struct {
+		name  string
+		level string
+		logFn func(*Logger, string, ...any)
 	}{
 		{"debug", "debug", (*Logger).Debug},
-		{"info",  "info",  (*Logger).Info},
-		{"warn",  "warn",  (*Logger).Warn},
+		{"info", "info", (*Logger).Info},
+		{"warn", "warn", (*Logger).Warn},
 		{"error", "error", (*Logger).Error},
 	}
 	for _, tt := range levels {

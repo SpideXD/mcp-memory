@@ -82,11 +82,11 @@ type ScaleMetrics struct {
 
 // ConcurrencyMetrics is the Metrics payload for Dimension 3 multi-agent test.
 type ConcurrencyMetrics struct {
-	TotalOps        int                       `json:"total_ops"`
-	SuccessfulOps   int                       `json:"successful_ops"`
-	FailedOps       int                       `json:"failed_ops"`
-	Agents          int                       `json:"agents"`
-	PerAgentResults map[int]AgentOpsSummary   `json:"per_agent_results"`
+	TotalOps        int                     `json:"total_ops"`
+	SuccessfulOps   int                     `json:"successful_ops"`
+	FailedOps       int                     `json:"failed_ops"`
+	Agents          int                     `json:"agents"`
+	PerAgentResults map[int]AgentOpsSummary `json:"per_agent_results"`
 }
 
 // AgentOpsSummary summarizes one agent's operations.
@@ -148,8 +148,8 @@ type retainResult struct {
 // HealthResponse matches the /health JSON structure.
 type HealthResponse struct {
 	Status string `json:"status"`
-	Llama    bool `json:"llama"`
-	Cognee   bool `json:"cognee"`
+	Llama  bool   `json:"llama"`
+	Cognee bool   `json:"cognee"`
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -269,8 +269,6 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
-
-
 // readPIDFile reads logs/.mcp-pids.json and returns the PID map.
 func readPIDFile(t *testing.T) map[string]int {
 	t.Helper()
@@ -317,7 +315,9 @@ func expectedEmployerForMonth(month int) string {
 
 // extractTopResultText parses the MCP recall JSON response and extracts the
 // text of the first (top-ranked) result. The response structure is:
-//  {"content":[{"text":"{\"results\":[{\"text\":\"...\"},...],...}"}]}
+//
+//	{"content":[{"text":"{\"results\":[{\"text\":\"...\"},...],...}"}]}
+//
 // Returns empty string if parsing fails (probe returned errors or malformed JSON).
 func extractTopResultText(actualOutput string) string {
 	if actualOutput == "" {
@@ -1677,7 +1677,12 @@ func TestStressEdge_All(t *testing.T) {
 				ExpectedConcept: "",
 				ActualOutput:    emptyOutput,
 				LatencyMs:       float64(emptyDur.Microseconds()) / 1000.0,
-				Note:            func() string { if emptyErr != nil { return fmt.Sprintf("empty probe error (expected): %v", emptyErr) }; return "" }(),
+				Note: func() string {
+					if emptyErr != nil {
+						return fmt.Sprintf("empty probe error (expected): %v", emptyErr)
+					}
+					return ""
+				}(),
 			})
 			t.Logf("Empty-string probe: err=%v output_len=%d", emptyErr, len(emptyOutput))
 		}

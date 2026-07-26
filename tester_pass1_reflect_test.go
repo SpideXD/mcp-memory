@@ -7,7 +7,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
 )
 
 // ============================================================================
@@ -181,22 +180,16 @@ func TestAttack4b_TimeTenYearsFuture(t *testing.T) {
 		AutoReflectTimeout: 1 * time.Nanosecond,
 	})
 
-	// Initialize state
-	s.checkAutoReflect("attack4b")
-
-	val, ok := s.reflectStates.Load("attack4b")
-	if !ok {
-		t.Fatal("expected state")
-	}
-	rs := val.(*reflectState)
-
-	// Set lastReflect to 10 years in the future
+	// Initialize state with lastReflect far in the future BEFORE first call
+	// so no job is ever inserted (Timeout=1ns would fire immediately otherwise)
 	future := time.Now().Add(10 * 365 * 24 * time.Hour)
+	val, _ := s.reflectStates.LoadOrStore("attack4b", &reflectState{lastReflect: future})
+	rs := val.(*reflectState)
 	rs.mu.Lock()
 	rs.lastReflect = future
 	rs.mu.Unlock()
 
-	// Next call should NOT trigger timeout (time.Since(future) is negative)
+	// First call — timeout should NOT fire (time.Since(future) is negative)
 	s.checkAutoReflect("attack4b")
 
 	// Verify NO reflect job was inserted

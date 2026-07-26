@@ -16,17 +16,17 @@ const maxSamples = 1000
 // using a ring buffer of the last maxSamples observations.
 // Generic: records bytes, tokens, latency — anything.
 type Histogram struct {
-	name    string
-	log     *logger.Logger
-	mu      sync.Mutex
-	count   atomic.Int64
-	total   atomic.Int64
-	min     atomic.Int64
-	max     atomic.Int64
-	samples [maxSamples]int64
-	sampleN int
+	name      string
+	log       *logger.Logger
+	mu        sync.Mutex
+	count     atomic.Int64
+	total     atomic.Int64
+	min       atomic.Int64
+	max       atomic.Int64
+	samples   [maxSamples]int64
+	sampleN   int
 	sampleIdx int
-	rate    *EWMA
+	rate      *EWMA
 }
 
 // NewHistogram creates a histogram and auto-registers it.

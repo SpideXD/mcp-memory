@@ -155,7 +155,7 @@ func (m *mockBackend) Reflect(ctx context.Context, bank string, query string) (s
 	return "", nil
 }
 func (m *mockBackend) Health(ctx context.Context) error { return nil }
-func (m *mockBackend) Name() string                      { return "mock" }
+func (m *mockBackend) Name() string                     { return "mock" }
 func (m *mockBackend) Forget(ctx context.Context, bank string, contentID string) (string, error) {
 	return "", nil
 }
@@ -167,13 +167,13 @@ func testServer(dir string, cfg Config) *Server {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		config:        cfg,
-		improveState:  loadAutoImproveState(dir),
-		log:           l,
-		metrics:       &serverMetrics{errorCalls: metrics.NewCounter("test")},
-		backend:       &mockBackend{},
-		cogneeCtx:     ctx,
-		cogneeCancel:  cancel,
+		config:       cfg,
+		improveState: loadAutoImproveState(dir),
+		log:          l,
+		metrics:      &serverMetrics{errorCalls: metrics.NewCounter("test")},
+		backend:      &mockBackend{},
+		cogneeCtx:    ctx,
+		cogneeCancel: cancel,
 	}
 }
 
@@ -181,7 +181,7 @@ func TestMaybeAutoImprove_DisabledWhenZero(t *testing.T) {
 	dir := t.TempDir()
 	s := &Server{
 		config: Config{
-			AutoImproveAfterN:  0,
+			AutoImproveAfterN:   0,
 			AutoImproveCooldown: 120 * time.Second,
 		},
 		improveState: loadAutoImproveState(dir),
@@ -198,7 +198,7 @@ func TestMaybeAutoImprove_DisabledWhenZero(t *testing.T) {
 func TestMaybeAutoImprove_ThresholdNotMet(t *testing.T) {
 	dir := t.TempDir()
 	s := testServer(dir, Config{
-		AutoImproveAfterN:  5,
+		AutoImproveAfterN:   5,
 		AutoImproveCooldown: 120 * time.Second,
 	})
 
@@ -218,7 +218,7 @@ func TestMaybeAutoImprove_ThresholdNotMet(t *testing.T) {
 func TestMaybeAutoImprove_IdleCheckBlocks(t *testing.T) {
 	dir := t.TempDir()
 	s := testServer(dir, Config{
-		AutoImproveAfterN:  1,
+		AutoImproveAfterN:   1,
 		AutoImproveCooldown: 0,
 	})
 
@@ -229,15 +229,29 @@ func TestMaybeAutoImprove_IdleCheckBlocks(t *testing.T) {
 
 	// With nil queueStore, idleCheck = true, so it should fire
 	// (no queue = assume idle)
-	if !s.improveState.banks["testbank"].improveInFlight {
+	s.improveState.mu.Lock()
+	inFlight := s.improveState.banks["testbank"].improveInFlight
+	s.improveState.mu.Unlock()
+	if !inFlight {
 		t.Fatal("should have fired improve (nil queueStore = assume idle)")
+	}
+
+	// Wait for goroutine to finish so TempDir cleanup doesn't fail
+	for i := 0; i < 50; i++ {
+		s.improveState.mu.Lock()
+		stillInFlight := s.improveState.banks["testbank"].improveInFlight
+		s.improveState.mu.Unlock()
+		if !stillInFlight {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
 func TestMaybeAutoImprove_CooldownBlocks(t *testing.T) {
 	dir := t.TempDir()
 	s := testServer(dir, Config{
-		AutoImproveAfterN:  1,
+		AutoImproveAfterN:   1,
 		AutoImproveCooldown: 60 * time.Second,
 	})
 	s.improveState.banks["bank"] = &bankState{
@@ -254,7 +268,7 @@ func TestMaybeAutoImprove_CooldownBlocks(t *testing.T) {
 func TestMaybeAutoImprove_InFlightBlocks(t *testing.T) {
 	dir := t.TempDir()
 	s := testServer(dir, Config{
-		AutoImproveAfterN:  1,
+		AutoImproveAfterN:   1,
 		AutoImproveCooldown: 0,
 	})
 	s.improveState.banks["bank"] = &bankState{
@@ -274,7 +288,7 @@ func TestMaybeAutoImprove_InFlightBlocks(t *testing.T) {
 func TestMaybeAutoImprove_PersistsOnIncrement(t *testing.T) {
 	dir := t.TempDir()
 	s := testServer(dir, Config{
-		AutoImproveAfterN:  10,
+		AutoImproveAfterN:   10,
 		AutoImproveCooldown: 120 * time.Second,
 	})
 
@@ -297,7 +311,7 @@ func TestMaybeAutoImprove_PersistsOnIncrement(t *testing.T) {
 func TestMaybeAutoImprove_PerBankIsolation(t *testing.T) {
 	dir := t.TempDir()
 	s := testServer(dir, Config{
-		AutoImproveAfterN:  5,
+		AutoImproveAfterN:   5,
 		AutoImproveCooldown: 0,
 	})
 
@@ -324,7 +338,7 @@ func TestMaybeAutoImprove_PerBankIsolation(t *testing.T) {
 func TestMaybeAutoImprove_ConcurrentSafety(t *testing.T) {
 	dir := t.TempDir()
 	s := testServer(dir, Config{
-		AutoImproveAfterN:  10000, // high threshold — no fires
+		AutoImproveAfterN:   10000, // high threshold — no fires
 		AutoImproveCooldown: 0,
 	})
 

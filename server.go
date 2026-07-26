@@ -26,11 +26,11 @@ type Server struct {
 	sessions   map[string]*MCPSession
 	sessionsMu sync.RWMutex
 
-	panics      atomic.Int64
-	stopMonitor context.CancelFunc
-	shutdown    chan struct{}
+	panics       atomic.Int64
+	stopMonitor  context.CancelFunc
+	shutdown     chan struct{}
 	shutdownOnce sync.Once
-	alerts      *AlertClient
+	alerts       *AlertClient
 
 	startTime time.Time
 
@@ -229,6 +229,7 @@ func (s *Server) Start() error {
 	s.svc.savePids() // Persist child PIDs for crash recovery
 
 	go s.sessionCleaner()
+	go s.autoReflectCleanup(s.shutdown)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go s.svc.monitor(ctx, &s.panics)

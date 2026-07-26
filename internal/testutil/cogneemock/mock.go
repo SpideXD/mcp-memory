@@ -119,12 +119,12 @@ func (s *Server) getResponse(endpoint string) ResponseConfig {
 
 // defaultResponseBody returns the default JSON response body for common endpoints.
 var defaultResponses = map[string]string{
-	"/health":            `{"status":"ready","health":"healthy","version":"0.1.0"}`,
-	"/api/v1/remember":   `{"status":"completed","pipeline_run_id":"mock-run-001","dataset_id":"mock-ds-001","dataset_name":"test","items_processed":1,"elapsed_seconds":0.1}`,
-	"/api/v1/recall":     `[{"_source":"mock","text":"mock recall result for query"}]`,
-	"/api/v1/improve":    `{"status":"PipelineRunCompleted","pipeline_run_id":"mock-improve-001","dataset_id":"mock-ds-001","dataset_name":"test"}`,
-	"/api/v1/forget":     `{"dataset_id":"mock-ds-001","status":"success"}`,
-	"/not_found":         `{"error":"not found"}`,
+	"/health":          `{"status":"ready","health":"healthy","version":"0.1.0"}`,
+	"/api/v1/remember": `{"status":"completed","pipeline_run_id":"mock-run-001","dataset_id":"mock-ds-001","dataset_name":"test","items_processed":1,"elapsed_seconds":0.1}`,
+	"/api/v1/recall":   `[{"_source":"mock","text":"mock recall result for query"}]`,
+	"/api/v1/improve":  `{"status":"PipelineRunCompleted","pipeline_run_id":"mock-improve-001","dataset_id":"mock-ds-001","dataset_name":"test"}`,
+	"/api/v1/forget":   `{"dataset_id":"mock-ds-001","status":"success"}`,
+	"/not_found":       `{"error":"not found"}`,
 }
 
 // writeResponse writes an HTTP response with the given status code and body.

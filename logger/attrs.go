@@ -19,8 +19,8 @@ func PID(val int) slog.Attr              { return slog.Int("pid", val) }
 // value type is chosen for human-readable log lines.
 
 func ProjectID(val string) slog.Attr { return slog.String("project", val) }
-func Reason(val string) slog.Attr   { return slog.String("reason", val) }
-func Binary(val string) slog.Attr   { return slog.String("binary", val) }
+func Reason(val string) slog.Attr    { return slog.String("reason", val) }
+func Binary(val string) slog.Attr    { return slog.String("binary", val) }
 func Idle(d time.Duration) slog.Attr { return slog.String("idle", d.String()) }
 func TTL(d time.Duration) slog.Attr  { return slog.String("ttl", d.String()) }
 func HealthWait(d time.Duration) slog.Attr {

@@ -27,7 +27,7 @@ func main() {
 	loadEnv()
 	// Load backend-specific env file (overrides .env values)
 	loadEnvFile(backendEnvFile())
-	cleanupOrphans()  // Kill orphans from previous crash
+	cleanupOrphans() // Kill orphans from previous crash
 	config := LoadConfig()
 	if err := config.Validate(); err != nil {
 		println("mcp-memory: invalid config:", err.Error())

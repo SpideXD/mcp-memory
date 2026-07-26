@@ -66,7 +66,6 @@ func newCogneeBackend(cfg BackendConfig) *CogneeBackend {
 // Name returns "cognee".
 func (c *CogneeBackend) Name() string { return "cognee" }
 
-
 // Health checks Cognee API connectivity. GET /health
 func (c *CogneeBackend) Health(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/health", nil)

@@ -10,7 +10,6 @@ The `Makefile` at the project root provides all build, test, setup, and download
 | `LLAMA_DIR` | `bin/llama` | Download destination for llama-server |
 | `MODEL_DIR` | `model` | Download destination for GGUF model files |
 | `EMBED_MODEL` | `model/qwen3-embedding-0.6b-Q8_0.gguf` | Embedding model file path |
-| `RERANK_MODEL` | `model/bge-reranker-base-Q4_k_m.gguf` | Reranker model file path |
 
 Override at invocation: `make LLAMA_VERSION=b5432 download-llama`.
 
@@ -18,10 +17,8 @@ Override at invocation: `make LLAMA_VERSION=b5432 download-llama`.
 
 ### `setup`
 Full project setup. Runs in order:
-1. Creates `.venv` virtual environment (if not present)
-2. Installs `hindsight-api-slim==0.8.2` and `hindsight-client==0.8.2`
-3. Runs `download-llama` to get platform-specific llama-server binary
-4. Runs `download-models` to get GGUF model files
+1. Runs `download-llama` to get platform-specific llama-server binary
+2. Runs `download-models` to get GGUF model files
 
 ```bash
 make setup
@@ -67,7 +64,7 @@ make stop
 
 ### `clean`
 Removes all generated artifacts:
-- `.venv/` — Python virtual environment
+- `.venv/` — Python virtual environment (legacy, removed)
 - `bin/mcp-memory` — Go binary
 - `mcp-memory` — Go binary (root)
 - `bin/llama/` — Downloaded llama-server
@@ -106,7 +103,6 @@ Downloads GGUF model files from Hugging Face to `model/`:
 | Model | Size | Source |
 |-------|------|--------|
 | `qwen3-embedding-0.6b-Q8_0.gguf` | ~610MB | `Qwen/Qwen3-Embedding-0.6B-GGUF` |
-| `bge-reranker-base-Q4_k_m.gguf` | ~209MB | `sinjab/bge-reranker-base-Q4_K_M-GGUF` |
 
 Skips files that already exist.
 

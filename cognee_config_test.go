@@ -13,17 +13,17 @@ import (
 
 func testBackendConfig(port int) backend.BackendConfig {
 	return backend.BackendConfig{
-		Backend:                 "cognee-rust",
-		CogneePort:              fmt.Sprintf("%d", port),
-		TemporalCognify:         true,
-		MemoryOnly:              true,
-		BackendRetainTimeout:    30 * time.Second,
-		BackendRecallTimeout:    30 * time.Second,
-		BackendReflectTimeout:   30 * time.Second,
-		CogneeRetainTimeout:     30 * time.Second,
-		RetryAttempts:           1,
-		RetryDelay:              100 * time.Millisecond,
-		RetryMaxDelay:           1 * time.Second,
+		Backend:               "cognee-rust",
+		CogneePort:            fmt.Sprintf("%d", port),
+		TemporalCognify:       true,
+		MemoryOnly:            true,
+		BackendRetainTimeout:  30 * time.Second,
+		BackendRecallTimeout:  30 * time.Second,
+		BackendReflectTimeout: 30 * time.Second,
+		CogneeRetainTimeout:   30 * time.Second,
+		RetryAttempts:         1,
+		RetryDelay:            100 * time.Millisecond,
+		RetryMaxDelay:         1 * time.Second,
 	}
 }
 

@@ -1,3 +1,4 @@
+# Historical — pre-implementation design doc. See docs/architecture.md for current architecture.
 # SQLite Job Queue + Hindsight Removal
 
 ## Motivation

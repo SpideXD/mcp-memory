@@ -15,11 +15,11 @@ type ProcessFunc func(ctx context.Context, job *Job) error
 
 // WorkerConfig configures the Worker pool.
 type WorkerConfig struct {
-	Store    *Store       // required — the queue store
-	Process  ProcessFunc  // required — called for each dequeued job
-	Count    int          // number of worker goroutines (0 = DefaultWorkerCount)
-	SemSize  int          // max concurrent process calls (0 = DefaultSemSize)
-	OnDead   func(job *Job) // optional callback when job reaches StatusDead
+	Store   *Store         // required — the queue store
+	Process ProcessFunc    // required — called for each dequeued job
+	Count   int            // number of worker goroutines (0 = DefaultWorkerCount)
+	SemSize int            // max concurrent process calls (0 = DefaultSemSize)
+	OnDead  func(job *Job) // optional callback when job reaches StatusDead
 }
 
 // Worker manages a pool of goroutines that dequeue and process jobs.
