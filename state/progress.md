@@ -4,8 +4,8 @@
 |--------|--------|-------|-----------|------|-------|--------|-----|
 | M1 — Hindsight Removal | ✅ Done | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | M2 — SQLite Queue Package | 🔵 In Progress | ✅ | ✅ | ✅ | 🔄 | ⬜ | ⬜ |
-| M3 — Wire Queue into Handlers | 🔵 In Progress | ✅ | ✅ | 🔄 | ⬜ | ⬜ | ⬜ |
-| M4 — Auto-Reflect Scheduling | ⬛ Pending | ✅ | ✅ | ✅ | ⬜ | ⬜ | ⬜ |
+| M3 — Wire Queue into Handlers | ✅ Done | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| M4 — Auto-Reflect Scheduling | 🔵 In Progress | ✅ | ✅ | 🔄 | ⬜ | ⬜ | ⬜ |
 | M5 — Cleanup + Production Readiness | ⬛ Pending | ✅ | ✅ | ✅ | ⬜ | ⬜ | ⬜ |
 
 ## Notes

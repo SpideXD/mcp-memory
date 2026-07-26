@@ -1,953 +1,436 @@
-# Spec: Module 3 — Wire Queue into Handlers
+# M4 Spec: Auto-Reflect Scheduling
 
-**Module**: M3 of the SQLite Queue + Hindsight Removal project
-**Architect**: Principal Architect
-**Date**: 2026-07-26
-**Scope**: Wire `queue/` package (M2) into the MCP server handlers. Replace goroutine-per-retain/reflect with SQLite queue-backed async processing.
-**Prerequisites**: M1 complete (Hindsight removed), M2 complete (queue/ package compiles and passes tests).
-**Approach**: Approach A — KISS/YAGNI. One ProcessFunc closure. One Store. One Worker pool. Delete jobTracker, cogneeSemaphore, cogneeWg (for retain/reflect paths). Keep slim WaitGroup for auto-improve goroutines.
+**Status:** Draft | **Date:** 2026-07-23 | **Module:** M4 (additive to M3 queue system)
 
 ---
 
 ## 1. Goal
 
-Replace the current goroutine-per-retain and goroutine-per-reflect patterns in `handlers.go` with SQLite queue-backed async processing using the `queue/` package. Delete the in-memory `jobTracker`, the `cogneeSemaphore`, and the `cogneeWg` (retain/reflect usage only). Wire the Worker pool lifecycle into `Server.Start()` and `Server.Stop()`. Update health endpoint and session cleaner to read real queue metrics.
+Add automatic reflect-job triggers into the M3 SQLite queue system. After N successful retains for a given memory bank, OR after X hours have elapsed since the last auto-reflect (whichever comes first), the system automatically inserts a `type="reflect"` job with payload `"_auto"` into the SQLite queue. This is a pure additive feature — no modifications to handlers, queue internals, or the backend interface.
 
 ---
 
 ## 2. Module Decomposition
 
-This is a single, flat wiring module. All changes are in package `main`. No new subpackages. The `queue/` package is consumed as-is.
+This is a single module (Extra Small — one new file, two file modifications). No sub-module decomposition needed.
 
-### 2.1 Files Modified
+### 2.1 Files to Create
 
-| File | Nature of Change | Lines Changed (est.) |
-|------|-----------------|----------------------|
-| `server.go` | Add queueStore/queueWorker fields; wire Start/Stop; delete cogneeSemaphore/jobTracker/cogneeWg; rewrite NewServer | ~80 |
-| `handlers.go` | Replace goroutine-per-retain/reflect with queue.Insert; rewrite handleRetainStatus to use queue.Get; delete semaphore acquisition | ~100 |
-| `session_cleaner.go` | Replace TODO(M3) + hardcoded 0 with queue.Stats().Pending | ~5 |
-| `config.go` | Add QueueDBPath, QueueMaxPending, QueueJobTTL, QueueTTLInterval, QueueWorkerCount, QueueMaxConcurrent; map COGNEE_MAX_CONCURRENT_RETAINS as default | ~40 |
-| `auto_improve.go` | Replace cogneeSemaphore idle check with queue.Stats(); replace cogneeWg with autoImproveWg | ~10 |
+| # | File | Purpose |
+|---|------|---------|
+| 1 | `auto_reflect.go` | Per-bank reflect state tracking, trigger logic, `checkAutoReflect(bank)` method on `*Server` |
 
-### 2.2 Files Deleted
+### 2.2 Files to Modify
 
-| File | Reason |
-|------|--------|
-| `job_tracker.go` | Replaced by queue.Store. All call sites migrated to queue.Get / queue.Stats. |
-
-### 2.3 Files Untouched (preserved)
-
-- `backend/cognee.go`, `backend/backend.go`, `backend/circuit_breaker.go` — Cognee backend is unchanged
-- `services.go` — Subprocess management unchanged
-- `metrics/` package — unchanged
-- SSE transport flow (`handleMCPSSE`, `handleMCPMessage`, `safeRouteMCP`) — unchanged
-- `bankNamePattern`, `newSessionID()`, `newJobID()`, `initResponse()`, `checkAuth()` — unchanged
-- `fireErrorWebhook()` — unchanged
-- `types.go` — unchanged
-- `errors.go` — unchanged
-- All MCP tool names and schemas — unchanged
-- `auto_improve.go` core logic — unchanged (only idle check and WaitGroup change)
-- `internal/testutil/cogneemock/` — unchanged
+| # | File | Change |
+|---|------|--------|
+| 1 | `config.go` | Add `AutoReflectAfterN` and `AutoReflectTimeout` fields to `Config` struct and `LoadConfig()` |
+| 2 | `server.go` | Add `reflectStates sync.Map` field to `Server` struct; add one call to `s.checkAutoReflect(job.Bank)` in `processQueueJob` after `s.maybeAutoImprove(job.Bank)` |
 
 ---
 
-## 3. Config: New Fields
+## 3. Data Model
 
-### 3.1 Add to Config struct (`config.go`)
-
-```go
-// Queue
-QueueDBPath        string        // QUEUE_DB_PATH, default "./data/queue.db"
-QueueMaxPending    int           // QUEUE_MAX_PENDING, default 1000
-QueueJobTTL        time.Duration // QUEUE_JOB_TTL, default 24h
-QueueTTLInterval   time.Duration // QUEUE_TTL_INTERVAL, default 5m
-QueueWorkerCount   int           // QUEUE_WORKER_COUNT, default 4
-QueueMaxConcurrent int           // QUEUE_MAX_CONCURRENT, default = COGNEE_MAX_CONCURRENT_RETAINS, fallback 3
-```
-
-### 3.2 Defaults in LoadConfig()
+### 3.1 reflectState
 
 ```go
-QueueDBPath:        getEnv("QUEUE_DB_PATH", "./data/queue.db"),
-QueueMaxPending:    getEnvInt("QUEUE_MAX_PENDING", 1000),
-QueueJobTTL:        getEnvDuration("QUEUE_JOB_TTL", 24*time.Hour),
-QueueTTLInterval:   getEnvDuration("QUEUE_TTL_INTERVAL", 5*time.Minute),
-QueueWorkerCount:   getEnvInt("QUEUE_WORKER_COUNT", 4),
-QueueMaxConcurrent: getEnvInt("QUEUE_MAX_CONCURRENT", getEnvInt("COGNEE_MAX_CONCURRENT_RETAINS", 3)),
-```
-
-**Note**: `QueueMaxConcurrent` defaults to `COGNEE_MAX_CONCURRENT_RETAINS` for backward compatibility, with a final fallback of 3. This replaces the old semaphore size (was default 10). The new default of 3 is safer; users can increase via either env var. `CogneeMaxConcurrentRetains` field remains in Config but is no longer used — the value has been mapped to `QueueMaxConcurrent`. Kept for backward compat, marked deprecated in comments.
-
-### 3.3 Validation in `Config.validateCognee()` or equivalent
-
-Add to validation block:
-```go
-if c.QueueMaxPending < 1 {
-    return fmt.Errorf("QUEUE_MAX_PENDING must be >= 1, got %d", c.QueueMaxPending)
-}
-if c.QueueWorkerCount < 1 {
-    return fmt.Errorf("QUEUE_WORKER_COUNT must be >= 1, got %d", c.QueueWorkerCount)
-}
-if c.QueueMaxConcurrent < 1 {
-    return fmt.Errorf("QUEUE_MAX_CONCURRENT must be >= 1, got %d", c.QueueMaxConcurrent)
+// reflectState tracks auto-reflect triggers for a single memory bank.
+// Safe for concurrent use — all field access is guarded by mu.
+type reflectState struct {
+    mu          sync.Mutex
+    retainCount int       // successful retains since last auto-reflect
+    lastReflect time.Time // time of last auto-reflect trigger (UTC)
 }
 ```
 
-### 3.4 Deprecated field (keep but don't use)
+- **Fields are NOT exported.** All access goes through methods on `reflectState`.
+- **Zero-value meaning:** A zero-value `reflectState` (retainCount=0, lastReflect=time.Time{}) means the bank has never had an auto-reflect triggered. The timeout trigger is suppressed when retainCount==0, and time.Time{}.IsZero() causes the timeout branch to behave correctly: `time.Since(zeroTime)` is a large positive duration, so the first retain after startup with timeout enabled will fire the timeout trigger if the timeout has elapsed since epoch. **Mitigation:** Initialize `lastReflect` to `time.Now()` on first LoadOrStore so timeout starts counting from server start, not epoch.
 
-`CogneeMaxConcurrentRetains` — **preserved in Config struct** but not read by M3 code. It is mapped to `QueueMaxConcurrent` at config load time. The Server no longer references `config.CogneeMaxConcurrentRetains`; it uses `config.QueueMaxConcurrent` instead.
+### 3.2 Server field
+
+Add to `Server` struct in `server.go`:
+
+```go
+// Auto-reflect state
+reflectStates sync.Map // map[string]*reflectState — per-bank reflect tracking
+```
+
+- **`sync.Map` chosen per mission design.** LoadOrStore provides atomic get-or-create semantics. The per-entry `reflectState.mu` protects the mutable fields (retainCount, lastReflect). No additional package-level or server-level mutex is needed for the map itself.
+- **Callers provide no synchronization beyond calling the exported method.**
+
+### 3.3 Config fields
+
+Add to `Config` struct in `config.go`:
+
+```go
+// Auto-reflect
+AutoReflectAfterN int           // AUTO_REFLECT_AFTER_N, 0=disabled, default 10
+AutoReflectTimeout time.Duration // AUTO_REFLECT_TIMEOUT, 0=disabled, default 6h
+```
+
+Add to `LoadConfig()`:
+
+```go
+AutoReflectAfterN:  getEnvInt("AUTO_REFLECT_AFTER_N", 10),
+AutoReflectTimeout: getEnvDuration("AUTO_REFLECT_TIMEOUT", 6*time.Hour),
+```
+
+**Validation rules (applied inline, not in `Validate()`):**
+
+| Field | Rule | Invalid Behavior |
+|-------|------|------------------|
+| `AutoReflectAfterN` | negative → clamped to 0 (disabled) | Applied in `checkAutoReflect` |
+| `AutoReflectTimeout` | negative → clamped to 0 (disabled) | Applied in `checkAutoReflect` |
+| `AutoReflectAfterN` | non-parseable env → default 10 | `getEnvInt` returns default |
+| `AutoReflectTimeout` | non-parseable env → default 6h | `getEnvDuration` returns default |
 
 ---
 
-## 4. Server Struct Changes (`server.go`)
+## 4. Core Algorithm: checkAutoReflect
 
-### 4.1 Fields to ADD
-
-```go
-// Queue infrastructure
-queueStore  *queue.Store    // SQLite-backed job store
-queueWorker *queue.Worker   // Worker pool for async retain/reflect processing
-autoImproveWg sync.WaitGroup // tracks in-flight auto-improve goroutines (replaces cogneeWg for this purpose)
-```
-
-### 4.2 Fields to REMOVE
+### 4.1 Signature
 
 ```go
-cogneeSemaphore chan struct{}   // REMOVED — replaced by Worker.sem (QueueMaxConcurrent)
-jobTracker      *jobTracker     // REMOVED — replaced by queue.Store
-cogneeWg        sync.WaitGroup  // REMOVED — replaced by queue.Worker.wg + autoImproveWg
-cogneeCtx       context.Context     // KEPT — needed by ProcessFunc for detached context creation
-cogneeCancel    context.CancelFunc  // KEPT — called from Stop()
+func (s *Server) checkAutoReflect(bank string)
 ```
 
-**Preserved fields**: `cogneeCtx` and `cogneeCancel` remain. They are used by the ProcessFunc to create detached contexts with timeouts. They are cancelled during Stop() to signal the backend to abort in-progress operations.
-
-### 4.3 Metrics changes
-
-All metrics gauges remain. `semaphoreGauge` now reads from Worker pool semaphore (via queue.Stats().Running) instead of `len(cogneeSemaphore)`. `cogneePending` now reads from `queue.Stats().Pending` instead of `jobTracker.stats().Pending`.
-
-### 4.4 field alignment: no reordering required
-
-Add new fields after `improveState` and `dataDir`. Remove old fields from their current positions. The struct stays aligned without padding warnings.
-
----
-
-## 5. NewServer() Rewrite (`server.go`)
-
-### 5.1 Sequence
-
-After `s.improveState = loadAutoImproveState(s.dataDir)`:
-
-**REMOVE**:
-```go
-go s.jobTrackerCleanup()
-```
-
-**ADD**:
-```go
-// Queue infrastructure — constructed during NewServer, started in Start()
-s.queueStore = nil   // populated in Start() after Cognee is healthy
-s.queueWorker = nil  // populated in Start()
-```
-
-**REMOVE** the block:
-```go
-s.cogneeSemaphore = make(chan struct{}, config.CogneeMaxConcurrentRetains)
-s.jobTracker = newJobTracker(30 * time.Minute)
-```
-
-### 5.2 Compile-time assertion
-
-At package level in `server.go` (or `handlers.go`):
-
-```go
-// Verify ProcessFunc signature matches queue.ProcessFunc at compile time.
-var _ = queue.ProcessFunc((*Server).processQueueJob)  // intentional: won't compile because
-// method expression has extra receiver. Instead, use closure check in Start().
-```
-
-**Correction**: Use a top-level function for the compile-time check:
-
-```go
-// processQueueJob is the ProcessFunc called by queue.Worker for each dequeued job.
-// Signature must match queue.ProcessFunc exactly.
-func (s *Server) processQueueJob(ctx context.Context, job *queue.Job) error {
-    // implementation in §7
-}
-
-// Compile-time assertion: verify signature matches.
-func init() {
-    var fn queue.ProcessFunc = queue.ProcessFunc(nil)
-    // Cast a compatible closure to force signature check:
-    fn = func(ctx context.Context, job *queue.Job) error { return nil }
-    _ = fn
-}
-```
-
-**Wait** — Go doesn't allow method-to-function assignment for interface satisfaction checks because `(*Server).processQueueJob` has type `func(*Server, context.Context, *queue.Job) error`, not `func(context.Context, *queue.Job) error`.
-
-**Realistic compile-time check**: In `Start()`, where the ProcessFunc closure is created:
-
-```go
-// Compile-time check: the closure must match queue.ProcessFunc
-var processFunc queue.ProcessFunc = func(ctx context.Context, job *queue.Job) error {
-    return s.processQueueJob(ctx, job)
-}
-_ = processFunc
-```
-
-This is a runtime no-op that the compiler verifies. If `s.processQueueJob` changes signature, this line fails to compile.
-
----
-
-## 6. Server.Start() Changes (`server.go`)
-
-### 6.1 Sequence (replaces current Start())
-
-The current flow after `s.svc.waitAllHealthy(s.config.StartTimeout)` succeeds:
+### 4.2 Pseudocode
 
 ```
-1. Create queue Store: queue.NewStore(StoreConfig{...})
-2. Create queue Worker: queue.NewWorker(WorkerConfig{...})
-3. Run queue.Recover() to reset orphaned jobs from previous crash
-4. Start worker pool: queueWorker.Start(ctx)
-5. Start TTL cleanup: queueStore.StartTTLCleanup(ctx, interval)
-```
-
-### 6.2 Full pseudocode
-
-```go
-func (s *Server) Start() error {
-    // ... existing startup through s.svc.start() and s.svc.waitAllHealthy() ...
-
-    // Allocate queue store — only after Cognee is healthy
-    store, err := queue.NewStore(queue.StoreConfig{
-        DBPath:     s.config.QueueDBPath,
-        MaxPending: s.config.QueueMaxPending,
-        JobTTL:     s.config.QueueJobTTL,
-    })
-    if err != nil {
-        return fmt.Errorf("queue store: %w", err)
-    }
-    s.queueStore = store
-
-    // Create ProcessFunc closure
-    processFunc := func(ctx context.Context, job *queue.Job) error {
-        return s.processQueueJob(ctx, job)
-    }
-
-    // Create worker pool
-    worker, err := queue.NewWorker(queue.WorkerConfig{
-        Store:   s.queueStore,
-        Process: processFunc,
-        Count:   s.config.QueueWorkerCount,
-        SemSize: s.config.QueueMaxConcurrent,
-    })
-    if err != nil {
-        s.queueStore.Close()
-        return fmt.Errorf("queue worker: %w", err)
-    }
-    s.queueWorker = worker
-
-    // Recover orphaned jobs (crashed before M3 — unlikely, but safe)
-    recovered, _ := s.queueStore.Recover()
-    if recovered > 0 {
-        s.log.Info("queue: recovered orphaned jobs", "count", recovered)
-    }
-
-    // Start worker pool
-    s.queueWorker.Start(context.Background())
-
-    // Start TTL cleanup
-    s.queueStore.StartTTLCleanup(context.Background(), s.config.QueueTTLInterval)
-
-    s.mu.Lock()
-    s.state = StateRunning
-    s.mu.Unlock()
-    return nil
-}
-```
-
-### 6.3 Error handling
-
-If any queue step fails:
-- If store created but worker fails: close store before returning error
-- Do NOT leave `s.state = StateRunning` — return error so caller (handleStart) reports failure
-- Existing sessionCleaner goroutine from earlier in Start() still runs — safe, it handles nil queueStore
-
----
-
-## 7. ProcessFunc Design: `processQueueJob()`
-
-### 7.1 Location
-
-New method on `*Server` in `server.go` (or `handlers.go` — coder's choice).
-
-### 7.2 Signature
-
-```go
-func (s *Server) processQueueJob(ctx context.Context, job *queue.Job) error
-```
-
-Matches `queue.ProcessFunc = func(ctx context.Context, job *queue.Job) error`.
-
-### 7.3 Pseudocode
-
-```go
-func (s *Server) processQueueJob(ctx context.Context, job *queue.Job) error {
-    s.log.Info("queue: processing job", "job_id", job.ID, "type", job.Type, "bank", job.Bank)
-    startTime := time.Now()
-
-    switch job.Type {
-    case "retain":
-        // Create detached context with CogneeRetainTimeout.
-        // Detached from ctx so shutdown doesn't abort long-running retain.
-        // ctx is only used by the worker loop for pre-acquisition cancellation.
-        detachedCtx, cancel := context.WithTimeout(context.Background(), s.config.CogneeRetainTimeout)
-        defer cancel()
-
-        result, err := s.backend.Retain(detachedCtx, job.Bank, job.Payload)
-        duration := time.Since(startTime)
-        s.metrics.retainDur.Record(duration)
-
-        if err != nil {
-            s.log.Error("queue: retain failed", "job_id", job.ID, "bank", job.Bank, "duration", duration, logger.Error(err))
-            s.metrics.errorCalls.Inc()
-            s.metrics.retainErrors.Inc()
-            s.fireErrorWebhook(job.Bank, job.ID, err.Error(), "retain")
-            return err
-        }
-
-        // Store result in job for UpdateStatus to persist
-        job.Result = result
-        s.log.Info("queue: retain completed", "job_id", job.ID, "bank", job.Bank, "duration", duration)
-
-        // Trigger auto-improve after successful retain
-        s.maybeAutoImprove(job.Bank)
-
-        return nil
-
-    case "reflect":
-        detachedCtx, cancel := context.WithTimeout(context.Background(), s.config.BackendReflectTimeout)
-        defer cancel()
-
-        _, err := s.backend.Reflect(detachedCtx, job.Bank, job.Payload)
-        duration := time.Since(startTime)
-        s.metrics.reflectDur.Record(duration)
-
-        if err != nil {
-            s.log.Error("queue: reflect failed", "job_id", job.ID, "bank", job.Bank, "duration", duration, logger.Error(err))
-            s.metrics.errorCalls.Inc()
-            return err
-        }
-
-        s.log.Info("queue: reflect completed", "job_id", job.ID, "bank", job.Bank, "duration", duration)
-        return nil
-
-    default:
-        return fmt.Errorf("unknown job type: %s", job.Type)
-    }
-}
-```
-
-### 7.4 Key design decisions
-
-| Decision | Rationale |
-|----------|-----------|
-| Detached context from `context.Background()` | `ctx` from worker is cancelled during Stop(). Long-running retains (up to 900s) must not be aborted by shutdown mid-operation. The worker's `ctx.Done()` is only checked in the worker loop's semaphore-acquire select, not passed to ProcessFunc. |
-| `job.Result` set before return nil | Worker calls `UpdateStatus(job.ID, StatusCompleted, job.Result, "")`. The ProcessFunc must populate `job.Result` so the result is persisted. |
-| `s.maybeAutoImprove(job.Bank)` after retain | Preserves existing auto-improve behavior — triggered on successful retain only. |
-| No panic recovery in ProcessFunc | Worker.workerLoop already has `defer recover()` wrapping the process call (AC-M2.27). Double-wrapping would hide bugs. |
-| `fireErrorWebhook` on retain failure | Preserves existing webhook behavior. |
-
-### 7.5 Context Cancellation During Shutdown
-
-When `Stop()` is called:
-1. `s.cogneeCancel()` is called — this cancels `s.cogneeCtx`, which is used by... nothing in M3 since ProcessFunc uses `context.Background()`.
-2. `s.queueWorker.Stop()` is called — this cancels the worker's internal context, causing worker loops to exit after finishing current jobs.
-
-**Issue**: The detached context from `context.Background()` means the Cognee API call continues even after server shutdown begins. This is intentional — cutting off a Cognee LLM call mid-flight would waste work and potentially leave Cognee in an inconsistent state. The Worker.Stop() waits for in-flight jobs to complete (via semaphore drain + wg.Wait). The 900s timeout ensures they don't hang forever.
-
-**If Cognee API supports cancellation**: In a future M4, we could pass `s.cogneeCtx` instead of `context.Background()` and let Cognee abort. Not in M3 scope.
-
----
-
-## 8. Handlers Rewrite (`handlers.go`)
-
-### 8.1 `memory_retain` handler (replaces lines ~256-327)
-
-**Before** (current pattern):
-```go
-// Acquire semaphore, store jobTracker, spawn goroutine with defer sem release
-// Goroutine: call backend.Retain(), update jobTracker, maybeAutoImprove
-// Return {"status":"queued","bank":"...","job_id":"..."}
-```
-
-**After**:
-```go
-case "memory_retain":
-    // ... validation unchanged (content required, MaxContentBytes check) ...
-    s.metrics.retainCalls.Inc()
-    s.metrics.retainTotal.Inc()
-
-    jobID := newJobID()
-    job := &queue.Job{
-        ID:         jobID,
-        Bank:       bank,
-        Type:       "retain",
-        Payload:    a.Content,
-        MaxRetries: 0, // use default (3)
-    }
-
-    if err := s.queueStore.Insert(job); err != nil {
-        if errors.Is(err, queue.ErrQueueFull) {
-            s.mcpToolResult(sid, id, `{"status":"rejected","reason":"queue_full"}`)
-            logReq("", err)
-            return
-        }
-        s.mcpError(sid, id, -32000, "failed to queue job")
-        s.metrics.errorCalls.Inc()
-        logReq("", err)
+function checkAutoReflect(bank):
+    // Guard 1: both triggers disabled → fast return
+    if s.config.AutoReflectAfterN <= 0 AND s.config.AutoReflectTimeout <= 0:
         return
-    }
 
-    s.metrics.cogneePending.Set(int64(pendingCount(s.queueStore)))
-    s.log.Info("retain_queued", "bank", bank, "job_id", jobID)
-    s.mcpToolResult(sid, id, fmt.Sprintf(`{"status":"queued","bank":"%s","job_id":"%s"}`, bank, jobID))
-    logReq("ok", nil)
-```
+    // Guard 2: defensive bank validation
+    if bank is empty OR does not match bankNamePattern:
+        return
 
-**Key changes**:
-- No semaphore acquisition in handler. Backpressure is via `ErrQueueFull`.
-- No goroutine spawn. Worker pool handles async processing.
-- Response is immediate: `{"status":"queued","bank":"...","job_id":"..."}`.
-- `cogneePending` gauge updated from `CountByStatus(pending)`.
+    // Get or create per-bank state, initialize lastReflect if new
+    stateI, _ := s.reflectStates.LoadOrStore(bank, &reflectState{lastReflect: time.Now()})
+    st := stateI.(*reflectState)
 
-### 8.2 `memory_reflect` handler (replaces lines ~329-376)
+    st.mu.Lock()
+    defer st.mu.Unlock()
 
-**Before**: spawn goroutine, no job_id, no tracking.
+    // Increment retain counter (saturate at MaxInt to prevent overflow wrap)
+    if st.retainCount < math.MaxInt:
+        st.retainCount++
 
-**After**:
-```go
-case "memory_reflect":
-    // ... validation unchanged ...
-    s.metrics.reflectCalls.Inc()
-    s.metrics.reflectTotal.Inc()
+    // Check count-based trigger
+    countTrigger := false
+    if s.config.AutoReflectAfterN > 0 AND st.retainCount >= s.config.AutoReflectAfterN:
+        countTrigger = true
 
-    jobID := newJobID()
+    // Check timeout-based trigger
+    timeoutTrigger := false
+    if s.config.AutoReflectTimeout > 0 AND st.retainCount > 0:
+        if time.Since(st.lastReflect) > s.config.AutoReflectTimeout:
+            timeoutTrigger = true
+
+    // No trigger condition met → return
+    if NOT countTrigger AND NOT timeoutTrigger:
+        return
+
+    // Fire: reset state BEFORE Insert (so re-queue on Insert failure is safe)
+    st.retainCount = 0
+    st.lastReflect = time.Now().UTC()
+    st.mu.Unlock()  // release lock before I/O
+
+    // Guard 3: queue store may be nil (server starting up)
+    if s.queueStore == nil:
+        s.log.Warn("auto_reflect: queue store not available", "bank", bank)
+        return
+
+    // Insert reflect job
     job := &queue.Job{
-        ID:         jobID,
+        ID:         newJobID(),
         Bank:       bank,
         Type:       "reflect",
-        Payload:    a.Query, // empty query is valid for reflect
-        MaxRetries: 0,
+        Payload:    "_auto",
+        MaxRetries: 0,  // uses default (3)
     }
+    err := s.queueStore.Insert(job)
+    if err != nil:
+        if errors.Is(err, queue.ErrQueueFull):
+            s.log.Warn("auto_reflect: queue full", "bank", bank)
+        else:
+            s.log.Error("auto_reflect: insert failed", "bank", bank, logger.Error(err))
+        // Note: state already reset. Reflect will be retried on next trigger cycle.
+        return
 
-    if err := s.queueStore.Insert(job); err != nil {
-        if errors.Is(err, queue.ErrQueueFull) {
-            s.mcpToolResult(sid, id, `{"status":"rejected","reason":"queue_full"}`)
-            logReq("", err)
-            return
+    s.log.Info("auto_reflect: job inserted", "bank", bank, "job_id", job.ID,
+               "trigger", triggerReason(countTrigger, timeoutTrigger))
+    s.metrics.cogneePending.Set(pendingCount(s.queueStore))
+```
+
+### 4.3 Trigger reason logging
+
+The `triggerReason` helper returns:
+- `"count"` when only countTrigger is true
+- `"timeout"` when only timeoutTrigger is true
+- `"both"` when both are true (possible if N=1 and timeout also elapsed — fires once, logged as "both")
+
+### 4.4 Locking detail
+
+The mutex is released BEFORE calling `s.queueStore.Insert()`. This is critical:
+- `Insert` may block on the store's mutex and perform disk I/O.
+- Holding `st.mu` across I/O would serialize all auto-reflect checks across all banks.
+- State is reset before the Insert attempt. If Insert fails (queue full, DB error), the reflect is lost for this cycle but will be retried on the next trigger cycle (either count or timeout). This is intentional — no persistent "pending reflect" flag needed.
+
+### 4.5 Why reset state before Insert (not after)
+
+| Order | Risk |
+|-------|------|
+| Reset after Insert success | If Insert panics (unlikely), state is stale but safe. However, inserting then resetting means a crash between Insert and reset would leave the job in queue AND not reset counters, causing duplicate reflects on restart. |
+| **Reset before Insert (chosen)** | If Insert fails, state is already reset. The reflect opportunity is lost for this cycle but will trigger again naturally. No duplicate risk on crash. |
+
+---
+
+## 5. Integration Point
+
+### 5.1 Call site
+
+In `server.go`, `processQueueJob()` method, inside the `case "retain":` block, after `s.maybeAutoImprove(job.Bank)` and before `return nil`:
+
+```go
+// Existing (do not remove):
+s.maybeAutoImprove(job.Bank)
+
+// NEW — M4: check auto-reflect triggers
+s.checkAutoReflect(job.Bank)
+
+return nil
+```
+
+### 5.2 Why after maybeAutoImprove
+
+Order does not matter functionally (auto-improve and auto-reflect are independent), but:
+- `maybeAutoImprove` was there first — placing new code after it minimizes diff and preserves blame.
+- Both must run. Neither should block the other. If `checkAutoReflect` panics, we must not lose the auto-improve work already done. See panic recovery below.
+
+### 5.3 Execution context
+
+`checkAutoReflect` runs inside the queue worker goroutine's `processJob` → `processQueueJob` call chain. The worker already has panic recovery at the `processJob` level. However, a panic in `checkAutoReflect` would mark the retain job as FAILED (since the worker's defer catches panics and marks the current job as failed). **This is unacceptable:** a successfully completed retain must not be marked failed because auto-reflect tripped.
+
+**Mitigation:** `checkAutoReflect` must have its own deferred panic recovery. See Section 7.3.
+
+---
+
+## 6. Disabled States
+
+### 6.1 Both disabled (N=0 AND TIMEOUT=0)
+
+The guard at the top of `checkAutoReflect` returns immediately. Zero allocations, zero `sync.Map` operations. Equivalent to the feature not existing.
+
+### 6.2 N=0 only (count disabled, timeout active)
+
+Count-based trigger is suppressed (`AutoReflectAfterN > 0` check fails). Only timeout trigger is active. `retainCount` is still incremented because the timeout trigger requires `retainCount > 0`.
+
+### 6.3 TIMEOUT=0 only (timeout disabled, count active)
+
+Timeout-based trigger is suppressed (`AutoReflectTimeout > 0` check fails). Only count trigger is active.
+
+### 6.4 Auto-improve vs Auto-reflect independence
+
+Auto-reflect and auto-improve are completely independent. Disabling one has zero effect on the other. They share no state, no mutexes, no code paths beyond the call site ordering in `processQueueJob`.
+
+---
+
+## 7. Goroutine Safety and Panic Recovery
+
+### 7.1 Enumerated goroutines
+
+| # | Goroutine | Spawned By | Recovery |
+|---|-----------|------------|----------|
+| 1 | Queue worker goroutines (N workers) | `queue.Worker.Start()` | YES — `workerLoop` defer recover |
+
+`checkAutoReflect` does NOT spawn any new goroutines. All work is synchronous within the caller's goroutine.
+
+### 7.2 Concurrency safety
+
+| Resource | Protection | Rationale |
+|----------|-----------|-----------|
+| `s.reflectStates` (sync.Map) | Built-in sync.Map concurrency | LoadOrStore is atomic |
+| `reflectState.retainCount` | `reflectState.mu` | Multiple workers may process retains for the same bank simultaneously |
+| `reflectState.lastReflect` | `reflectState.mu` | Same mutex as retainCount |
+| `s.queueStore.Insert()` | `queue.Store.mu` (internal) | Store serializes writes |
+| `s.config` fields | Read-only after startup | Config never mutates after LoadConfig |
+
+### 7.3 Panic recovery in checkAutoReflect
+
+```go
+func (s *Server) checkAutoReflect(bank string) {
+    defer func() {
+        if r := recover(); r != nil {
+            s.panics.Add(1)
+            s.log.Error("auto_reflect: panic", "bank", bank, "panic", fmt.Sprintf("%v", r))
+            // Do NOT re-panic. The retain job succeeded and must stay completed.
         }
-        s.mcpError(sid, id, -32000, "failed to queue job")
-        s.metrics.errorCalls.Inc()
-        logReq("", err)
-        return
-    }
-
-    s.log.Info("reflect_queued", "bank", bank, "job_id", jobID)
-    s.mcpToolResult(sid, id, fmt.Sprintf(`{"status":"queued","bank":"%s","job_id":"%s"}`, bank, jobID))
-    logReq("ok", nil)
-```
-
-**Key change**: reflect NOW has a job_id and is tracked via queue.Store. The old `{"status":"queued","bank":"..."}` response (without job_id) is replaced with `job_id` included.
-
-### 8.3 `handleRetainStatus` (replaces lines ~459-481)
-
-**Before**: reads from in-memory `jobTracker`.
-
-**After**:
-```go
-func (s *Server) handleRetainStatus(sid string, id interface{}, args json.RawMessage, logReq func(string, error)) {
-    var a struct{ JobID string `json:"job_id"` }
-    if err := json.Unmarshal(args, &a); err != nil || a.JobID == "" {
-        s.mcpError(sid, id, -32602, "job_id is required")
-        logReq("", fmt.Errorf("missing job_id"))
-        return
-    }
-
-    job, err := s.queueStore.Get(a.JobID)
-    if err != nil {
-        s.mcpError(sid, id, -32000, "failed to query job status")
-        logReq("", err)
-        return
-    }
-    if job == nil {
-        s.mcpToolResult(sid, id, `{"status":"not_found"}`)
-        logReq("not_found", nil)
-        return
-    }
-
-    // Map queue.Job to JSON response compatible with existing API
-    response := map[string]interface{}{
-        "job_id":     job.ID,
-        "bank":       job.Bank,
-        "status":     string(job.Status), // "pending","running","completed","failed","dead"
-        "created_at": job.CreatedAt,
-        "updated_at": job.UpdatedAt,
-    }
-    if job.Result != "" {
-        response["result"] = job.Result
-    }
-    if job.Error != "" {
-        response["error"] = job.Error
-    }
-    if job.Status == queue.StatusFailed || job.Status == queue.StatusDead {
-        response["retry_count"] = job.RetryCount
-        response["max_retries"] = job.MaxRetries
-    }
-
-    data, _ := json.Marshal(response)
-    s.mcpToolResult(sid, id, string(data))
-    logReq("ok", nil)
+    }()
+    // ... body ...
 }
 ```
 
-**Key changes**:
-- No nil check on `jobTracker` — queueStore always exists (constructed unconditionally)
-- Status values are queue package values: "pending", "running", "completed", "failed", "dead"
-- Adds `retry_count` and `max_retries` fields for failed/dead jobs
-- Removes `status":"not_found"` check on tracker nil — always available
+**Critical:** The deferred recover MUST NOT re-panic, MUST NOT return an error that would propagate to the worker, and MUST NOT affect the retain job's status. The retain already succeeded.
 
-### 8.4 Health endpoint (`handleHealth`)
+### 7.4 Lock ordering
 
-Replace:
-```go
-"queue_depth": 0,
-```
+Only one lock is held at any time:
+1. `reflectState.mu` is acquired, work done, released — before any store operation.
+2. `queue.Store.mu` is acquired internally by `Store.Insert()`.
 
-With:
-```go
-"queue_depth": queueDepth(s.queueStore),
-```
-
-Where `queueDepth()` is a helper that returns stats.Pending if store is non-nil, 0 otherwise:
-
-```go
-func queueDepth(store *queue.Store) int {
-    if store == nil {
-        return 0
-    }
-    stats, err := store.Stats()
-    if err != nil {
-        return 0
-    }
-    return stats.Pending
-}
-```
-
-Also update the `"down"` list logic if needed (no change expected — `allHealthy` only checks llama+cognee).
-
-Remove any remaining "hindsight" and "reranker" fields from health response if not already removed in M1. Verify with scout report §6 risk 7: `allHealthy()` already returns 2 values (llama, cognee) post-M1.
-
-### 8.5 `pendingCount()` helper
-
-Small helper used by retain and reflect handlers to update `cogneePending` gauge:
-
-```go
-func pendingCount(store *queue.Store) int64 {
-    if store == nil {
-        return 0
-    }
-    count, err := store.CountByStatus(queue.StatusPending)
-    if err != nil {
-        return 0
-    }
-    return int64(count)
-}
-```
+No nested locks. No ABBA deadlock potential.
 
 ---
 
-## 9. Server.Stop() Changes (`server.go`)
+## 8. Edge Cases
 
-### 9.1 Sequence (replaces current Stop())
-
-**Before** (current):
-```
-1. Cancel stopMonitor
-2. Close shutdown channel (sessionCleaner)
-3. Cancel cogneeCtx → cogneeWg.Wait()
-4. Close sessions
-5. svc.stop()
-6. Set state = StateStopped
-```
-
-**After**:
-```
-1. Cancel stopMonitor
-2. Close shutdown channel (sessionCleaner)
-3. Stop queue worker pool: queueWorker.Stop() — drains in-flight jobs
-4. Wait for auto-improve goroutines: autoImproveWg.Wait()
-5. Cancel cogneeCtx (signals any remaining detached contexts)
-6. Close queue store: queueStore.Close()
-7. Close sessions
-8. svc.stop()
-9. clearPids()
-10. Set state = StateStopped
-```
-
-### 9.2 Full pseudocode
-
-```go
-func (s *Server) Stop() {
-    s.mu.Lock()
-    if s.state == StateStopped {
-        s.mu.Unlock()
-        return
-    }
-    s.mu.Unlock()
-
-    s.log.Info("shutting down")
-    s.alerts.Send(AlertWarn, "Server shutting down", nil)
-
-    if s.stopMonitor != nil {
-        s.stopMonitor()
-    }
-
-    // Signal session cleaner goroutine to exit
-    s.shutdownOnce.Do(func() { close(s.shutdown) })
-
-    // ★ M3: Stop queue workers and drain in-flight jobs
-    if s.queueWorker != nil {
-        s.log.Info("stopping queue workers...")
-        s.queueWorker.Stop()
-        s.log.Info("queue workers stopped")
-    }
-
-    // ★ M3: Wait for auto-improve goroutines (may overlap with queue worker finish)
-    s.autoImproveWg.Wait()
-
-    // Cancel Cognee context (belt-and-suspenders for any remaining detached work)
-    if s.cogneeCancel != nil {
-        s.cogneeCancel()
-    }
-
-    // ★ M3: Close queue store
-    if s.queueStore != nil {
-        if err := s.queueStore.Close(); err != nil {
-            s.log.Error("queue store close error", logger.Error(err))
-        }
-    }
-
-    // Close all sessions
-    s.sessionsMu.Lock()
-    for id, sess := range s.sessions {
-        sess.Close()
-        delete(s.sessions, id)
-    }
-    s.sessionsMu.Unlock()
-
-    s.svc.stop()
-    s.svc.clearPids()
-
-    s.mu.Lock()
-    s.state = StateStopped
-    s.mu.Unlock()
-    s.log.Info("shutdown complete")
-}
-```
-
-### 9.3 Drain semantics
-
-`queueWorker.Stop()`:
-1. Cancels worker loop context → workers stop dequeuing new jobs
-2. `wg.Wait()` blocks until all worker goroutines exit
-3. Workers holding the semaphore finish their current job before exiting
-
-Total drain time: bounded by `CogneeRetainTimeout` (900s default) for the worst case — a retain just started when Stop is called.
+| # | Scenario | Behavior |
+|---|----------|----------|
+| E1 | Bank name is empty string | Guard returns immediately, no state created |
+| E2 | Bank name contains invalid chars | Guard returns immediately (bankNamePattern mismatch) |
+| E3 | `queueStore` is nil (server starting up) | Guard after state reset: log warning, return, no panic |
+| E4 | Queue is full (ErrQueueFull) | Log warning, return. State already reset — retries on next cycle |
+| E5 | DB error on Insert | Log error, return. Same as E4 |
+| E6 | `AUTO_REFLECT_AFTER_N=1` and `AUTO_REFLECT_TIMEOUT=1ns` | Both triggers fire simultaneously. State reset once (they share the same reset). One reflect job inserted. Logged as trigger="both". |
+| E7 | Bank receives 0 retains after server start, timeout elapses | Timeout check: retainCount is 0, suppressed. No reflect. Correct — no work to reflect on. |
+| E8 | Server restart: counters reset to 0 | Acceptable — `reflectStates` is in-memory only. Timeout starts counting from first retain after restart (lastReflect initialized to `time.Now()` on first LoadOrStore). |
+| E9 | Negative config values | Clamped to 0 (disabled) at check time in `checkAutoReflect` |
+| E10 | `retainCount` overflow after math.MaxInt retains | Saturates at `math.MaxInt`. No wrap to negative. Trigger fires on next check. |
+| E11 | Auto-reflect inserts reflect job, and user manually calls memory_reflect | Both jobs are legitimate. Both are queued and processed independently. No conflict. |
+| E12 | Auto-reflect job is in queue when server stops | `queue.Worker.Stop()` drains in-flight jobs. Remaining pending jobs survive in SQLite and are recovered on restart. Auto-reflect state (counters) is lost on restart — acceptable. |
+| E13 | Bank with exactly 0 successful retains since startup, N=10 | retainCount=0 after increment → 1. 1 < 10, no trigger. Correct. |
+| E14 | Timeout fires, then next retain comes 1ms later | State was reset (retainCount=0, lastReflect=now). Next retain: increment to 1, check timeout → time.Since(now) ≈ 1ms < 6h → no trigger. Correct debounce. |
 
 ---
 
-## 10. Session Cleaner Fix (`session_cleaner.go`)
+## 9. Metrics Impact
 
-Replace:
-```go
-// TODO(M3): read queue depth from SQLite queue store
-s.metrics.queueGauge.Set(0)
-```
-
-With:
-```go
-// Read queue depth from SQLite queue store
-s.metrics.queueGauge.Set(pendingCount(s.queueStore))
-```
-
-The `pendingCount()` helper handles nil queueStore gracefully.
+No new metrics are introduced. Existing metric `memory.cognee_jobs_pending` is updated via `s.metrics.cogneePending.Set(pendingCount(s.queueStore))` after Insert, consistent with how manual retains/reflects update the gauge.
 
 ---
 
-## 11. Auto-Improve Semaphore Idle Check Fix (`auto_improve.go`)
+## 10. Acceptance Criteria (20 ACs)
 
-### 11.1 Replace cogneeSemaphore idle check
+### Config
 
-**Before**:
-```go
-idleCheck := len(s.cogneeSemaphore) <= 1
-```
+| ID | Criterion | Verification |
+|----|-----------|-------------|
+| **AC-M4.01** | `AUTO_REFLECT_AFTER_N` env var is parsed as int, default 10. Value 0 disables count-based trigger. | `LoadConfig()` returns Config with AutoReflectAfterN=0 when env is "0". checkAutoReflect returns immediately for count branch when N=0. |
+| **AC-M4.02** | `AUTO_REFLECT_TIMEOUT` env var is parsed as duration, default 6h. Value 0 disables timeout-based trigger. | `LoadConfig()` returns Config with AutoReflectTimeout=0 when env is "0". checkAutoReflect returns immediately for timeout branch when TIMEOUT=0. |
+| **AC-M4.03** | Negative config values for either field are clamped to 0 at check time (disabled). | Pass -1 via env → config field is -1 (or default). checkAutoReflect treats -1 as <= 0 → disabled. No panic, no negative counters. |
 
-**After**:
-```go
-// Check if queue is idle: at most 1 job currently running
-// (the caller's job may still show as running during this check)
-stats, err := s.queueStore.Stats()
-idleCheck := err == nil && stats.Running <= 1
-```
+### State Management
 
-### 11.2 Replace cogneeWg with autoImproveWg
+| ID | Criterion | Verification |
+|----|-----------|-------------|
+| **AC-M4.04** | `reflectState` struct contains `retainCount int` and `lastReflect time.Time`, each guarded by an embedded `sync.Mutex`. | Type assertion: `reflectState` has mu, retainCount, lastReflect fields. All field writes happen under mu.Lock(). |
+| **AC-M4.05** | Per-bank isolation: retains in bank "alpha" do not increment the counter for bank "beta". | Call checkAutoReflect("alpha") N-1 times, then checkAutoReflect("beta") once. Verify only "alpha" triggers (its count reaches N), "beta" does not (its count is 1). |
+| **AC-M4.06** | Concurrent workers incrementing different banks produce no data races. | `go test -race`: 4 goroutines, each calling checkAutoReflect for a different bank 100 times. Zero races. |
+| **AC-M4.07** | Concurrent workers incrementing the SAME bank produce no data races. | `go test -race`: 4 goroutines, each calling checkAutoReflect for bank "shared" 25 times (N=100). All increments counted correctly, trigger fires exactly once. |
 
-**All occurrences** of `s.cogneeWg.Add(1)` → `s.autoImproveWg.Add(1)`
-**All occurrences** of `s.cogneeWg.Done()` → `s.autoImproveWg.Done()`
+### Trigger Logic — Count
 
-These are in `auto_improve.go` only (the auto-improve goroutine spawn).
+| ID | Criterion | Verification |
+|----|-----------|-------------|
+| **AC-M4.08** | After exactly N successful retain calls for a bank, a reflect job is inserted into the queue with Type="reflect", Bank=<bank>, Payload="_auto". | Set N=5. Call checkAutoReflect 5 times. On 5th call, verify `queueStore.Insert` is called with a Job matching those fields. Verify the job appears in the store. |
+| **AC-M4.09** | After TIMEOUT elapses since lastReflect AND retainCount > 0, a reflect job is inserted. | Set N=9999 (effectively infinite), TIMEOUT=1ms. Call checkAutoReflect once. Advance clock by 2ms. Call checkAutoReflect again. Verify reflect job inserted on 2nd call. |
+| **AC-M4.10** | After a trigger fires, retainCount is reset to 0 and lastReflect is set to current time. | Trigger fire. Immediately inspect reflectState fields. retainCount==0 AND lastReflect ≈ time.Now() (within 1s tolerance). |
+| **AC-M4.11** | Inserted auto-reflect job has MaxRetries=0 (uses default 3), Status="" (defaults to pending in Insert). | Query queue store for the job after insert. Verify MaxRetries==3 (default applied by Store.Insert), Status=="pending". |
+| **AC-M4.12** | When retainCount < N AND timeout has not elapsed, no reflect job is inserted and counters are preserved. | Set N=10, TIMEOUT=1h. Call checkAutoReflect 5 times. Verify 0 jobs in queue. Verify retainCount==5 (not reset). |
 
-### 11.3 Nil-safety
+### Disabled States
 
-In the nil-safety block of the auto-improve goroutine, capture `s.queueStore`:
-```go
-queueStore := s.queueStore
-```
+| ID | Criterion | Verification |
+|----|-----------|-------------|
+| **AC-M4.13** | When AUTO_REFLECT_AFTER_N=0, count-based trigger never fires regardless of retainCount. | Set N=0, TIMEOUT=1h. Call checkAutoReflect 100 times. Verify 0 reflect jobs inserted. Count-based branch never entered. |
+| **AC-M4.14** | When AUTO_REFLECT_TIMEOUT=0, timeout-based trigger never fires regardless of elapsed time. | Set N=5, TIMEOUT=0. Call checkAutoReflect 1 time. Advance clock by 100h. Call checkAutoReflect 1 more time. No timeout trigger on 2nd call. Only fires when count reaches 5. |
 
-The idle check uses `queueStore` which may be nil before Start() completes. Since auto-improve fires only after a successful retain (which requires Start() to have completed), queueStore will be non-nil at check time. The `err != nil` fallback handles edge cases.
+### Integration
 
----
+| ID | Criterion | Verification |
+|----|-----------|-------------|
+| **AC-M4.15** | checkAutoReflect is called ONLY after backend.Retain returns success (nil error). Failed retains skip the check. | Mock backend.Retain to return error. Verify checkAutoReflect is never invoked. Mock backend.Retain to succeed. Verify checkAutoReflect IS invoked. |
+| **AC-M4.16** | checkAutoReflect executes in the queue worker goroutine, not in the HTTP handler. | Add a goroutine ID assertion or trace log in checkAutoReflect. Verify the goroutine is a worker goroutine (not the HTTP handler goroutine). |
+| **AC-M4.17** | A failed retain (backend.Retain returns error) does NOT increment retainCount. | Mock retain to fail 5 times, then succeed once. Verify retainCount==1 after the success, not 6. Timeout trigger does not fire spuriously from failed attempts. |
 
-## 12. Goroutine Inventory (Post-M3)
+### Edge Cases & Robustness
 
-Every goroutine spawned by the application, with creation point and panic recovery status:
-
-| ID | Goroutine | Spawned By | Panic Recovery | Exit Signal |
-|----|-----------|-----------|---------------|-------------|
-| G1 | HTTP server | main.go (net/http) | net/http built-in | Server.Shutdown() |
-| G2 | SSE handler xN | handleMCPSSE | net/http built-in | r.Context().Done() |
-| G3 | MCP message dispatcher xN | handleMCPMessage → safeRouteMCP | YES (defer recover) | Goroutine exit after response |
-| G4 | Session cleaner | Server.Start() → sessionCleaner | YES (defer recover) | s.shutdown channel |
-| G5 | Service monitor | Server.Start() → monitor | YES (built into monitor) | stopMonitor cancel |
-| G6-G9 | Queue workers (default 4) | queue.Worker.Start() | YES (defer recover per worker) | ctx.Done() from Worker.Stop() |
-| G10 | Queue TTL cleanup | queue.Store.StartTTLCleanup() | YES (defer recover) | ctx.Done() from Stop() |
-| G11 | Auto-improve xN | maybeAutoImprove() → goroutine | YES (defer recover) | Goroutine exit after completion |
-| G12 | Error webhook xN | fireErrorWebhook() → goroutine | YES (defer recover) | Goroutine exit after completion |
-| G13 | Llama.cpp/Cognee subprocess | services.start() | exec.Cmd built-in | svc.stop() kills process |
-| G14 | jobTrackerCleanup | **DELETED** | — | — |
-
-**Total before M3**: G1-G5 + G12-G13 + jobTrackerCleanup + cogneeWg-tracked goroutines (retain, reflect, auto-improve, webhook).
-**Total after M3**: G1-G13 (jobTrackerCleanup removed, retain/reflect goroutines replaced by G6-G9 workers).
-
-**Panic recovery status**: ALL goroutines with application code have panic recovery. HTTP server goroutines have net/http built-in recovery.
+| ID | Criterion | Verification |
+|----|-----------|-------------|
+| **AC-M4.18** | Empty bank name or bank name failing `bankNamePattern` causes immediate no-op return. No state created, no panic. | Call checkAutoReflect(""). Call checkAutoReflect("bank with spaces!!!"). Verify no entry in reflectStates, no log at ERROR level, no panic. |
+| **AC-M4.19** | When `s.queueStore` is nil, reflect job insertion is skipped with a warning log. No panic. | Set queueStore=nil. Call checkAutoReflect enough times to trigger. Verify WARN log emitted, no nil pointer dereference, no panic. |
+| **AC-M4.20** | When QueueMaxPending is reached, `Store.Insert` returns ErrQueueFull. checkAutoReflect logs a warning and returns cleanly. State was already reset — next trigger cycle will retry. | Fill queue to max. Trigger auto-reflect. Verify WARN log, no panic, state is reset (retainCount==0, lastReflect updated). |
 
 ---
 
-## 13. Lock Ordering (Post-M3)
+## 11. Spec-implementation Consistency Verification
 
-Complete lock ordering across all goroutines:
+### 11.1 Pairwise AC ↔ Body trace
 
-| # | Lock | Type | Guards | Held By |
-|---|------|------|--------|---------|
-| 1 | `s.sessionsMu` | `sync.RWMutex` | sessions map | SSE handler, MCP dispatch, session cleaner |
-| 2 | `s.mu` | `sync.RWMutex` | server state | Start(), Stop(), handleHealth |
-| 3 | `s.improveState.mu` | `sync.Mutex` | auto-improve bank state | maybeAutoImprove, auto-improve goroutine |
-| 4 | `s.queueStore.mu` | `sync.Mutex` | SQLite write serialization | Insert (HTTP handler), NextPending/UpdateStatus (worker) |
-| 5 | `s.queueWorker.mu` | `sync.Mutex` | cancel field | Worker.Start(), Worker.Stop() |
+| AC | Body Section | Consistent? |
+|----|-------------|-------------|
+| AC-M4.01 | 3.3, 6.2 | YES — config field + disabled check |
+| AC-M4.02 | 3.3, 6.3 | YES — config field + disabled check |
+| AC-M4.03 | 3.3 (validation table), 4.2 (clamp in pseudocode) | YES |
+| AC-M4.04 | 3.1 (struct definition) | YES |
+| AC-M4.05 | 4.2 (LoadOrStore keyed by bank) | YES |
+| AC-M4.06 | 7.2 (concurrency table) | YES |
+| AC-M4.07 | 7.2 (concurrency table) | YES |
+| AC-M4.08 | 4.2 (pseudocode: countTrigger branch) | YES |
+| AC-M4.09 | 4.2 (pseudocode: timeoutTrigger branch) | YES |
+| AC-M4.10 | 4.2 (pseudocode: reset block) | YES |
+| AC-M4.11 | 4.2 (pseudocode: Job construction), 3.2 (Job.Validate rules) | YES |
+| AC-M4.12 | 4.2 (pseudocode: early return when neither trigger fires) | YES |
+| AC-M4.13 | 6.2 (N=0 only) | YES |
+| AC-M4.14 | 6.3 (TIMEOUT=0 only) | YES |
+| AC-M4.15 | 5.1 (call site in processQueueJob), 5.3 (execution context) | YES |
+| AC-M4.16 | 5.3 (worker goroutine context) | YES |
+| AC-M4.17 | 5.1 (call site: only after retain success path, error path returns early) | YES |
+| AC-M4.18 | 4.2 (Guard 2: bank validation) | YES |
+| AC-M4.19 | 4.2 (Guard 3: queueStore nil) | YES |
+| AC-M4.20 | 4.2 (Insert error handling), Edge case E4 | YES |
 
-**Lock ordering rule**: If multiple locks are acquired, acquire in order 1→5. No goroutine acquires a lower-numbered lock while holding a higher-numbered lock.
+### 11.2 Goroutine enumeration
 
-**Critical paths**:
+| Goroutine | Recovery | Body Ref |
+|-----------|----------|----------|
+| Queue worker goroutines (N workers) — existing, unchanged | YES — `workerLoop` defer recover | 7.1 |
 
-- **HTTP retain handler**: holds no locks during `queueStore.Insert()` (which acquires #4 internally). Returns response without holding any server locks.
-- **Worker goroutine**: acquires #4 internally via NextPending/UpdateStatus. Never acquires #1-#3.
-- **Auto-improve**: acquires #3 → calls `queueStore.Stats()` (which does NOT acquire #4 — Stats doesn't use store.mu). No cycle.
-- **Session cleaner**: acquires #1 only. Reads `queueStore.Stats()` (no lock needed).
-- **Stop()**: acquires #2 (briefly to check state) → calls Worker.Stop() (acquires #5 internally) → calls queueStore.Close() (acquires #4 internally). Order: 2→5→4. **This violates 1→5 ordering!** But since #2 is released before #5 and #4 are acquired, there's no hold-and-wait. The actual held-at-once sets are: {#2} then release, {#5} then release, {#4}.
+No NEW goroutines are spawned. `checkAutoReflect` runs synchronously in the caller's goroutine.
 
-**No ABBA deadlock possible**. Store.mu and Worker.mu are never held simultaneously by any goroutine (per M2 spec §7). The session cleaner and worker goroutines operate on entirely disjoint lock sets.
+### 11.3 Lock ordering verification
 
----
+Single lock path: `reflectState.mu` → release → `queue.Store.mu` (inside Insert). No nested locks. No ABBA potential. Documented in Section 7.4.
 
-## 14. Backpressure Summary
+### 11.4 Concurrency safety declaration
 
-| Layer | Mechanism | Response |
-|-------|-----------|----------|
-| Queue full (MaxPending reached) | `queue.ErrQueueFull` | HTTP handler returns `{"status":"rejected","reason":"queue_full"}` |
-| Worker semaphore full | Worker goroutine blocks in `select { case sem <-: ... }` | Backpressure is invisible to HTTP — request is already queued |
-| Cognee overload | ProcessFunc creates detached context with timeout | Worker marks job as failed, retries up to MaxRetries |
-| Worker pool drained during shutdown | Worker.Stop() → cancel ctx → workers reject new semaphore acquires → finish current jobs → exit | Shutdown waits up to job timeout |
-
----
-
-## 15. Error Handling Table
-
-| Scenario | Handler Behavior | Worker Behavior |
-|----------|-----------------|-----------------|
-| queueStore.Insert() returns ErrQueueFull | Return `{"status":"rejected","reason":"queue_full"}` | N/A |
-| queueStore.Insert() returns other error | Return MCP error -32000 | N/A |
-| queueStore is nil (before Start()) | Nil check in pendingCount/queueDepth returns 0 | N/A — workers only started after store is non-nil |
-| ProcessFunc returns error (retain failed) | N/A | Worker marks job failed, webhook fires, auto-retry |
-| ProcessFunc returns error (reflect failed) | N/A | Worker marks job failed, auto-retry, NO webhook |
-| ProcessFunc panics | N/A | Worker defer recover logs and continues |
-| queueStore.UpdateStatus fails | N/A | Worker logs error, job stuck in running → recovery on restart |
-| Cognee API call exceeds timeout | N/A | context.WithTimeout cancels, ProcessFunc returns error |
-| Stop() called with in-flight jobs | N/A | Worker.Stop() blocks until jobs complete or timeout |
-| memory_retain_status on non-existent job_id | Return `{"status":"not_found"}` | N/A |
-| memory_retain_status on dead job | Return status="dead" with error and retry info | N/A |
+| Type | Declaration | Section |
+|------|------------|---------|
+| `reflectState` | "Safe for concurrent use — mu guards all field access" | 3.1 |
+| `Server.reflectStates` (sync.Map) | "Safe for concurrent use — sync.Map" | 3.2 |
+| `Config.AutoReflectAfterN` / `AutoReflectTimeout` | "Read-only after startup" | 7.2 |
 
 ---
 
-## 16. Acceptance Criteria (M3)
+## 12. Deliverable Checklist
 
-All ACs are testable with Cognee mock backend (cogneemock) and :memory: queue store.
-
-### 16.1 Retain Path
-
-| AC# | Description | Verification |
-|-----|-------------|-------------|
-| AC-M3.1 | `memory_retain` returns `{"status":"queued","bank":"...","job_id":"..."}` immediately (no blocking) | POST memory_retain → response in <100ms, contains job_id |
-| AC-M3.2 | `memory_retain` returns `{"status":"rejected","reason":"queue_full"}` when MaxPending reached | Insert MaxPending jobs, next retain returns rejection |
-| AC-M3.3 | Queued retain job is processed by worker pool (CogneeBackend.Retain called) | Insert job, wait, verify Cognee mock received retain request |
-| AC-M3.4 | Job transitions: pending → running → completed on retain success | Query job by ID after completion → status="completed" |
-| AC-M3.5 | Job transitions: pending → running → failed → pending (retry) on retain failure with retries left | Mock returns error, verify retry_count increments and status goes back to pending |
-| AC-M3.6 | Job transitions to dead after MaxRetries exhausted | Mock returns error 3+ times consecutively → status="dead" |
-| AC-M3.7 | `job.Result` is persisted on retain success | Query completed job → result field contains Cognee response |
-| AC-M3.8 | `job.Error` is persisted on retain failure | Query failed job → error field contains error message |
-| AC-M3.9 | `fireErrorWebhook` is called on retain failure | Mock webhook URL, verify POST received with job_id and error |
-| AC-M3.10 | `maybeAutoImprove` is called after successful retain | Mock auto-improve, verify backend.Reflect(bank, "") is called |
-| AC-M3.11 | `semaphoreGauge` reflects queue worker concurrency | With SemSize=3 and 10 concurrent retains, gauge never exceeds 3 |
-
-### 16.2 Reflect Path
-
-| AC# | Description | Verification |
-|-----|-------------|-------------|
-| AC-M3.12 | `memory_reflect` returns `{"status":"queued","bank":"...","job_id":"..."}` with job_id | POST memory_reflect → response contains job_id (new!) |
-| AC-M3.13 | `memory_reflect` returns `{"status":"rejected","reason":"queue_full"}` when MaxPending reached | Insert MaxPending jobs, next reflect returns rejection |
-| AC-M3.14 | Queued reflect job is processed (CogneeBackend.Reflect called) | Insert reflect job, wait, verify Cognee mock received reflect request |
-| AC-M3.15 | Reflect job status pollable via `memory_retain_status` | Insert reflect job, poll status → returns job state |
-
-### 16.3 Status Endpoint
-
-| AC# | Description | Verification |
-|-----|-------------|-------------|
-| AC-M3.16 | `memory_retain_status` returns job data from SQLite queue | Insert job, call memory_retain_status → returns job with correct fields |
-| AC-M3.17 | `memory_retain_status` returns `{"status":"not_found"}` for non-existent job_id | Query with invalid job_id → not_found |
-| AC-M3.18 | `memory_retain_status` returns `retry_count` and `max_retries` for failed jobs | Query failed job → response includes retry fields |
-| AC-M3.19 | `memory_retain_status` returns status="dead" for exhausted retries | Query dead job → status="dead" |
-| AC-M3.20 | `memory_retain_status` works without nil-check (queueStore always constructed) | Verify no `"job tracking not available"` error in code path |
-
-### 16.4 Health Endpoint
-
-| AC# | Description | Verification |
-|-----|-------------|-------------|
-| AC-M3.21 | `GET /health` returns real `queue_depth` from SQLite | Insert 5 pending jobs → health endpoint shows queue_depth=5 |
-| AC-M3.22 | `GET /health` returns `queue_depth=0` before any jobs queued | Fresh start → queue_depth=0 (not hardcoded, actually reads store) |
-
-### 16.5 Lifecycle
-
-| AC# | Description | Verification |
-|-----|-------------|-------------|
-| AC-M3.23 | `Server.Start()` creates queue.Store and queue.Worker after Cognee is healthy | Check logs: "queue workers started" after Cognee health check |
-| AC-M3.24 | `Server.Start()` calls `queue.Recover()` and logs count if >0 | Manually reset running jobs before start → log shows recovered count |
-| AC-M3.25 | `Server.Start()` starts TTL cleanup goroutine | Verify TTL goroutine exists after start |
-| AC-M3.26 | `Server.Stop()` calls `queueWorker.Stop()` and waits for drain | Start retain job, immediately call Stop → Stop blocks until job completes |
-| AC-M3.27 | `Server.Stop()` calls `queueStore.Close()` | Verify SQLite file handle released after stop |
-| AC-M3.28 | `Server.Stop()` waits for auto-improve goroutines via `autoImproveWg` | Trigger auto-improve, call Stop → Stop blocks until auto-improve completes |
-| AC-M3.29 | `Server.Stop()` is safe when queue store/worker are nil (stop before start) | Stop without Start → no panic |
-| AC-M3.30 | `Server.Start()` then `Server.Stop()` then `Server.Start()` — queue reinitializes cleanly | Start→Stop→Start cycle → second Start has fresh workers |
-
-### 16.6 Deletion Verification
-
-| AC# | Description | Verification |
-|-----|-------------|-------------|
-| AC-M3.31 | `job_tracker.go` file is deleted | File does not exist |
-| AC-M3.32 | `cogneeSemaphore` field removed from Server struct | Grep for cogneeSemaphore → zero results (except auto_improve.go which gets replaced) |
-| AC-M3.33 | `jobTracker` field removed from Server struct | Grep for jobTracker in server.go → zero results |
-| AC-M3.34 | `cogneeWg` usage removed from retain/reflect paths | Grep handlers.go for cogneeWg → zero results |
-| AC-M3.35 | `jobTrackerCleanup()` goroutine removed | Grep for jobTrackerCleanup → zero results |
-| AC-M3.36 | `// TODO(M3)` comment removed from session_cleaner.go | Grep for TODO(M3) → zero results |
-
-### 16.7 Session Cleaner
-
-| AC# | Description | Verification |
-|-----|-------------|-------------|
-| AC-M3.37 | Session cleaner reads real queue depth from SQLite | Insert pending jobs while cleaner runs → `queueGauge` updates to correct value |
-
-### 16.8 Compile-Time & Concurrency
-
-| AC# | Description | Verification |
-|-----|-------------|-------------|
-| AC-M3.38 | Compile-time assertion that ProcessFunc matches queue.ProcessFunc | Change processQueueJob signature → compile error |
-| AC-M3.39 | `go test -race -timeout 240s ./...` passes with zero races | Exit code 0, no race output |
-| AC-M3.40 | `go build ./...` compiles without errors | Exit code 0 |
-
-### 16.9 Config
-
-| AC# | Description | Verification |
-|-----|-------------|-------------|
-| AC-M3.41 | `QUEUE_MAX_PENDING` env var sets MaxPending | Set QUEUE_MAX_PENDING=5, insert 6 jobs → 6th returns queue_full |
-| AC-M3.42 | `QUEUE_WORKER_COUNT` env var controls worker count | Set QUEUE_WORKER_COUNT=2 → exactly 2 worker goroutines |
-| AC-M3.43 | `QUEUE_MAX_CONCURRENT` env var controls semaphore size | Set QUEUE_MAX_CONCURRENT=1 → only 1 concurrent ProcessFunc call |
-| AC-M3.44 | `COGNEE_MAX_CONCURRENT_RETAINS` still works as fallback for QUEUE_MAX_CONCURRENT | Set COGNEE_MAX_CONCURRENT_RETAINS=5, leave QUEUE_MAX_CONCURRENT unset → sem size=5 |
+- [ ] `auto_reflect.go`: New file with `checkAutoReflect(bank string)` method on `*Server`
+- [ ] `config.go`: Add `AutoReflectAfterN int` and `AutoReflectTimeout time.Duration` fields
+- [ ] `config.go`: Add env var parsing in `LoadConfig()`
+- [ ] `server.go`: Add `reflectStates sync.Map` to `Server` struct
+- [ ] `server.go`: Add `s.checkAutoReflect(job.Bank)` call in `processQueueJob` after `s.maybeAutoImprove`
+- [ ] All 20 ACs are implemented and traceable to spec body
 
 ---
 
-## 17. Edge Cases & Risk Mitigation
+## 13. What M4 Does NOT Do
 
-### 17.1 Nil queueStore during early shutdown
-
-| Risk | Likelihood | Mitigation |
-|------|-----------|-----------|
-| Stop() called before Start() → queueStore is nil | Medium (test scenario) | All accessor helpers (`pendingCount`, `queueDepth`) check for nil store. `Stop()` checks `s.queueWorker != nil` and `s.queueStore != nil` before calling methods. |
-
-### 17.2 Auto-improve idle check with nil queueStore
-
-| Risk | Likelihood | Mitigation |
-|------|-----------|-----------|
-| `maybeAutoImprove` called before Start() completes | Very Low | Auto-improve fires only after a retain goroutine completes, which requires Start() to have finished. The `err != nil` fallback in idle check handles any edge case. |
-
-### 17.3 memory_retain_status API compatibility
-
-| Risk | Likelihood | Mitigation |
-|------|-----------|-----------|
-| Old clients expect exact JSON shape from jobTracker | Medium | New response includes all old fields (`job_id`, `bank`, `status`, `error`, `result`, `created_at`, `updated_at`) plus new fields (`retry_count`, `max_retries`). Old clients ignore unknown fields. Status values are strings — "completed" still means success. |
-
-### 17.4 Queue DB file in working directory
-
-| Risk | Likelihood | Mitigation |
-|------|-----------|-----------|
-| Default `./data/queue.db` in CWD conflicts with deployment | Low | Same pattern as `./data/improve_state.json` and `./logs/memory.log`. Consistent with existing file layout. Overridable via `QUEUE_DB_PATH`. |
-
-### 17.5 WAL file accumulation during TTL cleanup
-
-| Risk | Likelihood | Mitigation |
-|------|-----------|-----------|
-| Large number of dead jobs creates large WAL file | Medium | TTL cleanup runs every 5 minutes (configurable). SQLite WAL auto-checkpoints after 1000 pages. Queue TTL is 24h by default. |
-
-### 17.6 ProcessFunc timeout vs Worker semaphore timeout
-
-| Risk | Likelihood | Mitigation |
-|------|-----------|-----------|
-| ProcessFunc hangs 900s holding semaphore slot, blocking other workers | Low | The `context.WithTimeout` in ProcessFunc enforces a hard deadline. The semaphore is released via `defer` in `processWithSemaphore`. If ProcessFunc truly hangs past timeout (e.g., network partition), the Worker still recovers because ProcessFunc returns error on timeout. |
-
----
-
-## 18. Handoff Notes for Coder
-
-1. **Delete `job_tracker.go` entirely** — remove the file from the repository.
-2. **All new code in package `main`** — no new packages. Imports: add `"mcp-memory/queue"` to server.go and handlers.go.
-3. **Import `"errors"` in handlers.go** — needed for `errors.Is(err, queue.ErrQueueFull)`.
-4. **`autoImproveWg` field** — add to Server struct. Replace ALL `s.cogneeWg.Add/Done` calls in `auto_improve.go` only. The cogneeWg field is removed from Server struct.
-5. **Keep `cogneeCtx` and `cogneeCancel`** — they are still created in NewServer and cancelled in Stop. ProcessFunc uses `context.Background()` for the detached context, not `cogneeCtx`. cogneeCtx cancellation in Stop is belt-and-suspenders.
-6. **Do NOT remove `CogneeMaxConcurrentRetains` from Config** — keep it but mark it `// Deprecated: use QueueMaxConcurrent`. The env var still works as a fallback.
-7. **`queue.Stats()` does NOT acquire store.mu** — Stats uses a raw SQL query without the mutex. This is safe for approximate readings in health/session_cleaner paths.
-8. **`cogneePending` gauge** — update from `pendingCount()` helper after every Insert in retain and reflect handlers.
-9. **`semaphoreGauge` gauge** — update from `queue.Stats().Running` in session cleaner or a periodic goroutine. Alternatively, remove `semaphoreGauge` and replace with `memory.queue_running` gauge if appropriate. For M3: update in session cleaner alongside queue depth.
-10. **`memory_retain_duration` and `memory_reflect_duration` timers** — record in ProcessFunc (not in handler) since the async processing time is what matters.
-11. **Test strategy** — use `cogneemock` for Cognee backend and `:memory:` queue store. Set `QueueMaxConcurrent=1` for deterministic ordering in tests. Use `QueueWorkerCount=1` for single-worker tests.
-12. **No existing test files need modification** unless they reference `jobTracker`, `cogneeSemaphore`, or `cogneeWg` directly. Check `auto_improve_test.go`, `tester_pass1_adversarial_test.go`, `deep_test.go`, and any integration tests.
+- Does NOT modify `handlers.go`, `queue/`, `backend/`, `auto_improve.go`, `services.go`, or any test file.
+- Does NOT introduce new metrics.
+- Does NOT persist reflect state to disk (in-memory only, resets on restart).
+- Does NOT spawn new goroutines.
+- Does NOT change the queue schema, worker loop, or job processing.
+- Does NOT affect manual `memory_reflect` MCP tool behavior.
+- Does NOT require changes to `Validate()` in config.go (clamping is inline).
