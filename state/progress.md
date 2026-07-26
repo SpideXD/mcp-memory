@@ -6,7 +6,7 @@
 | M2 — SQLite Queue Package | 🔵 In Progress | ✅ | ✅ | ✅ | 🔄 | ⬜ | ⬜ |
 | M3 — Wire Queue into Handlers | ✅ Done | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | M4 — Auto-Reflect Scheduling | ✅ Done | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| M5 — Cleanup + Production | 🔵 In Progress | ✅ | ✅ | 🔄 | ⬜ | ⬜ | ⬜ |
+| M5 — Cleanup + Production | ✅ Done | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ## Notes
 
