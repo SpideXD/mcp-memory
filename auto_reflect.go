@@ -43,7 +43,7 @@ func (s *Server) checkAutoReflect(bank string) {
 	}
 
 	// Get or create per-bank state, initialize lastReflect if new
-	val, _ := s.reflectStates.LoadOrStore(bank, &reflectState{lastReflect: time.Now()})
+	val, _ := s.reflectStates.LoadOrStore(bank, &reflectState{lastReflect: time.Now(), lastAccess: time.Now()})
 	rs := val.(*reflectState)
 
 	// Lock for the check-and-update phase
@@ -133,19 +133,23 @@ func (s *Server) cleanupReflectStates(ttl time.Duration) {
 }
 
 // autoReflectCleanup periodically evicts stale reflectState entries.
+// Uses the outer-loop/inner-func panic recovery pattern: a panic inside
+// the inner func is caught, the goroutine survives and retries next tick.
 func (s *Server) autoReflectCleanup(shutdown chan struct{}) {
-	defer func() {
-		if r := recover(); r != nil {
-			s.panics.Add(1)
-			s.log.Error("autoReflectCleanup panicked", "panic", r)
-		}
-	}()
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			s.cleanupReflectStates(24 * time.Hour)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						s.panics.Add(1)
+						s.log.Error("autoReflectCleanup panicked", "panic", r)
+					}
+				}()
+				s.cleanupReflectStates(24 * time.Hour)
+			}()
 		case <-shutdown:
 			return
 		}
