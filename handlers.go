@@ -52,6 +52,18 @@ func pendingCount(store *queue.Store) int64 {
 	return int64(count)
 }
 
+// runningCount returns the running (in-flight) count as int64, or 0 if store is nil.
+func runningCount(store *queue.Store) int64 {
+	if store == nil {
+		return 0
+	}
+	count, err := store.CountByStatus(queue.StatusRunning)
+	if err != nil {
+		return 0
+	}
+	return int64(count)
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -344,6 +356,7 @@ func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessa
 		}
 
 		s.log.Info("reflect_queued", "bank", bank, "job_id", jobID)
+		s.metrics.cogneePending.Set(pendingCount(s.queueStore))
 		s.mcpToolResult(sid, id, fmt.Sprintf(`{"status":"queued","bank":"%s","job_id":"%s"}`, bank, jobID))
 		logReq("ok", nil)
 

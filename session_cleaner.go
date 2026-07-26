@@ -64,6 +64,7 @@ func (s *Server) sessionCleaner() {
 		s.metrics.sessionGauge.Set(int64(sessionCount))
 		// M3: Read queue depth from SQLite queue store
 		s.metrics.queueGauge.Set(pendingCount(s.queueStore))
+		s.metrics.semaphoreGauge.Set(runningCount(s.queueStore))
 		if sessionCount > s.config.MaxSessions*9/10 {
 			s.log.Warn("approaching session limit", "sessions", sessionCount, "max", s.config.MaxSessions)
 			s.alerts.Send(AlertWarn, fmt.Sprintf("Sessions at %d/%d", sessionCount, s.config.MaxSessions), nil)
