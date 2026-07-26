@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"errors"
 	"sync"
 	"time"
 
@@ -27,7 +27,7 @@ func (s *Server) checkAutoReflect(bank string) {
 	defer func() {
 		if r := recover(); r != nil {
 			s.panics.Add(1)
-			log.Printf("checkAutoReflect panicked for bank %s: %v", bank, r)
+			s.log.Error("auto_reflect panicked", "bank", bank, "panic", r)
 		}
 	}()
 
@@ -74,7 +74,7 @@ func (s *Server) checkAutoReflect(bank string) {
 
 	// Guard 3: queue store may be nil (server starting up)
 	if s.queueStore == nil {
-		log.Printf("WARN: auto_reflect: queue store not available for bank %s", bank)
+		s.log.Warn("auto_reflect skipped", "reason", "queue store not available", "bank", bank)
 		return
 	}
 
@@ -84,22 +84,21 @@ func (s *Server) checkAutoReflect(bank string) {
 		Bank:       bank,
 		Type:       "reflect",
 		Payload:    "_auto",
-		MaxRetries: 0, // uses default (3) in Store.Insert
+		MaxRetries: 0,
 	}
 	if err := s.queueStore.Insert(job); err != nil {
-		log.Printf("auto_reflect: failed to insert reflect job for bank %s: %v", bank, err)
+		if errors.Is(err, queue.ErrQueueFull) {
+			s.log.Warn("auto_reflect skipped", "reason", "queue full", "bank", bank)
+		} else {
+			s.log.Error("auto_reflect insert failed", "bank", bank, "error", err)
+		}
 		return
 	}
 
 	// Update pending gauge
-	if s.metrics != nil && s.metrics.cogneePending != nil {
-		stats, err := s.queueStore.Stats()
-		if err == nil {
-			s.metrics.cogneePending.Set(int64(stats.Pending))
-		}
-	}
+	s.metrics.cogneePending.Set(pendingCount(s.queueStore))
 
-	log.Printf("auto_reflect: job inserted for bank %s (trigger=%s)", bank, triggerReason(countTrigger, timeoutTrigger))
+	s.log.Info("auto_reflect triggered", "bank", bank, "trigger", triggerReason(countTrigger, timeoutTrigger))
 }
 
 // triggerReason returns a human-readable trigger reason.
