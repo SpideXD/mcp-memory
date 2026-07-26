@@ -50,6 +50,16 @@ func (s *Server) captureMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		// Restore body for handlers that need it (they re-read from a new reader)
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
+		// Apply configured faults (latency, transport-level failures, sequenced
+		// responses). A handled fault produced the whole response already.
+		handled, override := s.applyFault(w, r, r.URL.Path)
+		if handled {
+			return
+		}
+		if override != nil {
+			r = r.WithContext(withOverride(r.Context(), *override))
+		}
+
 		next(w, r)
 	}
 }

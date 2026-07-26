@@ -23,6 +23,7 @@ type Server struct {
 	mu         sync.RWMutex
 	requests   []RequestLog
 	responses  map[string]ResponseConfig // key = endpoint path, e.g. "/api/v1/improve"
+	faults     map[string]faultState     // key = endpoint path; see faults.go
 }
 
 // NewServer creates and starts the mock Cognee server.
@@ -30,6 +31,7 @@ type Server struct {
 func NewServer() *Server {
 	s := &Server{
 		responses: make(map[string]ResponseConfig),
+		faults:    make(map[string]faultState),
 	}
 
 	mux := http.NewServeMux()
@@ -115,6 +117,16 @@ func (s *Server) getResponse(endpoint string) ResponseConfig {
 		return cfg
 	}
 	return ResponseConfig{}
+}
+
+// responseFor resolves the response for a request: a sequenced override from
+// SetSequence wins over the static SetResponse override, which wins over the
+// endpoint default.
+func (s *Server) responseFor(r *http.Request, endpoint string) ResponseConfig {
+	if cfg, ok := overrideFrom(r.Context()); ok {
+		return cfg
+	}
+	return s.getResponse(endpoint)
 }
 
 // defaultResponseBody returns the default JSON response body for common endpoints.

@@ -14,7 +14,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := s.getResponse("/health")
+	cfg := s.responseFor(r, "/health")
 	code := cfg.StatusCode
 	if code == 0 {
 		code = http.StatusOK
@@ -34,7 +34,7 @@ func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := s.getResponse("/api/v1/remember")
+	cfg := s.responseFor(r, "/api/v1/remember")
 	code := cfg.StatusCode
 	if code == 0 {
 		code = http.StatusOK
@@ -54,7 +54,7 @@ func (s *Server) handleRecall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := s.getResponse("/api/v1/recall")
+	cfg := s.responseFor(r, "/api/v1/recall")
 	code := cfg.StatusCode
 	if code == 0 {
 		code = http.StatusOK
@@ -82,7 +82,7 @@ func (s *Server) handleImprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := s.getResponse("/api/v1/improve")
+	cfg := s.responseFor(r, "/api/v1/improve")
 	code := cfg.StatusCode
 	if code == 0 {
 		code = http.StatusOK
@@ -102,7 +102,7 @@ func (s *Server) handleForget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := s.getResponse("/api/v1/forget")
+	cfg := s.responseFor(r, "/api/v1/forget")
 	code := cfg.StatusCode
 	if code == 0 {
 		code = http.StatusOK
