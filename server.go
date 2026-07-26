@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"mcp-memory/backend"
 	"mcp-memory/logger"
 	"mcp-memory/metrics"
+	"mcp-memory/queue"
 )
 
 type Server struct {
@@ -40,11 +42,14 @@ type Server struct {
 	metrics *serverMetrics
 
 	// Cognee infrastructure
-	cogneeSemaphore chan struct{} // buffered, bounds concurrent retains
-	jobTracker      *jobTracker  // in-memory job result map + TTL cleanup
-	cogneeCtx       context.Context    // cancelled on Stop() for goroutine coordination
-	cogneeCancel    context.CancelFunc // called from Stop()
-	cogneeWg        sync.WaitGroup    // tracks in-flight Cognee goroutines
+	cogneeCtx    context.Context    // cancelled on Stop() for goroutine coordination
+	cogneeCancel context.CancelFunc // called from Stop()
+
+	// Queue infrastructure (M3)
+	queueStore  *queue.Store  // SQLite-backed job store
+	queueWorker *queue.Worker // Worker pool for async retain/reflect processing
+
+	autoImproveWg sync.WaitGroup // tracks in-flight auto-improve goroutines (replaces cogneeWg)
 
 	// Auto-improve state — periodic graph optimization
 	improveState *autoImproveState // per-bank counters + in-flight tracking
@@ -85,17 +90,17 @@ func NewServer(config Config) *Server {
 	alertClient := NewAlertClient(config.AlertURL, config.AlertMode)
 
 	backendCfg := backend.BackendConfig{
-		Backend:                 string(config.Backend),
-		CogneePort:              config.CogneePort,
-		BackendRetainTimeout:    config.BackendRetainTimeout,
-		BackendRecallTimeout:    config.BackendRecallTimeout,
-		BackendReflectTimeout:   config.BackendReflectTimeout,
-		CogneeRetainTimeout:     config.CogneeRetainTimeout,
-		RetryAttempts:           config.RetryAttempts,
-		RetryDelay:              config.RetryDelay,
-		RetryMaxDelay:           config.RetryMaxDelay,
-		TemporalCognify:         config.TemporalCognify,
-		MemoryOnly:              config.MemoryOnly,
+		Backend:               string(config.Backend),
+		CogneePort:            config.CogneePort,
+		BackendRetainTimeout:  config.BackendRetainTimeout,
+		BackendRecallTimeout:  config.BackendRecallTimeout,
+		BackendReflectTimeout: config.BackendReflectTimeout,
+		CogneeRetainTimeout:   config.CogneeRetainTimeout,
+		RetryAttempts:         config.RetryAttempts,
+		RetryDelay:            config.RetryDelay,
+		RetryMaxDelay:         config.RetryMaxDelay,
+		TemporalCognify:       config.TemporalCognify,
+		MemoryOnly:            config.MemoryOnly,
 	}
 
 	s := &Server{
@@ -116,7 +121,7 @@ func NewServer(config Config) *Server {
 			reflectDur:   metrics.NewTimer("memory.reflect_duration"),
 			queueGauge:   metrics.NewGauge("memory.queue_depth"),
 			sessionGauge: metrics.NewGauge("memory.sessions"),
-			sseDrops:       metrics.NewCounter("memory.sse_drops"),
+			sseDrops:     metrics.NewCounter("memory.sse_drops"),
 			// Spec-required metrics (AC-M7.13)
 			retainTotal:    metrics.NewCounter("memory.retain_total"),
 			retainErrors:   metrics.NewCounter("memory.retain_errors"),
@@ -129,15 +134,71 @@ func NewServer(config Config) *Server {
 		},
 	}
 
-	// Cognee infrastructure — always constructed
-	s.cogneeSemaphore = make(chan struct{}, config.CogneeMaxConcurrentRetains)
-	s.jobTracker = newJobTracker(30 * time.Minute)
+	// Cognee context — created during NewServer, cancelled during Stop()
 	s.cogneeCtx, s.cogneeCancel = context.WithCancel(context.Background())
 	s.dataDir = getEnv("DATA_DIR", "./data")
 	s.improveState = loadAutoImproveState(s.dataDir)
-	go s.jobTrackerCleanup()
 
 	return s
+}
+
+// processQueueJob is the ProcessFunc called by queue.Worker for each dequeued job.
+// Signature must match queue.ProcessFunc exactly.
+func (s *Server) processQueueJob(ctx context.Context, job *queue.Job) error {
+	s.log.Info("queue: processing job", "job_id", job.ID, "type", job.Type, "bank", job.Bank)
+	startTime := time.Now()
+
+	switch job.Type {
+	case "retain":
+		// Create detached context with CogneeRetainTimeout.
+		// Detached from ctx so shutdown doesn't abort long-running retain.
+		detachedCtx, cancel := context.WithTimeout(context.Background(), s.config.CogneeRetainTimeout)
+		defer cancel()
+
+		timerHandle := s.metrics.retainDur.Start()
+		result, err := s.backend.Retain(detachedCtx, job.Bank, job.Payload)
+		s.metrics.retainDur.Stop(timerHandle)
+		duration := time.Since(startTime)
+
+		if err != nil {
+			s.log.Error("queue: retain failed", "job_id", job.ID, "bank", job.Bank, "duration", duration, logger.Error(err))
+			s.metrics.errorCalls.Inc()
+			s.metrics.retainErrors.Inc()
+			s.fireErrorWebhook(job.Bank, job.ID, err.Error(), "retain")
+			return err
+		}
+
+		// Store result in job for UpdateStatus to persist
+		job.Result = result
+		s.log.Info("queue: retain completed", "job_id", job.ID, "bank", job.Bank, "duration", duration)
+
+		// Trigger auto-improve after successful retain
+		s.maybeAutoImprove(job.Bank)
+
+		return nil
+
+	case "reflect":
+		detachedCtx, cancel := context.WithTimeout(context.Background(), s.config.BackendReflectTimeout)
+		defer cancel()
+
+		startTime := time.Now()
+		timerHandle := s.metrics.reflectDur.Start()
+		_, err := s.backend.Reflect(detachedCtx, job.Bank, job.Payload)
+		s.metrics.reflectDur.Stop(timerHandle)
+		duration := time.Since(startTime)
+
+		if err != nil {
+			s.log.Error("queue: reflect failed", "job_id", job.ID, "bank", job.Bank, "duration", duration, logger.Error(err))
+			s.metrics.errorCalls.Inc()
+			return err
+		}
+
+		s.log.Info("queue: reflect completed", "job_id", job.ID, "bank", job.Bank, "duration", duration)
+		return nil
+
+	default:
+		return fmt.Errorf("unknown job type: %s", job.Type)
+	}
 }
 
 func (s *Server) Start() error {
@@ -159,7 +220,7 @@ func (s *Server) Start() error {
 		s.log.Error("startup failed", logger.Error(err))
 		return err
 	}
-	s.svc.savePids()  // Persist child PIDs for crash recovery
+	s.svc.savePids() // Persist child PIDs for crash recovery
 
 	go s.sessionCleaner()
 
@@ -181,6 +242,48 @@ func (s *Server) Start() error {
 		s.mu.Unlock()
 		s.alerts.Send(AlertInfo, "Server started — all services healthy", nil)
 	}
+
+	// Allocate queue store — only after Cognee is healthy
+	store, err := queue.NewStore(queue.StoreConfig{
+		DBPath:     s.config.QueueDBPath,
+		MaxPending: s.config.QueueMaxPending,
+		JobTTL:     s.config.QueueJobTTL,
+	})
+	if err != nil {
+		return fmt.Errorf("queue store: %w", err)
+	}
+	s.queueStore = store
+
+	// Create ProcessFunc closure
+	processFunc := func(ctx context.Context, job *queue.Job) error {
+		return s.processQueueJob(ctx, job)
+	}
+
+	// Create worker pool
+	worker, err := queue.NewWorker(queue.WorkerConfig{
+		Store:   s.queueStore,
+		Process: processFunc,
+		Count:   s.config.QueueWorkerCount,
+		SemSize: s.config.QueueMaxConcurrent,
+	})
+	if err != nil {
+		s.queueStore.Close()
+		return fmt.Errorf("queue worker: %w", err)
+	}
+	s.queueWorker = worker
+
+	// Recover orphaned jobs from previous crash
+	recovered, _ := s.queueStore.Recover()
+	if recovered > 0 {
+		s.log.Info("queue: recovered orphaned jobs", "count", recovered)
+	}
+
+	// Start worker pool
+	s.queueWorker.Start(context.Background())
+
+	// Start TTL cleanup
+	s.queueStore.StartTTLCleanup(context.Background(), s.config.QueueTTLInterval)
+
 	s.log.Info("services started", "uptime", time.Since(s.startTime).String(), "state", s.state)
 	return nil
 }
@@ -203,11 +306,26 @@ func (s *Server) Stop() {
 	// Signal session cleaner goroutine to exit (once)
 	s.shutdownOnce.Do(func() { close(s.shutdown) })
 
-	// Cancel Cognee goroutine contexts and wait for them to drain
+	// M3: Stop queue workers and drain in-flight jobs
+	if s.queueWorker != nil {
+		s.log.Info("stopping queue workers...")
+		s.queueWorker.Stop()
+		s.log.Info("queue workers stopped")
+	}
+
+	// M3: Wait for auto-improve goroutines
+	s.autoImproveWg.Wait()
+
+	// Cancel Cognee context (belt-and-suspenders for any remaining detached work)
 	if s.cogneeCancel != nil {
 		s.cogneeCancel()
-		s.cogneeWg.Wait()
-		s.log.Info("all cognee goroutines drained")
+	}
+
+	// M3: Close queue store
+	if s.queueStore != nil {
+		if err := s.queueStore.Close(); err != nil {
+			s.log.Error("queue store close error", logger.Error(err))
+		}
 	}
 
 	s.sessionsMu.Lock()
@@ -218,7 +336,7 @@ func (s *Server) Stop() {
 	s.sessionsMu.Unlock()
 
 	s.svc.stop()
-	defer s.svc.clearPids()  // Ensure cleanup even if stop panics
+	s.svc.clearPids()
 
 	s.mu.Lock()
 	s.state = StateStopped

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 
 	"mcp-memory/logger"
 	"mcp-memory/metrics"
+	"mcp-memory/queue"
 )
 
 var bankNamePattern = regexp.MustCompile(`^[a-zA-Z0-9:_-]{1,128}$`)
@@ -24,6 +26,30 @@ func newJobID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// queueDepth returns the pending queue depth from the store, or 0 if unavailable.
+func queueDepth(store *queue.Store) int {
+	if store == nil {
+		return 0
+	}
+	stats, err := store.Stats()
+	if err != nil {
+		return 0
+	}
+	return stats.Pending
+}
+
+// pendingCount returns the pending count as int64, or 0 if store is nil.
+func pendingCount(store *queue.Store) int64 {
+	if store == nil {
+		return 0
+	}
+	count, err := store.CountByStatus(queue.StatusPending)
+	if err != nil {
+		return 0
+	}
+	return int64(count)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -61,7 +87,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"llama":           llama,
 		"cognee":          cognee,
 		"down":            down,
-		"queue_depth":     0,
+		"queue_depth":     queueDepth(s.queueStore),
 		"sessions":        n,
 		"sse_drops":       s.metrics.sseDrops.Value(),
 		"uptime":          time.Since(s.startTime).String(),
@@ -258,78 +284,29 @@ func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessa
 		s.metrics.retainCalls.Inc()
 		s.metrics.retainTotal.Inc()
 
-		// ★ COGNEE PATH: goroutine-per-retain with semaphore
+		// M3: Queue-backed retain path
 		jobID := newJobID()
+		job := &queue.Job{
+			ID:         jobID,
+			Bank:       bank,
+			Type:       "retain",
+			Payload:    a.Content,
+			MaxRetries: 0, // use default (3)
+		}
 
-		// Acquire semaphore BEFORE storing in tracker (P2-C3 fix)
-		select {
-		case s.cogneeSemaphore <- struct{}{}:
-			// acquired slot
-			s.log.Debug("semaphore_acquired", "bank", bank, "job_id", jobID, "slots", len(s.cogneeSemaphore))
-			s.metrics.semaphoreGauge.Set(int64(len(s.cogneeSemaphore)))
-		default:
-			s.mcpToolResult(sid, id, `{"status":"rejected","reason":"too_many_concurrent_retains"}`)
+		if err := s.queueStore.Insert(job); err != nil {
+			if errors.Is(err, queue.ErrQueueFull) {
+				s.mcpToolResult(sid, id, `{"status":"rejected","reason":"queue_full"}`)
+				logReq("", err)
+				return
+			}
+			s.mcpError(sid, id, -32000, "failed to queue job")
+			s.metrics.errorCalls.Inc()
+			logReq("", err)
 			return
 		}
 
-		// Store AFTER successful semaphore acquire
-		if s.jobTracker != nil {
-			s.jobTracker.store(jobID, bank)
-			s.metrics.cogneePending.Set(int64(s.jobTracker.stats().Pending))
-		}
-
-		s.cogneeWg.Add(1)
-		go func() {
-			defer s.cogneeWg.Done()
-			defer func() {
-				<-s.cogneeSemaphore
-				s.log.Debug("semaphore_released", "bank", bank, "job_id", jobID)
-				s.metrics.semaphoreGauge.Set(int64(len(s.cogneeSemaphore)))
-			}()
-			defer func() {
-				if r := recover(); r != nil {
-					s.panics.Add(1)
-					s.log.Error("cognee retain goroutine panicked", "bank", bank, "job_id", jobID, "panic", fmt.Sprintf("%v", r))
-					if s.jobTracker != nil {
-						s.jobTracker.fail(jobID, "internal error: panic")
-						s.metrics.cogneePending.Set(int64(s.jobTracker.stats().Pending))
-					}
-				}
-			}()
-
-			s.log.Info("goroutine_started", "name", "cognee_retain", "bank", bank, "job_id", jobID)
-			defer s.log.Info("goroutine_stopped", "name", "cognee_retain", "bank", bank, "job_id", jobID)
-
-			s.log.Info("cognee retain started", "bank", bank, "job_id", jobID)
-			startTime := time.Now()
-
-			detachedCtx, cancel := context.WithTimeout(s.cogneeCtx, s.config.CogneeRetainTimeout)
-			defer cancel()
-
-			result, err := s.backend.Retain(detachedCtx, bank, a.Content)
-			duration := time.Since(startTime)
-
-			if err != nil {
-				s.log.Error("cognee retain failed", "bank", bank, "job_id", jobID, "duration", duration, logger.Error(err))
-				s.metrics.errorCalls.Inc()
-				s.metrics.retainErrors.Inc()
-				if s.jobTracker != nil {
-					s.jobTracker.fail(jobID, err.Error())
-					s.metrics.cogneePending.Set(int64(s.jobTracker.stats().Pending))
-				}
-				s.fireErrorWebhook(bank, jobID, err.Error(), "retain")
-			} else {
-				s.log.Info("cognee retain completed", "bank", bank, "job_id", jobID, "duration", duration)
-				if s.jobTracker != nil {
-					s.jobTracker.complete(jobID, result)
-					s.metrics.cogneePending.Set(int64(s.jobTracker.stats().Pending))
-				}
-			}
-
-			// Trigger auto-improve after retain
-			s.maybeAutoImprove(bank)
-		}()
-
+		s.metrics.cogneePending.Set(pendingCount(s.queueStore))
 		s.log.Info("retain_queued", "bank", bank, "job_id", jobID)
 		s.mcpToolResult(sid, id, fmt.Sprintf(`{"status":"queued","bank":"%s","job_id":"%s"}`, bank, jobID))
 		logReq("ok", nil)
@@ -344,32 +321,30 @@ func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessa
 		s.metrics.reflectCalls.Inc()
 		s.metrics.reflectTotal.Inc()
 
-		// ★ COGNEE PATH: goroutine, immediate response
-		s.cogneeWg.Add(1)
-		go func() {
-			defer s.cogneeWg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					s.panics.Add(1)
-					s.log.Error("cognee reflect goroutine panicked", "bank", bank, "panic", fmt.Sprintf("%v", r))
-				}
-			}()
+		// M3: Queue-backed reflect path
+		jobID := newJobID()
+		job := &queue.Job{
+			ID:         jobID,
+			Bank:       bank,
+			Type:       "reflect",
+			Payload:    a.Query, // empty query is valid for reflect
+			MaxRetries: 0,
+		}
 
-			s.log.Info("goroutine_started", "name", "cognee_reflect", "bank", bank)
-			defer s.log.Info("goroutine_stopped", "name", "cognee_reflect", "bank", bank)
-
-			detachedCtx, cancel := context.WithTimeout(s.cogneeCtx, s.config.BackendReflectTimeout)
-			defer cancel()
-
-			_, err := s.backend.Reflect(detachedCtx, bank, a.Query)
-			if err != nil {
-				s.log.Error("cognee reflect failed", "bank", bank, logger.Error(err))
-				s.metrics.errorCalls.Inc()
+		if err := s.queueStore.Insert(job); err != nil {
+			if errors.Is(err, queue.ErrQueueFull) {
+				s.mcpToolResult(sid, id, `{"status":"rejected","reason":"queue_full"}`)
+				logReq("", err)
+				return
 			}
-		}()
+			s.mcpError(sid, id, -32000, "failed to queue job")
+			s.metrics.errorCalls.Inc()
+			logReq("", err)
+			return
+		}
 
-		s.log.Info("reflect_queued", "bank", bank)
-		s.mcpToolResult(sid, id, fmt.Sprintf(`{"status":"queued","bank":"%s"}`, bank))
+		s.log.Info("reflect_queued", "bank", bank, "job_id", jobID)
+		s.mcpToolResult(sid, id, fmt.Sprintf(`{"status":"queued","bank":"%s","job_id":"%s"}`, bank, jobID))
 		logReq("ok", nil)
 
 	case "memory_forget":
@@ -444,18 +419,39 @@ func (s *Server) handleRetainStatus(sid string, id interface{}, args json.RawMes
 		logReq("", fmt.Errorf("missing job_id"))
 		return
 	}
-	if s.jobTracker == nil {
-		s.mcpError(sid, id, -32000, "job tracking not available with current backend")
-		logReq("", fmt.Errorf("jobTracker nil"))
+
+	job, err := s.queueStore.Get(a.JobID)
+	if err != nil {
+		s.mcpError(sid, id, -32000, "failed to query job status")
+		logReq("", err)
 		return
 	}
-	result := s.jobTracker.get(a.JobID)
-	if result == nil {
+	if job == nil {
 		s.mcpToolResult(sid, id, `{"status":"not_found"}`)
 		logReq("not_found", nil)
 		return
 	}
-	data, _ := json.Marshal(result)
+
+	// Map queue.Job to JSON response compatible with existing API
+	response := map[string]interface{}{
+		"job_id":     job.ID,
+		"bank":       job.Bank,
+		"status":     string(job.Status),
+		"created_at": job.CreatedAt,
+		"updated_at": job.UpdatedAt,
+	}
+	if job.Result != "" {
+		response["result"] = job.Result
+	}
+	if job.Error != "" {
+		response["error"] = job.Error
+	}
+	if job.Status == queue.StatusFailed || job.Status == queue.StatusDead {
+		response["retry_count"] = job.RetryCount
+		response["max_retries"] = job.MaxRetries
+	}
+
+	data, _ := json.Marshal(response)
 	s.mcpToolResult(sid, id, string(data))
 	logReq("ok", nil)
 }

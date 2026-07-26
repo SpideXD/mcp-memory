@@ -88,6 +88,14 @@ type Config struct {
 	BackendRetainTimeout  time.Duration // BACKEND_RETAIN_TIMEOUT
 	BackendRecallTimeout  time.Duration // BACKEND_RECALL_TIMEOUT
 	BackendReflectTimeout time.Duration // BACKEND_REFLECT_TIMEOUT
+
+	// Queue (M3)
+	QueueDBPath        string        // QUEUE_DB_PATH, default "./data/queue.db"
+	QueueMaxPending    int           // QUEUE_MAX_PENDING, default 1000
+	QueueJobTTL        time.Duration // QUEUE_JOB_TTL, default 24h
+	QueueTTLInterval   time.Duration // QUEUE_TTL_INTERVAL, default 5m
+	QueueWorkerCount   int           // QUEUE_WORKER_COUNT, default 4
+	QueueMaxConcurrent int           // QUEUE_MAX_CONCURRENT, default = COGNEE_MAX_CONCURRENT_RETAINS, fallback 3
 }
 
 func LoadConfig() Config {
@@ -171,6 +179,14 @@ func LoadConfig() Config {
 		BackendRetainTimeout:  getEnvDuration("BACKEND_RETAIN_TIMEOUT", 60*time.Second),
 		BackendRecallTimeout:  getEnvDuration("BACKEND_RECALL_TIMEOUT", 10*time.Second),
 		BackendReflectTimeout: getEnvDuration("BACKEND_REFLECT_TIMEOUT", 60*time.Second),
+
+		// Queue (M3)
+		QueueDBPath:        getEnv("QUEUE_DB_PATH", "./data/queue.db"),
+		QueueMaxPending:    getEnvInt("QUEUE_MAX_PENDING", 1000),
+		QueueJobTTL:        getEnvDuration("QUEUE_JOB_TTL", 24*time.Hour),
+		QueueTTLInterval:   getEnvDuration("QUEUE_TTL_INTERVAL", 5*time.Minute),
+		QueueWorkerCount:   getEnvInt("QUEUE_WORKER_COUNT", 4),
+		QueueMaxConcurrent: getEnvInt("QUEUE_MAX_CONCURRENT", getEnvInt("COGNEE_MAX_CONCURRENT_RETAINS", 3)),
 	}
 }
 
@@ -255,6 +271,15 @@ func (c Config) Validate() error {
 		if c.CogneeRetainTimeout <= 0 {
 			return fmt.Errorf("COGNEE_RETAIN_TIMEOUT must be positive")
 		}
+		if c.QueueMaxPending < 1 {
+			return fmt.Errorf("QUEUE_MAX_PENDING must be >= 1, got %d", c.QueueMaxPending)
+		}
+		if c.QueueWorkerCount < 1 {
+			return fmt.Errorf("QUEUE_WORKER_COUNT must be >= 1, got %d", c.QueueWorkerCount)
+		}
+		if c.QueueMaxConcurrent < 1 {
+			return fmt.Errorf("QUEUE_MAX_CONCURRENT must be >= 1, got %d", c.QueueMaxConcurrent)
+		}
 
 	case BackendCogneeRust:
 		// Validate Cognee binary is resolvable
@@ -271,6 +296,15 @@ func (c Config) Validate() error {
 		}
 		if c.CogneeRetainTimeout <= 0 {
 			return fmt.Errorf("COGNEE_RETAIN_TIMEOUT must be positive")
+		}
+		if c.QueueMaxPending < 1 {
+			return fmt.Errorf("QUEUE_MAX_PENDING must be >= 1, got %d", c.QueueMaxPending)
+		}
+		if c.QueueWorkerCount < 1 {
+			return fmt.Errorf("QUEUE_WORKER_COUNT must be >= 1, got %d", c.QueueWorkerCount)
+		}
+		if c.QueueMaxConcurrent < 1 {
+			return fmt.Errorf("QUEUE_MAX_CONCURRENT must be >= 1, got %d", c.QueueMaxConcurrent)
 		}
 
 	default:

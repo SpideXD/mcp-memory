@@ -117,7 +117,7 @@ func (s *autoImproveState) saveStateLocked() {
 //
 // Four conditions must ALL be true:
 //  1. retainsSince >= AUTO_IMPROVE_AFTER_N
-//  2. len(cogneeSemaphore) <= 1 (idle: at most the caller's own slot)
+//  2. queue is idle (at most 1 job currently running)
 //  3. !improveInFlight
 //  4. time.Since(lastImprove) >= AUTO_IMPROVE_COOLDOWN
 func (s *Server) maybeAutoImprove(bank string) {
@@ -152,7 +152,14 @@ func (s *Server) maybeAutoImprove(bank string) {
 
 	// Check all 4 conditions
 	thresholdMet := bs.retainsSince >= int64(s.config.AutoImproveAfterN)
-	idleCheck := len(s.cogneeSemaphore) <= 1
+	// M3: Check if queue is idle (at most 1 job currently running)
+	var idleCheck bool
+	if s.queueStore != nil {
+		stats, err := s.queueStore.Stats()
+		idleCheck = err == nil && stats.Running <= 1
+	} else {
+		idleCheck = true // no queue = assume idle
+	}
 	noInFlight := !bs.improveInFlight
 	cooldownMet := bs.lastImprove.IsZero() || time.Since(bs.lastImprove) >= s.config.AutoImproveCooldown
 
@@ -171,9 +178,9 @@ func (s *Server) maybeAutoImprove(bank string) {
 	s.improveState.mu.Unlock()
 
 	// Spawn auto-improve goroutine
-	s.cogneeWg.Add(1)
+	s.autoImproveWg.Add(1)
 	go func() {
-		defer s.cogneeWg.Done()
+		defer s.autoImproveWg.Done()
 
 		// Defer ordering per AC-M2.31: recover() must be the FIRST deferred
 		// statement to execute. In Go, defers execute LIFO, so recover() is
