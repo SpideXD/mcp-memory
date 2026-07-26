@@ -10,7 +10,7 @@ import (
 )
 
 // doRequest executes an HTTP request with retry logic and exponential backoff.
-// It returns the response body on success. Used by both Hindsight and Cognee backends.
+// It returns the response body on success.
 func doRequest(client *http.Client, req *http.Request, timeout time.Duration, retryAttempts int, retryDelay, retryMaxDelay time.Duration) ([]byte, error) {
 	if req.Body == nil {
 		return nil, fmt.Errorf("request body is nil")

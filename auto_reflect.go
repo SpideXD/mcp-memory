@@ -98,6 +98,7 @@ func (s *Server) checkAutoReflect(bank string) {
 	// Update pending gauge
 	s.metrics.cogneePending.Set(pendingCount(s.queueStore))
 
+	s.log.Info("job_queued", "job_id", job.ID, "bank", bank, "type", "reflect", "trigger", triggerReason(countTrigger, timeoutTrigger))
 	s.log.Info("auto_reflect triggered", "bank", bank, "trigger", triggerReason(countTrigger, timeoutTrigger))
 }
 

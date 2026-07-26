@@ -73,6 +73,7 @@ func main() {
 	mux.HandleFunc("/stop", srv.handleStop)
 	mux.HandleFunc("/mcp/sse", srv.handleMCPSSE)
 	mux.HandleFunc("/mcp/message", srv.handleMCPMessage)
+	mux.HandleFunc("/debug/queue", srv.handleDebugQueue)
 
 	addr := config.Host + ":" + config.Port
 	httpSrv := &http.Server{

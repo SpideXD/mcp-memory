@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"time"
 
@@ -319,7 +320,7 @@ func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessa
 		}
 
 		s.metrics.cogneePending.Set(pendingCount(s.queueStore))
-		s.log.Info("retain_queued", "bank", bank, "job_id", jobID)
+		s.log.Info("job_queued", "job_id", jobID, "bank", bank, "type", "retain")
 		s.mcpToolResult(sid, id, fmt.Sprintf(`{"status":"queued","bank":"%s","job_id":"%s"}`, bank, jobID))
 		logReq("ok", nil)
 
@@ -355,7 +356,7 @@ func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessa
 			return
 		}
 
-		s.log.Info("reflect_queued", "bank", bank, "job_id", jobID)
+		s.log.Info("job_queued", "job_id", jobID, "bank", bank, "type", "reflect")
 		s.metrics.cogneePending.Set(pendingCount(s.queueStore))
 		s.mcpToolResult(sid, id, fmt.Sprintf(`{"status":"queued","bank":"%s","job_id":"%s"}`, bank, jobID))
 		logReq("ok", nil)
@@ -467,6 +468,53 @@ func (s *Server) handleRetainStatus(sid string, id interface{}, args json.RawMes
 	data, _ := json.Marshal(response)
 	s.mcpToolResult(sid, id, string(data))
 	logReq("ok", nil)
+}
+
+// handleDebugQueue returns live queue state as JSON for operational monitoring.
+func (s *Server) handleDebugQueue(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+
+	// Null-safety: if queueStore is nil, return all zeros
+	pending, running, completed, failed, dead := 0, 0, 0, 0, 0
+	var oldestPendingAgeS float64
+
+	if s.queueStore != nil {
+		if stats, err := s.queueStore.Stats(); err == nil {
+			pending = stats.Pending
+			running = stats.Running
+			completed = stats.Completed
+			failed = stats.Failed
+			dead = stats.Dead
+			if stats.OldestPending > 0 {
+				oldestPendingAgeS = float64(time.Now().Unix() - stats.OldestPending)
+			}
+		}
+	}
+
+	// DB size computation — 0 if file missing or stat fails
+	dbSizeKB := 0
+	if s.config.QueueDBPath != "" {
+		if info, err := os.Stat(s.config.QueueDBPath); err == nil {
+			dbSizeKB = int(info.Size() / 1024)
+		}
+	}
+
+	response := map[string]interface{}{
+		"pending":             pending,
+		"running":             running,
+		"completed_total":     completed,
+		"failed_total":        failed,
+		"dead_total":          dead,
+		"oldest_pending_age_s": oldestPendingAgeS,
+		"workers":             s.config.QueueWorkerCount,
+		"max_concurrent":      s.config.QueueMaxConcurrent,
+		"db_size_kb":          dbSizeKB,
+	}
+	json.NewEncoder(w).Encode(response)
 }
 
 // fireErrorWebhook sends an error notification to the configured webhook URL.

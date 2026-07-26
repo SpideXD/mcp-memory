@@ -148,7 +148,7 @@ func NewServer(config Config) *Server {
 // processQueueJob is the ProcessFunc called by queue.Worker for each dequeued job.
 // Signature must match queue.ProcessFunc exactly.
 func (s *Server) processQueueJob(ctx context.Context, job *queue.Job) error {
-	s.log.Info("queue: processing job", "job_id", job.ID, "type", job.Type, "bank", job.Bank)
+	s.log.Info("job_dequeued", "job_id", job.ID, "type", job.Type, "bank", job.Bank)
 	startTime := time.Now()
 
 	switch job.Type {
@@ -173,7 +173,7 @@ func (s *Server) processQueueJob(ctx context.Context, job *queue.Job) error {
 
 		// Store result in job for UpdateStatus to persist
 		job.Result = result
-		s.log.Info("queue: retain completed", "job_id", job.ID, "bank", job.Bank, "duration", duration)
+		s.log.Info("job_completed", "job_id", job.ID, "bank", job.Bank, "type", "retain", "duration_ms", duration.Milliseconds())
 
 		// Trigger auto-improve after successful retain
 		s.maybeAutoImprove(job.Bank)
@@ -199,7 +199,7 @@ func (s *Server) processQueueJob(ctx context.Context, job *queue.Job) error {
 			return err
 		}
 
-		s.log.Info("queue: reflect completed", "job_id", job.ID, "bank", job.Bank, "duration", duration)
+		s.log.Info("job_completed", "job_id", job.ID, "bank", job.Bank, "type", "reflect", "duration_ms", duration.Milliseconds())
 		return nil
 
 	default:
@@ -271,6 +271,11 @@ func (s *Server) Start() error {
 		Process: processFunc,
 		Count:   s.config.QueueWorkerCount,
 		SemSize: s.config.QueueMaxConcurrent,
+		OnDead: func(job *queue.Job) {
+			s.log.Error("job_dead", "job_id", job.ID, "bank", job.Bank, "type", job.Type,
+				"error", job.Error, "retry_count", job.RetryCount, "max_retries", job.MaxRetries)
+			s.fireErrorWebhook(job.Bank, job.ID, job.Error, job.Type)
+		},
 	})
 	if err != nil {
 		s.queueStore.Close()

@@ -2,13 +2,11 @@
 
 ## Prerequisites
 
-- **Python 3.12+**
 - **Go 1.26+** (build)
 - **OpenRouter API key** (https://openrouter.ai/keys)
 - **llama-server** — downloaded automatically by `make setup` to `bin/llama/` (brew is a fallback). Skipped if using cloud endpoints.
-- **Model files** — downloaded automatically by `make setup` to `./model/`:
+- **Model file** — downloaded automatically by `make setup` to `./model/`:
   - `qwen3-embedding-0.6b-Q8_0.gguf` (~610MB) — or use cloud endpoint
-  - `bge-reranker-base-Q4_k_m.gguf` (~209MB) — or use cloud endpoint
 
 ## Setup
 
@@ -16,7 +14,7 @@
 cd mcp/memory
 cp .env.example .env
 # Edit .env: set OPENROUTER_API_KEY
-make setup              # Creates .venv, installs Hindsight, downloads llama-server + models
+make setup              # Downloads llama-server + models
 ```
 
 ## Run
@@ -52,7 +50,10 @@ curl -X POST http://localhost:8899/stop
 # Health
 curl http://localhost:8899/health
 
-# Should show: {"status":"running","hindsight":true,"llama":true}
+# Should show: {"status":"running","llama":true,"cognee":true}
+
+# Queue debug
+curl http://localhost:8899/debug/queue
 ```
 
 ## Environment
@@ -72,60 +73,75 @@ All configuration via `.env` or environment variables. See `.env.example` for al
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LLAMA_PORT` | `8080` | Embedding server port |
-| `LLAMA_RERANKER_PORT` | `8081` | Reranker server port |
 | `LLAMA_PATH` | `./bin/llama/llama-server` | llama-server binary path (brew on PATH is fallback) |
 | `LLAMA_MODEL_PATH` | `./model/qwen3-embedding-0.6b-Q8_0.gguf` | Embedding model (or HTTP URL for cloud) |
 | `LLAMA_GPU_LAYERS` | `999` | GPU layers (0=CPU only) |
 | `LLAMA_CTX_SIZE` | `8192` | Context size |
 
-### Hindsight
+### Cognee
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HINDSIGHT_PORT` | `8888` | Memory API port |
-| `OPENROUTER_API_KEY` | (required) | LLM API key |
-| `HINDSIGHT_LLM_MODEL` | `deepseek/deepseek-v4-flash` | LLM model |
-| `HINDSIGHT_EMBEDDINGS_MODEL` | `qwen3-embedding-0.6b-Q8_0.gguf` | Embedding model name |
-| `HINDSIGHT_PATH` | `hindsight-api` | Path to hindsight-api binary (falls back to `.venv/bin/hindsight-api`) |
-| `HINDSIGHT_RERANKER_MODEL` | `./model/bge-reranker-base-Q4_k_m.gguf` | Reranker model (or HTTP URL for cloud) |
+| `COGNEE_PORT` | `8000` | Cognee API port |
+| `COGNEE_DATA_DIR` | `./cognee-data` | Cognee data directory |
+| `COGNEE_BINARY` | (empty) | Cognee Rust binary path (cognee-rust backend) |
+| `COGNEE_PYTHON_PATH` | (empty) | Cognee Python venv path (cognee-python backend) |
+| `COGNEE_LLM_API_KEY` | (OPENROUTER_API_KEY) | LLM API key for Cognee |
+| `COGNEE_LLM_MODEL` | `deepseek/deepseek-v4-flash` | LLM model for Cognee |
+| `COGNEE_LLM_ENDPOINT` | `https://openrouter.ai/api/v1` | LLM endpoint |
+| `COGNEE_EMBEDDING_ENDPOINT` | `http://localhost:8080/v1` | Embedding endpoint |
+| `COGNEE_EMBEDDING_PROVIDER` | `openai` | Embedding provider |
+| `COGNEE_MAX_CONCURRENT_RETAINS` | `10` | Max concurrent retain operations |
+| `COGNEE_RETAIN_TIMEOUT` | `900s` | Timeout for retain operations |
+| `COGNEE_TEMPORAL_COGNIFY` | `true` | Enable temporal cognify |
+| `COGNEE_MEMORY_ONLY` | `true` | Memory-only mode |
 
-### Hindsight API Timeouts
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `HINDSIGHT_RETAIN_TIMEOUT` | `60s` | Timeout for retain API calls |
-| `HINDSIGHT_RECALL_TIMEOUT` | `10s` | Timeout for recall API calls |
-| `HINDSIGHT_REFLECT_TIMEOUT` | `60s` | Timeout for reflect API calls |
-
-### Circuit Breaker
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `HINDSIGHT_CIRCUIT_BREAKER_THRESHOLD` | `5` | Failures before tripping |
-| `HINDSIGHT_CIRCUIT_BREAKER_COOLDOWN` | `30s` | Cooldown period after trip |
-
-### Workers & Queue
+### Queue
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MEMORY_RETAIN_WORKERS` | `2` | Retain worker pool size |
-| `MEMORY_REFLECT_WORKERS` | `2` | Reflect worker pool size |
-| `MEMORY_JOB_BUFFER` | `100` | Job channel buffer size |
-| `MEMORY_QUEUE_PUSH_TIMEOUT` | `5s` | Max wait to push job to queue |
-| `MEMORY_QUEUE_RESPONSE_TIMEOUT` | `60s` | Max wait for job result |
+| `QUEUE_DB_PATH` | `./data/queue.db` | SQLite database path |
+| `QUEUE_MAX_PENDING` | `1000` | Max pending jobs before rejection |
+| `QUEUE_WORKERS` | `4` | Worker goroutine count |
+| `QUEUE_MAX_CONCURRENT` | `3` | Max concurrent in-flight calls |
+| `QUEUE_JOB_TTL` | `24h` | Retention for completed/failed/dead jobs |
+| `QUEUE_TTL_INTERVAL` | `5m` | TTL cleanup frequency |
+
+### Auto-Improve
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AUTO_IMPROVE_AFTER_N` | `0` | Retains before triggering (0=disabled) |
+| `AUTO_IMPROVE_COOLDOWN` | `120s` | Min time between triggers |
+
+### Auto-Reflect
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AUTO_REFLECT_AFTER_N` | `10` | Retains before triggering (0=disabled) |
+| `AUTO_REFLECT_TIMEOUT` | `6h` | Max time since last reflect (0=disabled) |
+
+### Error Webhook
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ERROR_WEBHOOK_URL` | (empty) | POSTed on dead-letter events |
 
 ### Sessions
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MCP_MAX_SESSIONS` | `100` | Max concurrent SSE sessions |
+| `MCP_SSE_BUFFER` | `100` | SSE channel buffer per session |
 | `MCP_SESSION_IDLE` | `30m` | Idle session cleanup timeout |
+| `MCP_SESSION_CLEAN_INTERVAL` | `30s` | Session cleaner frequency |
 
 ### Health Monitor
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HEALTH_CHECK_INTERVAL` | `5s` | Health poll frequency |
+| `HEALTH_CHECK_TIMEOUT` | `60s` | Health check timeout |
 | `HEALTH_CONSECUTIVE_FAILURES` | `2` | Failures before restart |
 
 ### Retry & Backoff
@@ -143,6 +159,18 @@ All configuration via `.env` or environment variables. See `.env.example` for al
 | `MAX_CONTENT_BYTES` | `1048576` | Max content size (1MB) |
 | `HTTP_MAX_BODY_BYTES` | `1048576` | Max HTTP body size |
 | `HTTP_READ_TIMEOUT` | `10s` | HTTP read timeout |
+| `HTTP_IDLE_TIMEOUT` | `120s` | HTTP idle timeout |
+
+### Service Timeouts
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SERVICE_START_TIMEOUT` | `120s` | Max time for services to become healthy |
+| `SERVICE_STOP_TIMEOUT` | `5s` | Max time for graceful service stop |
+| `SHUTDOWN_TIMEOUT` | `10s` | Max time for HTTP server shutdown |
+| `BACKEND_RETAIN_TIMEOUT` | `60s` | Timeout for retain API calls |
+| `BACKEND_RECALL_TIMEOUT` | `10s` | Timeout for recall API calls |
+| `BACKEND_REFLECT_TIMEOUT` | `60s` | Timeout for reflect API calls |
 
 ### Alerts
 
@@ -151,43 +179,26 @@ All configuration via `.env` or environment variables. See `.env.example` for al
 | `ALERT_URL` | (empty) | Webhook URL for alerts |
 | `ALERT_MODE` | `optional` | `optional` or `required` |
 
-## Cloud Embedding/Reranker
+## Cloud Embedding
 
-To use cloud embedding or reranker services instead of local llama.cpp:
+To use a cloud embedding service instead of local llama.cpp:
 
 ```bash
-# Use OpenAI-compatible embedding endpoint
 LLAMA_MODEL_PATH=https://api.openai.com/v1
 CLOUD_EMBEDDING_API_KEY=sk-...
 CLOUD_EMBEDDING_URL=https://api.openai.com/v1
 CLOUD_EMBEDDING_MODEL=text-embedding-3-small
-
-# Use Cohere-compatible reranker endpoint
-HINDSIGHT_RERANKER_MODEL=https://api.cohere.com/v1/rerank
-CLOUD_RERANKER_API_KEY=...
-CLOUD_RERANKER_URL=https://api.cohere.com/v1/rerank
-CLOUD_RERANKER_MODEL=rerank-english-v3.0
 ```
 
-When `LLAMA_MODEL_PATH` or `HINDSIGHT_RERANKER_MODEL` is an HTTP/HTTPS URL, the server skips local process management and configures Hindsight to use the remote endpoint directly. The 6 `CLOUD_*` variables are required when using cloud mode.
-
-### Cloud Configuration Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `CLOUD_EMBEDDING_API_KEY` | When cloud embedding active | API key for embedding service |
-| `CLOUD_EMBEDDING_URL` | When cloud embedding active | Base URL for embedding endpoint |
-| `CLOUD_EMBEDDING_MODEL` | When cloud embedding active | Model name for embedding requests |
-| `CLOUD_RERANKER_API_KEY` | When cloud reranker active | API key for reranker service |
-| `CLOUD_RERANKER_URL` | When cloud reranker active | Base URL for reranker endpoint |
-| `CLOUD_RERANKER_MODEL` | When cloud reranker active | Model name for reranker requests |
+When `LLAMA_MODEL_PATH` is an HTTP/HTTPS URL, the server skips local llama.cpp process management.
 
 ## Production Notes
 
-- **Ports:** 8080, 8081, 8888 must be free (unless using cloud endpoints). Server checks on startup.
-- **RAM:** ~1GB minimum with local models. Cloud endpoints reduce to ~250MB.
+- **Ports:** 8080, 8899 must be free (unless using cloud endpoints). Server checks on startup.
+- **RAM:** ~650MB minimum with local models. Cloud endpoints reduce to ~50MB.
 - **Logs:** `logs/memory.log` -- JSON structured, 10MB rotation, 3 backups.
 - **Crash recovery:** `logs/.mcp-pids.json` -- cleans orphaned processes on restart.
+- **Queue DB:** `data/queue.db` -- SQLite WAL mode, auto-created on first run.
 - **Security:** Bind to `127.0.0.1` for local-only access. No authentication (local use only).
 
 ## Troubleshooting
@@ -195,10 +206,10 @@ When `LLAMA_MODEL_PATH` or `HINDSIGHT_RERANKER_MODEL` is an HTTP/HTTPS URL, the 
 | Problem | Fix |
 |---------|-----|
 | "model not found" | Check `LLAMA_MODEL_PATH` points to a valid `.gguf` file or HTTP URL |
-| "hindsight-api not found" | Run `make setup` or set `HINDSIGHT_PATH` (default: `hindsight-api`, falls back to `.venv/bin/hindsight-api`) |
 | Port already in use | `./scripts/stop.sh` to kill all services, then retry |
-| Hindsight fails to start | Check `logs/hindsight-crash.log` for errors |
-| High latency | Reduce `MEMORY_RETAIN_WORKERS` to 1, check OpenRouter status |
-| Circuit breaker open | Check Hindsight health, wait for cooldown (30s), or increase threshold |
+| High latency | Check OpenRouter status, verify Cognee health |
 | Content too large | Increase `MAX_CONTENT_BYTES` or reduce input size |
 | Session limit reached | Increase `MCP_MAX_SESSIONS` or check for session leaks |
+| Jobs stuck pending | Check worker logs, verify Cognee is healthy, check `QUEUE_WORKERS` count |
+| Queue full | Increase `QUEUE_MAX_PENDING` or drain stuck jobs |
+| Dead letter events | Check `ERROR_WEBHOOK_URL` is set, check webhook endpoint health |

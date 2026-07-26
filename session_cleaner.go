@@ -6,7 +6,6 @@ import (
 )
 
 // sessionCleaner periodically closes and removes idle MCP sessions.
-// Extracted from workers.go during M1 (Hindsight removal).
 func (s *Server) sessionCleaner() {
 	defer func() {
 		if r := recover(); r != nil {

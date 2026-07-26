@@ -19,6 +19,7 @@ type WorkerConfig struct {
 	Process  ProcessFunc  // required — called for each dequeued job
 	Count    int          // number of worker goroutines (0 = DefaultWorkerCount)
 	SemSize  int          // max concurrent process calls (0 = DefaultSemSize)
+	OnDead   func(job *Job) // optional callback when job reaches StatusDead
 }
 
 // Worker manages a pool of goroutines that dequeue and process jobs.
@@ -28,6 +29,7 @@ type Worker struct {
 	sem     chan struct{}
 	count   int
 	process ProcessFunc
+	onDead  func(job *Job) // optional callback for dead-letter notification
 	wg      sync.WaitGroup
 	cancel  context.CancelFunc
 	mu      sync.Mutex // protects cancel during Start/Stop race
@@ -57,6 +59,7 @@ func NewWorker(cfg WorkerConfig) (*Worker, error) {
 		sem:     make(chan struct{}, semSize),
 		count:   count,
 		process: cfg.Process,
+		onDead:  cfg.OnDead,
 	}, nil
 }
 
@@ -193,6 +196,9 @@ func (w *Worker) processJob(ctx context.Context, job *Job) {
 	} else {
 		if err := w.store.UpdateStatus(job.ID, StatusDead, "", processErr.Error()); err != nil {
 			log.Printf("queue: worker UpdateStatus(dead) error: %v", err)
+		}
+		if w.onDead != nil {
+			w.onDead(job)
 		}
 	}
 }

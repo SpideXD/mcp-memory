@@ -12,31 +12,34 @@
 +-----------------------------------------------------+
 |                  MCP Memory Server (port 8899)          |
 |                                                         |
-|  +----------+  +----------+  +--------------------+   |
-|  | Sessions |  | Worker   |  | Health Monitor     |   |
-|  | Map      |  | Pools    |  | (auto-restart)     |   |
-|  | {id->bank}|  | retainx2 |  | singleflight      |   |
-|  |          |  | reflectx2|  |                    |   |
-|  +----+-----+  +----+-----+  +--------+-----------+   |
-|       |              |                 |                |
-|  +----+-----+  +----+-----+           |                |
-|  | Circuit  |  | SSE Drop |           |                |
-|  | Breaker  |  | Tracker  |           |                |
-|  +----------+  +----------+           |                |
-+-------+--------------+----------------+----------------+
-        |              |                 |
-        v              v                 v
-+------------+  +------------+  +------------------+
-| llama.cpp  |  | Hindsight  |  | llama.cpp        |
-| embedder   |  | API        |  | reranker         |
-| :8080      |  | :8888      |  | :8081            |
-| q4_0 KV    |  | + pg0      |  | q8_0 KV          |
-+------------+  +------------+  +------------------+
-     OR (cloud)       |          OR (cloud)
-+------------+        |          +------------------+
-| Cloud API  |        |          | Cloud API        |
-| (HTTP URL) |        |          | (HTTP URL)       |
-+------------+        |          +------------------+
+|  +----------+  +--------------------+  +-------------+ |
+|  | Sessions |  | SQLite Queue       |  | Health      | |
+|  | Map      |  | (queue/store.go)   |  | Monitor     | |
+|  | {id->bank}|  | pending->running-> |  | (auto-      | |
+|  |          |  | completed/failed/  |  |  restart)   | |
+|  +----+-----+  | dead               |  +------+------+ |
+|       |        +----+---------------+         |         |
+|       |             |                         |         |
+|  +----+-----+  +----+-----+                   |         |
+|  | Auto-    |  | Worker   |                   |         |
+|  | Reflect  |  | Pool     |                   |         |
+|  | (M4)     |  | (N goroutines)              |         |
+|  +----------+  +----+-----+                   |         |
+|                     |                         |         |
++---------------------+-------------------------+---------+
+                      |                         |
+                      v                         v
+              +-------------+           +------------------+
+              | Cognee API  |           | llama.cpp        |
+              | (retain,    |           | embedder         |
+              |  recall,    |           | :8080            |
+              |  reflect)   |           | q4_0 KV          |
+              +-------------+           +------------------+
+                                              OR (cloud)
+                                      +------------------+
+                                      | Cloud Embedding  |
+                                      | API              |
+                                      +------------------+
 ```
 
 ## Component Details
@@ -49,31 +52,37 @@
 - Max 100 concurrent sessions (configurable)
 - **TOCTOU fix:** Session limit enforcement is atomic under `sessionsMu.Lock()`
 
-### Worker Pools (`workers.go`, `worker/`)
-- `retainJobs` / `reflectJobs` -- buffered channels (100)
-- `retainPool` / `reflectPool` -- 2 workers each (configurable)
-- Workers pull from channels, call Hindsight, return result
-- Panic recovery: error returned to caller, worker restarted
-- **Context cancellation:** Workers respect `ctx.Done()` for clean shutdown during stop
+### SQLite Queue (`queue/`)
+- **Store** (`queue/store.go`): SQLite with WAL mode, single-connection pool, startup recovery
+- **Worker** (`queue/worker.go`): Pool of N goroutines polling for jobs, semaphore-bounded concurrency
+- **State machine:** `pending -> running -> completed/failed/dead`
+- **Retry:** Failed jobs with retries remaining go back to `pending`
+- **TTL cleanup:** Periodic deletion of completed/failed/dead jobs past retention period
+- **Recovery:** On startup, orphaned `running` jobs are reset to `pending`; exhausted `failed` jobs become `dead`
+- **Dead-letter callback:** `OnDead` function in `WorkerConfig` fires when a job transitions to `StatusDead`
+
+### Auto-Reflect (`auto_reflect.go`)
+- Per-bank trigger state tracking retain count and last reflect time
+- **Count trigger:** Fires when retain count reaches `AUTO_REFLECT_AFTER_N`
+- **Timeout trigger:** Fires when time since last reflect exceeds `AUTO_REFLECT_TIMEOUT`
+- Inserts `_auto` payload reflect job into the queue
+
+### Auto-Improve (`auto_improve.go`)
+- Per-bank graph optimization triggered after successful retains
+- Cooldown period prevents excessive re-optimization
+- Runs asynchronously via `autoImproveWg` for graceful shutdown
 
 ### Health Monitor (`services.go`)
-- Polls llama/Hindsight every 5s (configurable)
+- Polls llama.cpp every 5s (configurable)
 - Tracks consecutive failures independently per service
 - Auto-restarts after 2 consecutive failures (configurable)
 - Per-service recovery (doesn't restart everything)
 - **Singleflight:** Concurrent health checks deduplicated via `singleflight.Group`
-- **Health cache:** Results cached for 10s to avoid 3 HTTP requests per tool call
+- **Health cache:** Results cached for 10s to avoid multiple HTTP requests per tool call
 - **Process exit detection:** Monitors `cmd.ProcessState.Exited()` independently of HTTP health
 - **Max restarts:** 5 per service per hour, then stops trying + alert
 
-### Circuit Breaker (`hindsight.go`)
-- Trips after `HINDSIGHT_CIRCUIT_BREAKER_THRESHOLD` consecutive failures (default: 5)
-- Cooldown period: `HINDSIGHT_CIRCUIT_BREAKER_COOLDOWN` (default: 30s)
-- While tripped: all Hindsight API calls fail fast with "circuit breaker open"
-- Cooldown expires: allows one request through to test recovery
-- Success resets failure count
-
-### Exponential Backoff (`hindsight.go`)
+### Exponential Backoff (`backend/doRequest.go`)
 - `doRequest` retries with exponential backoff: `delay * 2^attempt`
 - Capped at `MCP_RETRY_MAX_DELAY` (default: 30s)
 - Configurable attempts: `MCP_RETRY_ATTEMPTS` (default: 3)
@@ -84,12 +93,33 @@
 - Rejects oversized content before queuing to workers
 - Prevents memory exhaustion from large payloads
 
-### Cloud Embedding/Reranker Support (`services.go`, `config.go`)
-- `LLAMA_MODEL_PATH` and `HINDSIGHT_RERANKER_MODEL` accept HTTP/HTTPS URLs
-- When URL detected: `IsCloudEmbedding()` / `IsCloudReranker()` validate the 6 `CLOUD_*` env vars are set
-- Required embedding vars: `CLOUD_EMBEDDING_API_KEY`, `CLOUD_EMBEDDING_URL`, `CLOUD_EMBEDDING_MODEL`
-- Required reranker vars: `CLOUD_RERANKER_API_KEY`, `CLOUD_RERANKER_URL`, `CLOUD_RERANKER_MODEL`
-- Skips local llama.cpp process management, Hindsight configured to use remote endpoint directly
+### Cloud Embedding Support (`services.go`, `config.go`)
+- `LLAMA_MODEL_PATH` accepts HTTP/HTTPS URLs for cloud embedding
+- When URL detected: `IsCloudEmbedding()` validates the 3 `CLOUD_EMBEDDING_*` env vars are set
+- Required vars: `CLOUD_EMBEDDING_API_KEY`, `CLOUD_EMBEDDING_URL`, `CLOUD_EMBEDDING_MODEL`
+- Skips local llama.cpp process management
+
+### Debug Endpoints
+
+#### GET /debug/queue
+Returns live queue state as JSON for operational monitoring. No authentication required.
+
+**Response:**
+```json
+{
+  "pending": 42,
+  "running": 3,
+  "completed_total": 1503,
+  "failed_total": 12,
+  "dead_total": 5,
+  "oldest_pending_age_s": 127.5,
+  "workers": 4,
+  "max_concurrent": 3,
+  "db_size_kb": 512
+}
+```
+
+Returns all zeros if `queueStore` is nil (server starting/shutting down). `oldest_pending_age_s` is 0 when no pending jobs. `db_size_kb` is 0 when DB file is missing.
 
 ### Orphan Recovery (`pids.go`)
 - `savePids()` runs after services start, writes `logs/.mcp-pids.json`
@@ -101,47 +131,44 @@
 
 ### memory_recall (fast path, ~300ms)
 ```
-Agent -> POST /mcp/message -> goroutine -> s.recallAPI(bank, query)
-  -> circuit breaker check
-  -> HTTP POST /v1/default/banks/{bank}/recall (with timeout)
-  -> Hindsight vector search -> result
-  -> SSE response to agent
+Agent -> POST /mcp/message -> goroutine -> s.backend.Recall(bank, query)
+  -> HTTP POST to Cognee /recall endpoint (with timeout)
+  -> result -> SSE response to agent
 ```
 
-### memory_retain (slow path, ~6-30s)
+### memory_retain (queued, ~6-30s)
 ```
-Agent -> POST /mcp/message -> goroutine -> s.queueJob(retainJobs, ...)
-  -> content size validation (MAX_CONTENT_BYTES)
-  -> push MemoryJob to channel -> worker picks up
-  -> s.retainAPI(bank, content)
-  -> circuit breaker check
-  -> HTTP POST /v1/default/banks/{bank}/memories (with timeout + retry)
-  -> Hindsight LLM extraction -> pg0 write -> result
-  -> job.Result channel -> SSE response to agent
+Agent -> POST /mcp/message -> goroutine -> content size validation
+  -> queue.Store.Insert(job) -> SSE response {"status":"queued"}
+  -> queue.Worker picks up job -> s.backend.Retain(bank, content)
+  -> Cognee processing -> job completed/failed
+  -> checkAutoReflect(bank) -> maybeAutoImprove(bank)
 ```
 
-### memory_reflect (slow path, ~5-10s)
+### memory_reflect (queued, ~5-10s)
 ```
-Same as retain but through reflectJobs channel and /reflect endpoint.
+Agent -> POST /mcp/message -> goroutine -> queue.Store.Insert(job)
+  -> SSE response {"status":"queued"}
+  -> queue.Worker picks up job -> s.backend.Reflect(bank, query)
+  -> Cognee synthesis -> job completed/failed
 ```
 
-### Cloud Mode Data Flow
-When `LLAMA_MODEL_PATH` or `HINDSIGHT_RERANKER_MODEL` is an HTTP/HTTPS URL:
-- Local llama.cpp processes are not started
-- Embedding requests go directly to `CLOUD_EMBEDDING_URL` with `CLOUD_EMBEDDING_API_KEY`
-- Reranker requests go directly to `CLOUD_RERANKER_URL` with `CLOUD_RERANKER_API_KEY`
-- Hindsight is configured with cloud endpoint URLs at startup
+### auto-reflect (background)
+```
+Successful retain -> checkAutoReflect(bank)
+  -> count or timeout threshold met?
+  -> Insert reflect job with "_auto" payload
+  -> queue.Worker processes it
+```
 
 ## Memory Budget
 
 | Component | RAM |
 |-----------|-----|
 | llama.cpp embedder (qwen3, q4_0) | ~600MB |
-| llama.cpp reranker (bge, q8_0) | ~200MB |
-| Hindsight + pg0 | ~200MB |
-| MCP memory + workers | ~50MB |
-| **Total** | **~1GB** |
+| MCP memory + queue + workers | ~50MB |
+| **Total** | **~650MB** |
 
-KV cache quantization (q4_0/q8_0) saves ~3x vs default f16.
+KV cache quantization (q4_0) saves ~3x vs default f16.
 
-**Note:** Cloud embedding/reranker endpoints eliminate local llama.cpp RAM requirements.
+**Note:** Cloud embedding endpoint eliminates local llama.cpp RAM requirement.
