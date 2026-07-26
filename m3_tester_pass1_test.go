@@ -154,8 +154,10 @@ func newM3Fixture(t *testing.T, opts ...m3FixtureOption) *m3Fixture {
 	}
 	s.queueWorker = worker
 
-	// Start worker pool
-	worker.Start(context.Background())
+	// Start worker pool (only when workers requested — withWorkers(0) means no processing)
+	if cfg.QueueWorkerCount > 0 {
+		worker.Start(context.Background())
+	}
 
 	return &m3Fixture{
 		t:          t,
@@ -378,23 +380,32 @@ func TestM3_WorkerRecoversFromRetainPanic(t *testing.T) {
 	// Insert a job that will trigger a panic in processQueueJob → backend.Retain
 	jobID := f.insertJob("retain", "panicbank", "this will panic in Retain")
 
-	// BUG: The worker catches the panic (log says "worker 0 panicked") but
-	// the job remains in "running" state (zombie). The waitForJob will timeout.
-	// This proves the worker does NOT transition zombie jobs to failed/retry.
-	job, err := f.store.Get(jobID)
-	if err != nil {
-		t.Fatalf("get job: %v", err)
+	// FIX: Wait for the job to reach a terminal state (not zombie in "running")
+	// After the panic fix, the job should transition to failed (and possibly retry back to pending)
+	deadline := time.Now().Add(5 * time.Second)
+	var job *queue.Job
+	for time.Now().Before(deadline) {
+		var err error
+		job, err = f.store.Get(jobID)
+		if err != nil {
+			t.Fatalf("get job: %v", err)
+		}
+		if job.Status == queue.StatusFailed || job.Status == queue.StatusDead || job.Status == queue.StatusPending {
+			break // no longer stuck in running
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	t.Logf("Job status after Retain panic: %q (BUG: should be failed/pending, not %q)", job.Status, job.Status)
+	t.Logf("Job status after Retain panic: %q (retry_count=%d)", job.Status, job.RetryCount)
 
-	if job.Status != queue.StatusFailed {
-		t.Logf("BUG CONFIRMED: Job stuck in %q instead of failed — worker panic recovery doesn't update status", job.Status)
-	} else {
-		t.Log("BUG FIXED: Worker correctly transitions zombie jobs to failed")
+	if job.Status == queue.StatusRunning {
+		t.Fatalf("BUG: Job stuck in running — zombie, panic recovery didn't update status")
 	}
+	t.Log("BUG FIXED: Job correctly transitions out of running after panic")
 
-	// Verify worker is still alive by processing a second, non-panicking job
+	// Disable panics, then verify worker processes a second job normally
+	panicBackend.mu.Lock()
 	panicBackend.panicOnRetain = false
+	panicBackend.mu.Unlock()
 	secondID := f.insertJob("retain", "panicbank", "should complete")
 	secondJob := f.waitForJob(secondID, 10*time.Second)
 	if secondJob.Status != queue.StatusCompleted {
@@ -411,16 +422,24 @@ func TestM3_WorkerRecoversFromReflectPanic(t *testing.T) {
 
 	jobID := f.insertJob("reflect", "reflectpanic", "payload for validation")
 
-	// Same zombie job bug applies to reflect
-	job, err := f.store.Get(jobID)
-	if err != nil {
-		t.Fatalf("get job: %v", err)
+	// FIX: Wait for the job to be processed (not immediately read)
+	deadline := time.Now().Add(5 * time.Second)
+	var job *queue.Job
+	for time.Now().Before(deadline) {
+		var err error
+		job, err = f.store.Get(jobID)
+		if err != nil {
+			t.Fatalf("get job: %v", err)
+		}
+		if job.Status == queue.StatusFailed || job.Status == queue.StatusDead || job.Status == queue.StatusPending {
+			break // no longer stuck in running
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	if job.Status != queue.StatusFailed {
-		t.Logf("BUG CONFIRMED: Reflect panic also leaves zombie in status=%q", job.Status)
-	} else {
-		t.Log("BUG FIXED: Reflect panic correctly transitions to failed")
+	if job.Status == queue.StatusRunning {
+		t.Fatalf("BUG: Reflect panic also leaves zombie in status=%q", job.Status)
 	}
+	t.Log("BUG FIXED: Reflect panic correctly transitions out of running")
 }
 
 // ─── Attack Vector 3: Nil Queue Store ─────────────────────────────────────
@@ -517,7 +536,7 @@ func TestM3_RetainPayload_MaxContentSize(t *testing.T) {
 func TestM3_ReflectErrorsWithEmptyPayload(t *testing.T) {
 	f := newM3Fixture(t)
 
-	// Simulate what the handler does: reflect with empty query
+	// FIX: Reflect with empty query is now valid (Bug 2 fixed)
 	jobID := newJobID()
 	job := &queue.Job{
 		ID:      jobID,
@@ -527,11 +546,17 @@ func TestM3_ReflectErrorsWithEmptyPayload(t *testing.T) {
 	}
 
 	err := f.store.Insert(job)
-	if err == nil {
-		t.Fatal("expected validation error for empty payload in reflect job")
+	if err != nil {
+		t.Fatalf("BUG: Reflect with empty query should be accepted after fix, got error: %v", err)
 	}
-	t.Logf("BUG: Reflect with empty query rejected by queue validation: %v", err)
-	t.Log("The queue's Validate() requires non-empty payload, but the spec says 'empty query is valid for reflect'")
+	t.Log("BUG FIXED: Reflect with empty query accepted by queue validation")
+
+	// Verify the empty-query reflect job processes correctly
+	completed := f.waitForJob(jobID, 10*time.Second)
+	if completed.Status != queue.StatusCompleted {
+		t.Fatalf("expected completed, got status=%q error=%q", completed.Status, completed.Error)
+	}
+	t.Log("Empty-query reflect job processed successfully")
 }
 
 func TestM3_ReflectWithPayloadHasJobID(t *testing.T) {
@@ -615,18 +640,25 @@ func TestM3_RetainStatus_NotFound(t *testing.T) {
 func TestM3_RetainStatus_FailedJobHasRetryFields(t *testing.T) {
 	f := newM3Fixture(t)
 
-	// Trigger a panic to create a zombie job (stuck in 'running')
+	// Trigger a panic to test retry behavior after fix
 	panicBackend := &panickingBackend{Backend: f.server.backend, panicOnRetain: true}
 	f.server.backend = panicBackend
 
 	jobID := f.insertJob("retain", "failbank", "will panic")
 
-	// Give it time to process (and panic)
-	time.Sleep(200 * time.Millisecond)
-
-	job, err := f.store.Get(jobID)
-	if err != nil {
-		t.Fatalf("get job: %v", err)
+	// Wait for the job to reach a terminal state (failed/dead) or retry back to pending
+	deadline := time.Now().Add(5 * time.Second)
+	var job *queue.Job
+	for time.Now().Before(deadline) {
+		var err error
+		job, err = f.store.Get(jobID)
+		if err != nil {
+			t.Fatalf("get job: %v", err)
+		}
+		if job.Status != queue.StatusRunning {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	if job == nil {
 		t.Fatal("job not found")
@@ -634,10 +666,13 @@ func TestM3_RetainStatus_FailedJobHasRetryFields(t *testing.T) {
 	t.Logf("Failed job state: status=%q retry_count=%d max_retries=%d error=%q",
 		job.Status, job.RetryCount, job.MaxRetries, job.Error)
 
+	if job.Status == queue.StatusRunning {
+		t.Fatalf("BUG: Job stuck in running — no retry fields available")
+	}
 	if job.Status == queue.StatusFailed || job.Status == queue.StatusDead {
-		t.Log("BUG FIXED: Job correctly transitions to failed/dead after panic")
-	} else {
-		t.Logf("BUG: Job stuck in %q instead of failed — no retry fields available", job.Status)
+		t.Log("BUG FIXED: Job correctly transitions to failed/dead with retry info")
+	} else if job.Status == queue.StatusPending && job.RetryCount > 0 {
+		t.Log("BUG FIXED: Job retried and moved back to pending")
 	}
 }
 

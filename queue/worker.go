@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -103,33 +104,33 @@ func (w *Worker) workerLoop(ctx context.Context, id int) {
 		}
 
 		// Wrap work in closure so panic recovery keeps the worker alive
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("queue: worker %d panicked: %v", id, r)
-				}
-			}()
-
 		job, err := w.store.NextPending()
 		if err != nil {
 			log.Printf("queue: worker %d NextPending error: %v", id, err)
 			time.Sleep(100 * time.Millisecond)
-			return
+			continue
 		}
 		if job == nil {
-			// Empty queue — backoff
 			time.Sleep(100 * time.Millisecond)
-			return
+			continue
 		}
 
-		// Acquire semaphore (B1 fix: use helper function so defer runs per-iteration)
-		select {
-		case w.sem <- struct{}{}:
-		case <-ctx.Done():
-			return
-		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("queue: worker panic on job %s: %v", job.ID, r)
+					w.store.UpdateStatus(job.ID, StatusFailed, "", fmt.Sprintf("panic: %v", r))
+				}
+			}()
 
-		w.processWithSemaphore(ctx, job)
+			// Acquire semaphore
+			select {
+			case w.sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+
+			w.processWithSemaphore(ctx, job)
 		}()
 	}
 }
@@ -142,7 +143,27 @@ func (w *Worker) processWithSemaphore(ctx context.Context, job *Job) {
 
 // processJob calls the ProcessFunc and handles the result.
 func (w *Worker) processJob(ctx context.Context, job *Job) {
+	// Catch ProcessFunc panics and mark the job as failed.
+	// Without this, a panic in ProcessFunc leaves the job stuck in "running"
+	// forever (zombie). The job is marked StatusFailed so it can be retried
+	// if retries remain, or moved to StatusDead if exhausted.
+	var panicked bool
+	defer func() {
+		if r := recover(); r != nil {
+			errMsg := fmt.Sprintf("panic: %v", r)
+			log.Printf("queue: worker panic on job %s: %s", job.ID, errMsg)
+			if updateErr := w.store.UpdateStatus(job.ID, StatusFailed, "", errMsg); updateErr != nil {
+				log.Printf("queue: worker UpdateStatus(failed/panic) error: %v", updateErr)
+			}
+			panicked = true
+		}
+	}()
+
 	processErr := w.process(ctx, job)
+
+	if panicked {
+		return // already handled in defer
+	}
 
 	if processErr == nil {
 		// Success

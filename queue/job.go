@@ -65,7 +65,7 @@ func (j *Job) Validate() error {
 	if j.Type != "retain" && j.Type != "reflect" {
 		return fmt.Errorf("job type must be 'retain' or 'reflect'")
 	}
-	if strings.TrimSpace(j.Payload) == "" {
+	if j.Type == "retain" && strings.TrimSpace(j.Payload) == "" {
 		return fmt.Errorf("payload must not be empty")
 	}
 	if j.MaxRetries < 0 || j.MaxRetries > 10 {
