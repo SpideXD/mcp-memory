@@ -39,14 +39,27 @@ type CogneeBackend struct {
 	memoryOnly      bool
 }
 
+// Compile-time interface assertion.
+var _ Backend = (*CogneeBackend)(nil)
+
 func newCogneeBackend(cfg BackendConfig) *CogneeBackend {
+	// Use CogneeRetainTimeout (default 900s) for the HTTP client timeout,
+	// NOT BackendRetainTimeout (60s default). Cognee retains run a full LLM
+	// pipeline and take 20-30s on average, minutes in the worst case
+	// (see docs/benchmarks.md). http.Client.Timeout bounds the entire
+	// exchange and overrides the per-request context deadline, so setting it
+	// too low makes every slow retain fail, retry, and trip the breaker.
+	clientTimeout := cfg.BackendRetainTimeout
+	if cfg.CogneeRetainTimeout > 0 {
+		clientTimeout = cfg.CogneeRetainTimeout
+	}
 	return &CogneeBackend{
 		baseURL:         fmt.Sprintf("http://localhost:%s", cfg.CogneePort),
-		httpClient:      &http.Client{Timeout: 30 * time.Second},
+		httpClient:      &http.Client{Timeout: clientTimeout},
 		breaker:         NewCircuitBreaker(5, 30*time.Second),
-		retainTimeout:   cfg.BackendRetainTimeout,
+		retainTimeout:   clientTimeout,
 		recallTimeout:   cfg.BackendRecallTimeout,
-		reflectTimeout:  cfg.BackendReflectTimeout,
+		reflectTimeout:  clientTimeout,
 		retryAttempts:   cfg.RetryAttempts,
 		retryDelay:      cfg.RetryDelay,
 		retryMaxDelay:   cfg.RetryMaxDelay,
@@ -73,6 +86,8 @@ func (c *CogneeBackend) Health(ctx context.Context) error {
 }
 
 // Retain stores content in Cognee. POST /api/v1/remember (multipart form).
+// datasetName=bank, content=content (as file field).
+// Blocks 20-30s typically while Cognee runs the LLM pipeline, minutes worst case.
 func (c *CogneeBackend) Retain(ctx context.Context, bank string, content string) (string, error) {
 	if c.breaker.IsTripped() {
 		return "", fmt.Errorf("Cognee circuit breaker open — service unavailable")
@@ -225,5 +240,5 @@ func (c *CogneeBackend) Forget(ctx context.Context, bank string, contentID strin
 	return string(body), nil
 }
 
-// Name returns "cognee-python" or "cognee-rust" depending on variant.
+// Name returns "cognee".
 func (c *CogneeBackend) Name() string { return "cognee" }
