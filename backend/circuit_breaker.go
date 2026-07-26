@@ -72,6 +72,14 @@ func (cb *CircuitBreaker) IsTripped() bool {
 
 	// Half-open: a probe is already in flight — reject
 	if cb.halfOpen {
+		// Belt-and-braces: if probe in flight longer than 30× cooldown,
+		// the outcome was lost. Re-arm so we don't wedge permanently.
+		if time.Now().After(cb.trippedUntil.Add(cb.cooldown * 30)) {
+			cb.halfOpen = false
+			cb.trippedUntil = time.Time{}
+			cb.failures = 0
+			return false
+		}
 		return true
 	}
 

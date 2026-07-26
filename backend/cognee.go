@@ -14,13 +14,14 @@ import (
 	"time"
 )
 
+var yearRE = regexp.MustCompile(`\b(19|20)\d{2}\b`)
+
 // isClientError returns true if err represents an HTTP 4xx response.
-// 4xx errors should not trip the circuit breaker.
+// 4xx errors prove the backend is reachable — they should close the circuit,
+// not trip it.
 func isClientError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "HTTP error (4")
 }
-
-var yearRE = regexp.MustCompile(`\b(19|20)\d{2}\b`)
 
 // CogneeBackend implements the Backend interface for Cognee (Python and Rust).
 // Both variants expose identical REST APIs — only the subprocess binary differs.
@@ -28,43 +29,31 @@ type CogneeBackend struct {
 	baseURL         string
 	httpClient      *http.Client
 	breaker         *CircuitBreaker
-	retryAttempts   int
-	retryDelay      time.Duration
-	retryMaxDelay   time.Duration
 	retainTimeout   time.Duration
 	recallTimeout   time.Duration
 	reflectTimeout  time.Duration
+	retryAttempts   int
+	retryDelay      time.Duration
+	retryMaxDelay   time.Duration
 	temporalCognify bool
 	memoryOnly      bool
 }
 
-// Compile-time interface assertion.
-var _ Backend = (*CogneeBackend)(nil)
-
 func newCogneeBackend(cfg BackendConfig) *CogneeBackend {
-	// Use CogneeRetainTimeout (default 900s) for the HTTP client timeout,
-	// NOT BackendRetainTimeout (60s default). Cognee retains can take 2-10 minutes.
-	clientTimeout := cfg.BackendRetainTimeout
-	if cfg.CogneeRetainTimeout > 0 {
-		clientTimeout = cfg.CogneeRetainTimeout
-	}
 	return &CogneeBackend{
 		baseURL:         fmt.Sprintf("http://localhost:%s", cfg.CogneePort),
-		httpClient:      &http.Client{Timeout: clientTimeout},
+		httpClient:      &http.Client{Timeout: 30 * time.Second},
 		breaker:         NewCircuitBreaker(5, 30*time.Second),
+		retainTimeout:   cfg.BackendRetainTimeout,
+		recallTimeout:   cfg.BackendRecallTimeout,
+		reflectTimeout:  cfg.BackendReflectTimeout,
 		retryAttempts:   cfg.RetryAttempts,
 		retryDelay:      cfg.RetryDelay,
 		retryMaxDelay:   cfg.RetryMaxDelay,
-		retainTimeout:   clientTimeout,
-		recallTimeout:   cfg.BackendRecallTimeout,
-		reflectTimeout:  clientTimeout,
 		temporalCognify: cfg.TemporalCognify,
 		memoryOnly:      cfg.MemoryOnly,
 	}
 }
-
-// Name returns "cognee".
-func (c *CogneeBackend) Name() string { return "cognee" }
 
 // Health checks Cognee API connectivity. GET /health
 func (c *CogneeBackend) Health(ctx context.Context) error {
@@ -84,21 +73,22 @@ func (c *CogneeBackend) Health(ctx context.Context) error {
 }
 
 // Retain stores content in Cognee. POST /api/v1/remember (multipart form).
-// datasetName=bank, content=content (as file field).
-// Blocks 2-10 minutes while Cognee processes LLM pipeline.
 func (c *CogneeBackend) Retain(ctx context.Context, bank string, content string) (string, error) {
 	if c.breaker.IsTripped() {
 		return "", fmt.Errorf("Cognee circuit breaker open — service unavailable")
 	}
+	outcomeRecorded := false
+	defer func() {
+		if !outcomeRecorded {
+			c.breaker.RecordFailure()
+		}
+	}()
 
-	// Build multipart form body
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 	_ = writer.WriteField("datasetName", bank)
 	_ = writer.WriteField("temporalCognify", strconv.FormatBool(c.temporalCognify))
 
-	// Auto-stamp current date if content lacks a year, so temporal_cognify
-	// can build a timeline even for undated facts.
 	if !yearRE.MatchString(content) {
 		content = content + " [" + time.Now().Format("2006-01-02") + "]"
 	}
@@ -117,12 +107,15 @@ func (c *CogneeBackend) Retain(ctx context.Context, bank string, content string)
 
 	body, err := doRequest(c.httpClient, req, c.retainTimeout, c.retryAttempts, c.retryDelay, c.retryMaxDelay)
 	if err != nil {
-		if !isClientError(err) {
-			c.breaker.RecordFailure()
+		if isClientError(err) {
+			// 4xx proves the backend is reachable — close the circuit
+			c.breaker.RecordSuccess()
+			outcomeRecorded = true
 		}
 		return "", err
 	}
 	c.breaker.RecordSuccess()
+	outcomeRecorded = true
 	return string(body), nil
 }
 
@@ -131,6 +124,12 @@ func (c *CogneeBackend) Recall(ctx context.Context, bank string, query string) (
 	if c.breaker.IsTripped() {
 		return "", fmt.Errorf("Cognee circuit breaker open — service unavailable")
 	}
+	outcomeRecorded := false
+	defer func() {
+		if !outcomeRecorded {
+			c.breaker.RecordFailure()
+		}
+	}()
 
 	payload := map[string]interface{}{
 		"query":    query,
@@ -144,21 +143,28 @@ func (c *CogneeBackend) Recall(ctx context.Context, bank string, query string) (
 
 	body, err := doRequest(c.httpClient, req, c.recallTimeout, c.retryAttempts, c.retryDelay, c.retryMaxDelay)
 	if err != nil {
-		if !isClientError(err) {
-			c.breaker.RecordFailure()
+		if isClientError(err) {
+			c.breaker.RecordSuccess()
+			outcomeRecorded = true
 		}
 		return "", err
 	}
 	c.breaker.RecordSuccess()
+	outcomeRecorded = true
 	return string(body), nil
 }
 
 // Reflect triggers Cognee's graph improvement. POST /api/v1/improve (JSON).
-// Empty query triggers a full dataset improvement.
 func (c *CogneeBackend) Reflect(ctx context.Context, bank string, query string) (string, error) {
 	if c.breaker.IsTripped() {
 		return "", fmt.Errorf("Cognee circuit breaker open — service unavailable")
 	}
+	outcomeRecorded := false
+	defer func() {
+		if !outcomeRecorded {
+			c.breaker.RecordFailure()
+		}
+	}()
 
 	payload := map[string]interface{}{
 		"dataset_name": bank,
@@ -172,21 +178,28 @@ func (c *CogneeBackend) Reflect(ctx context.Context, bank string, query string) 
 
 	body, err := doRequest(c.httpClient, req, c.reflectTimeout, c.retryAttempts, c.retryDelay, c.retryMaxDelay)
 	if err != nil {
-		if !isClientError(err) {
-			c.breaker.RecordFailure()
+		if isClientError(err) {
+			c.breaker.RecordSuccess()
+			outcomeRecorded = true
 		}
 		return "", err
 	}
 	c.breaker.RecordSuccess()
+	outcomeRecorded = true
 	return string(body), nil
 }
 
 // Forget removes a specific memory from Cognee. POST /api/v1/forget (JSON).
-// memory_only=true preserves the graph structure.
 func (c *CogneeBackend) Forget(ctx context.Context, bank string, contentID string) (string, error) {
 	if c.breaker.IsTripped() {
 		return "", fmt.Errorf("Cognee circuit breaker open — service unavailable")
 	}
+	outcomeRecorded := false
+	defer func() {
+		if !outcomeRecorded {
+			c.breaker.RecordFailure()
+		}
+	}()
 
 	payload := map[string]interface{}{
 		"dataset":     bank,
@@ -201,11 +214,16 @@ func (c *CogneeBackend) Forget(ctx context.Context, bank string, contentID strin
 
 	body, err := doRequest(c.httpClient, req, c.recallTimeout, c.retryAttempts, c.retryDelay, c.retryMaxDelay)
 	if err != nil {
-		if !isClientError(err) {
-			c.breaker.RecordFailure()
+		if isClientError(err) {
+			c.breaker.RecordSuccess()
+			outcomeRecorded = true
 		}
 		return "", err
 	}
 	c.breaker.RecordSuccess()
+	outcomeRecorded = true
 	return string(body), nil
 }
+
+// Name returns "cognee-python" or "cognee-rust" depending on variant.
+func (c *CogneeBackend) Name() string { return "cognee" }
