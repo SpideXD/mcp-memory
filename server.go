@@ -51,6 +51,9 @@ type Server struct {
 
 	autoImproveWg sync.WaitGroup // tracks in-flight auto-improve goroutines (replaces cogneeWg)
 
+	// Auto-reflect state (M4)
+	reflectStates sync.Map // map[string]*reflectState — per-bank reflect tracking
+
 	// Auto-improve state — periodic graph optimization
 	improveState *autoImproveState // per-bank counters + in-flight tracking
 	dataDir      string            // directory for improve_state.json persistence
@@ -174,6 +177,9 @@ func (s *Server) processQueueJob(ctx context.Context, job *queue.Job) error {
 
 		// Trigger auto-improve after successful retain
 		s.maybeAutoImprove(job.Bank)
+
+		// M4: check auto-reflect triggers
+		s.checkAutoReflect(job.Bank)
 
 		return nil
 

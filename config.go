@@ -81,6 +81,10 @@ type Config struct {
 	AutoImproveAfterN  int           // AUTO_IMPROVE_AFTER_N, 0=disabled, default 0
 	AutoImproveCooldown time.Duration // AUTO_IMPROVE_COOLDOWN, default 120s
 
+	// Auto-reflect
+	AutoReflectAfterN  int           // AUTO_REFLECT_AFTER_N, 0=disabled, default 10
+	AutoReflectTimeout time.Duration // AUTO_REFLECT_TIMEOUT, 0=disabled, default 6h
+
 	// Error webhook
 	ErrorWebhookURL string // ERROR_WEBHOOK_URL, default "" (disabled)
 
@@ -171,6 +175,10 @@ func LoadConfig() Config {
 		// Auto-improve
 		AutoImproveAfterN:  getEnvInt("AUTO_IMPROVE_AFTER_N", 0),
 		AutoImproveCooldown: clampDuration(getEnvDuration("AUTO_IMPROVE_COOLDOWN", 120*time.Second), 0),
+
+		// Auto-reflect
+		AutoReflectAfterN:  getEnvInt("AUTO_REFLECT_AFTER_N", 10),
+		AutoReflectTimeout: getEnvDuration("AUTO_REFLECT_TIMEOUT", 6*time.Hour),
 
 		// Error webhook
 		ErrorWebhookURL: getEnv("ERROR_WEBHOOK_URL", ""),
