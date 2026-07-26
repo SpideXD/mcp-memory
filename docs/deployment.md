@@ -102,7 +102,7 @@ All configuration via `.env` or environment variables. See `.env.example` for al
 |----------|---------|-------------|
 | `QUEUE_DB_PATH` | `./data/queue.db` | SQLite database path |
 | `QUEUE_MAX_PENDING` | `1000` | Max pending jobs before rejection |
-| `QUEUE_WORKERS` | `4` | Worker goroutine count |
+| `QUEUE_WORKER_COUNT` | `4` | Worker goroutine count |
 | `QUEUE_MAX_CONCURRENT` | `3` | Max concurrent in-flight calls |
 | `QUEUE_JOB_TTL` | `24h` | Retention for completed/failed/dead jobs |
 | `QUEUE_TTL_INTERVAL` | `5m` | TTL cleanup frequency |
@@ -210,6 +210,6 @@ When `LLAMA_MODEL_PATH` is an HTTP/HTTPS URL, the server skips local llama.cpp p
 | High latency | Check OpenRouter status, verify Cognee health |
 | Content too large | Increase `MAX_CONTENT_BYTES` or reduce input size |
 | Session limit reached | Increase `MCP_MAX_SESSIONS` or check for session leaks |
-| Jobs stuck pending | Check worker logs, verify Cognee is healthy, check `QUEUE_WORKERS` count |
+| Jobs stuck pending | Check worker logs, verify Cognee is healthy, check `QUEUE_WORKER_COUNT` count |
 | Queue full | Increase `QUEUE_MAX_PENDING` or drain stuck jobs |
 | Dead letter events | Check `ERROR_WEBHOOK_URL` is set, check webhook endpoint health |
