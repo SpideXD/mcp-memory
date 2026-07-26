@@ -445,7 +445,7 @@ func (s *Server) handleToolCall(sid string, id interface{}, params json.RawMessa
 		s.handleForget(sid, id, bank, c.Arguments, logReq)
 
 	case "memory_retain_status":
-		s.handleRetainStatus(sid, id, c.Arguments, logReq)
+		s.handleRetainStatus(sid, id, bank, c.Arguments, logReq)
 
 	default:
 		s.mcpError(sid, id, -32601, fmt.Sprintf("unknown tool: %s", c.Name))
@@ -510,7 +510,10 @@ func (s *Server) handleForget(sid string, id interface{}, bank string, args json
 }
 
 // handleRetainStatus checks the status of an async retain job.
-func (s *Server) handleRetainStatus(sid string, id interface{}, args json.RawMessage, logReq func(string, error)) {
+// The job must belong to the caller's bank: job IDs are unguessable, but that
+// is obscurity, not authorization. Without this check any session can read
+// another tenant's bank name, backend result and error text by job ID.
+func (s *Server) handleRetainStatus(sid string, id interface{}, bank string, args json.RawMessage, logReq func(string, error)) {
 	var a struct {
 		JobID string `json:"job_id"`
 	}
@@ -526,7 +529,9 @@ func (s *Server) handleRetainStatus(sid string, id interface{}, args json.RawMes
 		logReq("", err)
 		return
 	}
-	if job == nil {
+	// Report a foreign job as not_found — identical to a genuinely missing job,
+	// so the response cannot be used to probe for job IDs belonging to others.
+	if job == nil || job.Bank != bank {
 		s.mcpToolResult(sid, id, `{"status":"not_found"}`)
 		logReq("not_found", nil)
 		return

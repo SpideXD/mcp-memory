@@ -259,6 +259,12 @@ func (svc *services) checkAndRestart(
 }
 
 func (svc *services) allHealthy() (llama, cognee bool) {
+	// Nil receiver: services are not wired yet (or Start never ran). Report
+	// unhealthy rather than panicking — /health is a public endpoint and must
+	// never take the process's connection handler down.
+	if svc == nil {
+		return false, false
+	}
 	// Use cached health with 10s TTL to avoid HTTP requests per tool call
 	svc.healthMu.RLock()
 	if time.Since(svc.healthChecked) < 10*time.Second {
