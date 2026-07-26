@@ -10,8 +10,15 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
+
+// isClientError returns true if err represents an HTTP 4xx response.
+// 4xx errors should not trip the circuit breaker.
+func isClientError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "HTTP error (4")
+}
 
 var yearRE = regexp.MustCompile(`\b(19|20)\d{2}\b`)
 
@@ -111,7 +118,9 @@ func (c *CogneeBackend) Retain(ctx context.Context, bank string, content string)
 
 	body, err := doRequest(c.httpClient, req, c.retainTimeout, c.retryAttempts, c.retryDelay, c.retryMaxDelay)
 	if err != nil {
-		c.breaker.RecordFailure()
+		if !isClientError(err) {
+			c.breaker.RecordFailure()
+		}
 		return "", err
 	}
 	c.breaker.RecordSuccess()
@@ -136,7 +145,9 @@ func (c *CogneeBackend) Recall(ctx context.Context, bank string, query string) (
 
 	body, err := doRequest(c.httpClient, req, c.recallTimeout, c.retryAttempts, c.retryDelay, c.retryMaxDelay)
 	if err != nil {
-		c.breaker.RecordFailure()
+		if !isClientError(err) {
+			c.breaker.RecordFailure()
+		}
 		return "", err
 	}
 	c.breaker.RecordSuccess()
@@ -162,7 +173,9 @@ func (c *CogneeBackend) Reflect(ctx context.Context, bank string, query string) 
 
 	body, err := doRequest(c.httpClient, req, c.reflectTimeout, c.retryAttempts, c.retryDelay, c.retryMaxDelay)
 	if err != nil {
-		c.breaker.RecordFailure()
+		if !isClientError(err) {
+			c.breaker.RecordFailure()
+		}
 		return "", err
 	}
 	c.breaker.RecordSuccess()
@@ -189,7 +202,9 @@ func (c *CogneeBackend) Forget(ctx context.Context, bank string, contentID strin
 
 	body, err := doRequest(c.httpClient, req, c.recallTimeout, c.retryAttempts, c.retryDelay, c.retryMaxDelay)
 	if err != nil {
-		c.breaker.RecordFailure()
+		if !isClientError(err) {
+			c.breaker.RecordFailure()
+		}
 		return "", err
 	}
 	c.breaker.RecordSuccess()

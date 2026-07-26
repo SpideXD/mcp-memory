@@ -68,6 +68,11 @@ func doRequest(client *http.Client, req *http.Request, timeout time.Duration, re
 		}
 		if resp.StatusCode != 200 {
 			lastErr = fmt.Errorf("HTTP error (%d): %s", resp.StatusCode, string(body))
+			// 4xx = client error, not a backend failure — don't retry
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+				return nil, lastErr
+			}
+			// 5xx = server error — retry with backoff
 			backoff := retryDelay * (1 << uint(attempt))
 			if backoff > retryMaxDelay {
 				backoff = retryMaxDelay
