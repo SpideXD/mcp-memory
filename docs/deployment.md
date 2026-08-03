@@ -65,7 +65,7 @@ All configuration via `.env` or environment variables. See `.env.example` for al
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MCP_PORT` | `8899` | Server port |
-| `MCP_HOST` | `0.0.0.0` | Bind address |
+| `MCP_HOST` | `127.0.0.1` | Bind address |
 | `MCP_AUTH_TOKEN` | (empty) | Auth token for endpoints |
 
 ### llama.cpp
@@ -73,6 +73,7 @@ All configuration via `.env` or environment variables. See `.env.example` for al
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LLAMA_PORT` | `8080` | Embedding server port |
+| `LLAMA_HOST` | `127.0.0.1` | Embedding server bind address |
 | `LLAMA_PATH` | `./bin/llama/llama-server` | llama-server binary path (brew on PATH is fallback) |
 | `LLAMA_MODEL_PATH` | `./model/qwen3-embedding-0.6b-Q8_0.gguf` | Embedding model (or HTTP URL for cloud) |
 | `LLAMA_GPU_LAYERS` | `999` | GPU layers (0=CPU only) |
@@ -84,8 +85,7 @@ All configuration via `.env` or environment variables. See `.env.example` for al
 |----------|---------|-------------|
 | `COGNEE_PORT` | `8000` | Cognee API port |
 | `COGNEE_DATA_DIR` | `./cognee-data` | Cognee data directory |
-| `COGNEE_BINARY` | (empty) | Cognee Rust binary path (cognee-rust backend) |
-| `COGNEE_PYTHON_PATH` | (empty) | Cognee Python venv path (cognee-python backend) |
+| `COGNEE_BINARY` | `bin/cognee-http-server` | Cognee Rust binary path |
 | `COGNEE_LLM_API_KEY` | (OPENROUTER_API_KEY) | LLM API key for Cognee |
 | `COGNEE_LLM_MODEL` | `deepseek/deepseek-v4-flash` | LLM model for Cognee |
 | `COGNEE_LLM_ENDPOINT` | `https://openrouter.ai/api/v1` | LLM endpoint |

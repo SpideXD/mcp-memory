@@ -468,32 +468,6 @@ func TestUnit_CogneeRustEnvWiring(t *testing.T) {
 	}
 }
 
-// TestUnit_CogneePythonEnvUsesJSONInstructorMode guards the DeepSeek fix: the
-// Python backend must not fall back to tool-calling, which DeepSeek rejects
-// outright ("Thinking mode does not support this tool_choice").
-func TestUnit_CogneePythonEnvUsesJSONInstructorMode(t *testing.T) {
-	env := newServices(Config{CogneePort: "8000"}, testLogger(), nil).cogneePythonEnv()
-
-	if got, _ := envValue(env, "LLM_INSTRUCTOR_MODE"); got != "json_mode" {
-		t.Errorf("LLM_INSTRUCTOR_MODE = %q, want json_mode — tool_choice breaks DeepSeek", got)
-	}
-	if got, _ := envValue(env, "EMBEDDING_PROVIDER"); got != "llama_cpp" {
-		t.Errorf("EMBEDDING_PROVIDER = %q, want llama_cpp", got)
-	}
-}
-
-// TestUnit_CogneeEnvVariantsDiffer catches the two backends being wired to the
-// same embedding provider, which silently breaks one of them.
-func TestUnit_CogneeEnvVariantsDiffer(t *testing.T) {
-	svc := newServices(Config{CogneePort: "8000"}, testLogger(), nil)
-	py, _ := envValue(svc.cogneePythonEnv(), "EMBEDDING_PROVIDER")
-	rs, _ := envValue(svc.cogneeRustEnv(), "EMBEDDING_PROVIDER")
-	if py == rs {
-		t.Errorf("both backends use EMBEDDING_PROVIDER=%q; Rust needs openai_compatible "+
-			"and Python needs llama_cpp", py)
-	}
-}
-
 func TestUnit_GetEnvOrDefault(t *testing.T) {
 	const key = "MCP_TEST_ENV_ONLY"
 	t.Setenv(key, "")

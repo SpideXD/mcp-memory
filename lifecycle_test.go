@@ -181,6 +181,7 @@ func launchServer(t *testing.T, opts launchOpts) *liveServer {
 		"ERROR_WEBHOOK_URL=",
 		"AUTO_REFLECT_AFTER_N=0",
 		"AUTO_IMPROVE_AFTER_N=0",
+		"COGNEE_LLM_API_KEY=test-key-for-preflight",
 	)
 	if opts.ignoreSigterm {
 		cmd.Env = append(cmd.Env, "STUB_IGNORE_SIGTERM=1")
@@ -511,6 +512,7 @@ func TestLifecycle_CrashLeavesOrphanThenNextStartReapsIt(t *testing.T) {
 		"SHUTDOWN_TIMEOUT=5s",
 		"ALERT_URL=", "ERROR_WEBHOOK_URL=",
 		"AUTO_REFLECT_AFTER_N=0", "AUTO_IMPROVE_AFTER_N=0",
+		"COGNEE_LLM_API_KEY=test-key-for-preflight",
 	)
 
 	run := func(tag string) (*exec.Cmd, chan error) {

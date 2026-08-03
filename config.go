@@ -3,7 +3,9 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 )
@@ -59,14 +61,13 @@ type Config struct {
 	// Retry backoff cap
 	RetryMaxDelay time.Duration
 
-	// Backend selection (default: "cognee-python")
+	// Backend selection (default: "cognee-rust")
 	Backend Backend
 
 	// Cognee
 	CogneePort                 string        // COGNEE_PORT, default "8000"
 	CogneeDataDir              string        // COGNEE_DATA_DIR, default "./cognee-data"
 	CogneeBinary               string        // COGNEE_BINARY, Rust binary path
-	CogneePythonPath           string        // COGNEE_PYTHON_PATH, Python venv path
 	CogneeLLMApiKey            string        // COGNEE_LLM_API_KEY (defaults to OPENROUTER_API_KEY if unset)
 	CogneeLLMModel             string        // COGNEE_LLM_MODEL (default "deepseek/deepseek-v4-flash")
 	CogneeLLMEndpoint          string        // COGNEE_LLM_ENDPOINT (default "https://openrouter.ai/api/v1")
@@ -106,7 +107,7 @@ func LoadConfig() Config {
 	return Config{
 		// Server
 		Port:      getEnv("MCP_PORT", "8899"),
-		Host:      getEnv("MCP_HOST", "0.0.0.0"),
+		Host:      getEnv("MCP_HOST", "127.0.0.1"),
 		AuthToken: getEnv("MCP_AUTH_TOKEN", ""),
 		AlertURL:  getEnv("ALERT_URL", ""),
 		AlertMode: getEnv("ALERT_MODE", "optional"),
@@ -114,7 +115,7 @@ func LoadConfig() Config {
 		// llama.cpp embedder
 		LlamaPath: getEnv("LLAMA_PATH", "./bin/llama/llama-server"),
 		LlamaPort: getEnv("LLAMA_PORT", "8080"),
-		LlamaHost: getEnv("LLAMA_HOST", "0.0.0.0"),
+		LlamaHost: getEnv("LLAMA_HOST", "127.0.0.1"),
 		ModelPath: getEnv("LLAMA_MODEL_PATH", "./model/qwen3-embedding-0.6b-Q8_0.gguf"),
 		CtxSize:   getEnv("LLAMA_CTX_SIZE", "8192"),
 		GPULayers: getEnv("LLAMA_GPU_LAYERS", "999"),
@@ -155,13 +156,12 @@ func LoadConfig() Config {
 		RetryMaxDelay: getEnvDuration("MCP_RETRY_MAX_DELAY", 30*time.Second),
 
 		// Backend selection
-		Backend: Backend(getEnv("BACKEND", "cognee-python")),
+		Backend: Backend(getEnv("BACKEND", "cognee-rust")),
 
 		// Cognee
 		CogneePort:                 getEnv("COGNEE_PORT", "8000"),
 		CogneeDataDir:              getEnv("COGNEE_DATA_DIR", "./cognee-data"),
 		CogneeBinary:               getEnv("COGNEE_BINARY", ""),
-		CogneePythonPath:           getEnv("COGNEE_PYTHON_PATH", ""),
 		CogneeLLMApiKey:            getEnv("COGNEE_LLM_API_KEY", getEnv("OPENROUTER_API_KEY", "")),
 		CogneeLLMModel:             getEnv("COGNEE_LLM_MODEL", "deepseek/deepseek-v4-flash"),
 		CogneeLLMEndpoint:          getEnv("COGNEE_LLM_ENDPOINT", "https://openrouter.ai/api/v1"),
@@ -268,43 +268,14 @@ func (c Config) Validate() error {
 
 	// Branch validation per backend type
 	switch c.Backend {
-	case BackendCogneePython:
-		// Cognee uses llama-server for embeddings, not model files directly
-		// Validate Cognee Python path is resolvable
-		if c.CogneePythonPath != "" {
-			info, err := os.Stat(c.CogneePythonPath)
-			if err != nil {
-				return fmt.Errorf("COGNEE_PYTHON_PATH not found: %s: %w", c.CogneePythonPath, err)
-			}
-			if !info.Mode().IsRegular() || info.Size() == 0 || info.Mode()&0111 == 0 {
-				return fmt.Errorf("COGNEE_PYTHON_PATH is not a valid executable: %s", c.CogneePythonPath)
-			}
-		}
-		if c.CogneeMaxConcurrentRetains < 1 {
-			return fmt.Errorf("COGNEE_MAX_CONCURRENT_RETAINS must be >= 1, got %d", c.CogneeMaxConcurrentRetains)
-		}
-		if c.CogneeRetainTimeout <= 0 {
-			return fmt.Errorf("COGNEE_RETAIN_TIMEOUT must be positive")
-		}
-		if c.QueueMaxPending < 1 {
-			return fmt.Errorf("QUEUE_MAX_PENDING must be >= 1, got %d", c.QueueMaxPending)
-		}
-		if c.QueueWorkerCount < 1 {
-			return fmt.Errorf("QUEUE_WORKER_COUNT must be >= 1, got %d", c.QueueWorkerCount)
-		}
-		if c.QueueMaxConcurrent < 1 {
-			return fmt.Errorf("QUEUE_MAX_CONCURRENT must be >= 1, got %d", c.QueueMaxConcurrent)
-		}
-
 	case BackendCogneeRust:
-		// Validate Cognee binary is resolvable
-		if c.CogneeBinary == "" {
-			return fmt.Errorf("COGNEE_BINARY is required for cognee-rust backend")
-		}
-		if info, err := os.Stat(c.CogneeBinary); err != nil {
-			return fmt.Errorf("COGNEE_BINARY not found: %s: %w", c.CogneeBinary, err)
-		} else if !info.Mode().IsRegular() || info.Size() == 0 || info.Mode()&0111 == 0 {
-			return fmt.Errorf("COGNEE_BINARY is not a valid executable: %s", c.CogneeBinary)
+		// Validate Cognee binary if explicitly set (optional — preflightCheck catches missing binary at startup)
+		if c.CogneeBinary != "" {
+			if info, err := os.Stat(c.CogneeBinary); err != nil {
+				return fmt.Errorf("COGNEE_BINARY not found: %s: %w", c.CogneeBinary, err)
+			} else if !info.Mode().IsRegular() || info.Size() == 0 || info.Mode()&0111 == 0 {
+				return fmt.Errorf("COGNEE_BINARY is not a valid executable: %s", c.CogneeBinary)
+			}
 		}
 		if c.CogneeMaxConcurrentRetains < 1 {
 			return fmt.Errorf("COGNEE_MAX_CONCURRENT_RETAINS must be >= 1, got %d", c.CogneeMaxConcurrentRetains)
@@ -323,7 +294,99 @@ func (c Config) Validate() error {
 		}
 
 	default:
-		return fmt.Errorf("unknown BACKEND: %q (valid: cognee-python, cognee-rust)", c.Backend)
+		return fmt.Errorf("unknown BACKEND: %q (valid: cognee-rust)", c.Backend)
+	}
+
+	// Deployment safety gate: reject non-loopback MCP_HOST without auth
+	if c.Host != "" && c.AuthToken == "" {
+		if !isLoopback(c.Host) {
+			return fmt.Errorf("MCP_HOST=%s requires MCP_AUTH_TOKEN to be set for non-loopback binding", c.Host)
+		}
+	}
+
+	return nil
+}
+
+// isLoopback checks whether the given host string resolves to a loopback address.
+// Handles IP literals (127.0.0.1, ::1) and the hostname "localhost".
+func isLoopback(host string) bool {
+	// Try parsing as IP literal first
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	// Try resolving hostname (e.g., "localhost")
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return false
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() {
+			return true
+		}
+	}
+	return false
+}
+
+// preflightCheck validates runtime prerequisites before starting services.
+// Checks are ordered: binary → llama → model → dirs → API key.
+func preflightCheck(cfg Config) error {
+	// 1. Check Cognee Rust binary exists and is executable
+	cogneeBin := cfg.CogneeBinary
+	if cogneeBin == "" {
+		cogneeBin = "bin/cognee-http-server"
+	}
+	if info, err := os.Stat(cogneeBin); err != nil {
+		return fmt.Errorf("Cognee Rust binary not found at %s — run 'make build-cognee'", cogneeBin)
+	} else if !info.Mode().IsRegular() || info.Size() == 0 || info.Mode()&0111 == 0 {
+		return fmt.Errorf("Cognee Rust binary at %s is not a valid executable — run 'make build-cognee'", cogneeBin)
+	}
+
+	// 2. Check llama-server binary exists and is executable
+	llamaPath := cfg.LlamaPath
+	if llamaPath == "" {
+		llamaPath = "./bin/llama/llama-server"
+	}
+	llamaFound := false
+	if info, err := os.Stat(llamaPath); err == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Mode()&0111 != 0 {
+		llamaFound = true
+	} else if lp, err := exec.LookPath("llama-server"); err == nil {
+		if info, err := os.Stat(lp); err == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Mode()&0111 != 0 {
+			llamaFound = true
+		}
+	}
+	if !llamaFound {
+		return fmt.Errorf("llama-server not found at %s or on system PATH — run 'make setup' or install llama-server", llamaPath)
+	}
+
+	// 3. Check embedding model file exists and is non-empty
+	modelPath := cfg.ModelPath
+	if modelPath == "" {
+		modelPath = "./model/qwen3-embedding-0.6b-Q8_0.gguf"
+	}
+	// Skip model check for cloud embedding (HTTP URL)
+	if !isCloudURL(modelPath) {
+		if info, err := os.Stat(modelPath); err != nil {
+			return fmt.Errorf("Embedding model not found at %s — run 'make download-models'", modelPath)
+		} else if !info.Mode().IsRegular() || info.Size() == 0 {
+			return fmt.Errorf("Embedding model at %s is not a valid file — run 'make download-models'", modelPath)
+		}
+	}
+
+	// 4. Check required data directories exist or are creatable
+	dataDir := cfg.CogneeDataDir
+	if dataDir == "" {
+		dataDir = "./cognee-data"
+	}
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return fmt.Errorf("Cannot create Cognee data directory %s: %w", dataDir, err)
+	}
+	if err := os.MkdirAll("logs", 0755); err != nil {
+		return fmt.Errorf("Cannot create logs directory: %w", err)
+	}
+
+	// 5. Check API key is set and non-empty
+	if cfg.CogneeLLMApiKey == "" {
+		return fmt.Errorf("LLM API key not set — set COGNEE_LLM_API_KEY or OPENROUTER_API_KEY environment variable")
 	}
 
 	return nil

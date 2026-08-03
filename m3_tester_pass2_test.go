@@ -393,7 +393,7 @@ func TestM3P2_QueueDepthRaceWithClose(t *testing.T) {
 
 func TestM3P2_ConfigValidation_QueueWorkersZero(t *testing.T) {
 	cfg := Config{
-		Backend:                    BackendCogneePython,
+		Backend:                    BackendCogneeRust,
 		RetryAttempts:              3,
 		MaxSessions:                10,
 		MaxContentBytes:            1 << 20,
@@ -418,7 +418,7 @@ func TestM3P2_ConfigValidation_QueueWorkersZero(t *testing.T) {
 
 func TestM3P2_ConfigValidation_QueueMaxPendingZero(t *testing.T) {
 	cfg := Config{
-		Backend:                    BackendCogneePython,
+		Backend:                    BackendCogneeRust,
 		RetryAttempts:              3,
 		MaxSessions:                10,
 		MaxContentBytes:            1 << 20,
@@ -443,7 +443,7 @@ func TestM3P2_ConfigValidation_QueueMaxPendingZero(t *testing.T) {
 
 func TestM3P2_ConfigValidation_QueueMaxConcurrentZero(t *testing.T) {
 	cfg := Config{
-		Backend:                    BackendCogneePython,
+		Backend:                    BackendCogneeRust,
 		RetryAttempts:              3,
 		MaxSessions:                10,
 		MaxContentBytes:            1 << 20,
@@ -470,7 +470,7 @@ func TestM3P2_ConfigValidation_QueueMaxConcurrentZero(t *testing.T) {
 // This test documents that the config doesn't enforce this relationship.
 func TestM3P2_ConfigValidation_MaxConcurrentGreaterThanWorkers(t *testing.T) {
 	cfg := Config{
-		Backend:                    BackendCogneePython,
+		Backend:                    BackendCogneeRust,
 		RetryAttempts:              3,
 		MaxSessions:                10,
 		MaxContentBytes:            1 << 20,

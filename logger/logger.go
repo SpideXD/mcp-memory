@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"regexp"
 )
 
 // Logger wraps slog.Logger with a baked-in module name.
@@ -83,7 +84,7 @@ func create(module, level string, w io.Writer, opts []Option) (*Logger, error) {
 	})
 
 	return &Logger{
-		Logger: slog.New(handler).With("module", module),
+		Logger: slog.New(&redactingHandler{Handler: handler}).With("module", module),
 	}, nil
 }
 
@@ -117,6 +118,30 @@ func (l *Logger) Bytes() []byte {
 		return l.buf.Bytes()
 	}
 	return nil
+}
+
+// redact replaces sensitive API key values in log messages.
+// Matches LLM_API_KEY=... and EMBEDDING_API_KEY=... (quoted or unquoted).
+var redactRe = regexp.MustCompile(`(LLM_API_KEY|EMBEDDING_API_KEY)=("[^"]*"|\S+)`)
+
+func redact(msg string) string {
+	return redactRe.ReplaceAllStringFunc(msg, func(match string) string {
+		idx := redactRe.FindStringSubmatchIndex(match)
+		if len(idx) < 4 {
+			return match
+		}
+		return match[:idx[2]] + "=***REDACTED***"
+	})
+}
+
+// redactingHandler wraps a slog.Handler to redact sensitive values from log messages.
+type redactingHandler struct {
+	slog.Handler
+}
+
+func (h *redactingHandler) Handle(ctx context.Context, r slog.Record) error {
+	r.Message = redact(r.Message)
+	return h.Handler.Handle(ctx, r)
 }
 
 // parseLevel returns an error for unknown levels.

@@ -35,7 +35,7 @@ build-cognee:
 		echo "cognee-rs submodule not found. Run: git submodule update --init --recursive"; \
 		exit 1; \
 	fi
-	cd cognee-rs && cargo build --release -p cognee-http-server
+	cd cognee-rs && cargo build --release -p cognee-http-server --features bin
 	cp cognee-rs/target/release/cognee-http-server $(COGNEE_BINARY)
 	@echo "Cognee Rust binary built: $(COGNEE_BINARY)"
 

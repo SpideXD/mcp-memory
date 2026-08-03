@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -75,20 +74,6 @@ func (svc *services) start() error {
 	}
 
 	switch svc.config.Backend {
-	case BackendCogneePython:
-		cogneeURL := healthURL(svc.config.CogneePort)
-		if svc.check(cogneeURL) != nil {
-			if err := svc.startCogneePython(); err != nil {
-				return err
-			}
-			if err := svc.wait(context.Background(), cogneeURL, svc.config.StartTimeout); err != nil {
-				return err
-			}
-			svc.log.Info("cognee-python started")
-		} else {
-			svc.log.Info("cognee-python already running")
-		}
-
 	case BackendCogneeRust:
 		cogneeURL := healthURL(svc.config.CogneePort)
 		if svc.check(cogneeURL) != nil {
@@ -108,7 +93,7 @@ func (svc *services) start() error {
 
 func (svc *services) stop() {
 	switch svc.config.Backend {
-	case BackendCogneePython, BackendCogneeRust:
+	case BackendCogneeRust:
 		svc.stopProcess(&svc.cogneeCmd, "cognee")
 	}
 	if !svc.config.IsCloudEmbedding() {
@@ -139,10 +124,6 @@ func (svc *services) monitor(ctx context.Context, panics *atomic.Int64) {
 			}
 
 			switch svc.config.Backend {
-			case BackendCogneePython:
-				go svc.checkAndRestart(ctx, "cognee-python", healthURL(svc.config.CogneePort),
-					&svc.cogneeCmd, svc.startCogneePython, &svc.cogneeFails, maxRestartsPerHour)
-
 			case BackendCogneeRust:
 				go svc.checkAndRestart(ctx, "cognee-rust", healthURL(svc.config.CogneePort),
 					&svc.cogneeCmd, svc.startCogneeRust, &svc.cogneeFails, maxRestartsPerHour)
@@ -442,16 +423,6 @@ func (svc *services) cogneeBaseEnv() []string {
 	)
 }
 
-// cogneePythonEnv returns env vars for the Cognee Python (uvicorn) subprocess.
-// Uses instructor JSON mode to avoid tool_choice incompatibility with DeepSeek.
-func (svc *services) cogneePythonEnv() []string {
-	return append(svc.cogneeBaseEnv(),
-		"LLM_INSTRUCTOR_MODE=json_mode",
-		"EMBEDDING_PROVIDER=llama_cpp",
-		"COGNEE_SKIP_CONNECTION_TEST=true",
-	)
-}
-
 // cogneeRustEnv returns env vars for the Cognee Rust (http-server) subprocess.
 // Uses openai_compatible embedding provider (Rust does not support llama_cpp).
 func (svc *services) cogneeRustEnv() []string {
@@ -463,30 +434,6 @@ func (svc *services) cogneeRustEnv() []string {
 		"DATA_ROOT_DIRECTORY="+dataDir+"/data",
 		"SYSTEM_ROOT_DIRECTORY="+dataDir+"/system",
 	)
-}
-
-// startCogneePython spawns uvicorn serving the Cognee Python API.
-func (svc *services) startCogneePython() error {
-	pythonPath := svc.resolveCogneePythonPath()
-	cmd := exec.Command(pythonPath, "-m", "uvicorn", "cognee.api.client:app",
-		"--host", "0.0.0.0", "--port", svc.config.CogneePort)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = svc.cogneePythonEnv()
-
-	wd, _ := os.Getwd()
-	f, _ := os.OpenFile(filepath.Join(wd, "logs", "cognee-crash.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	cmd.Stdout, cmd.Stderr = f, f
-	if err := cmd.Start(); err != nil {
-		if f != nil {
-			f.Close()
-		}
-		return err
-	}
-	svc.mu.Lock()
-	svc.cogneeCmd = cmd
-	svc.mu.Unlock()
-	svc.log.Info("cognee-python started", "pid", cmd.Process.Pid)
-	return nil
 }
 
 // startCogneeRust spawns the cognee-http-server Rust binary.
@@ -514,31 +461,6 @@ func (svc *services) startCogneeRust() error {
 	svc.mu.Unlock()
 	svc.log.Info("cognee-rust started", "pid", cmd.Process.Pid)
 	return nil
-}
-
-// resolveCogneePythonPath resolves the Python binary for Cognee Python.
-// Fallback chain: config.CogneePythonPath → .venv/bin/python → python3
-func (svc *services) resolveCogneePythonPath() string {
-	if svc.config.CogneePythonPath != "" {
-		info, err := os.Stat(svc.config.CogneePythonPath)
-		if err == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Mode()&0111 != 0 {
-			return svc.config.CogneePythonPath
-		}
-	}
-	// Project-local venv
-	venvPython := filepath.Join(".venv", "bin", "python")
-	if runtime.GOOS == "windows" {
-		venvPython = filepath.Join(".venv", "Scripts", "python.exe")
-	}
-	info, err := os.Stat(venvPython)
-	if err == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Mode()&0111 != 0 {
-		return venvPython
-	}
-	// System PATH
-	if lp, err := exec.LookPath("python3"); err == nil {
-		return lp
-	}
-	return "python3" // Last resort — let it fail at exec time
 }
 
 // resolveCogneeBinary resolves the Rust Cognee binary path.

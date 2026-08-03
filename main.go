@@ -47,6 +47,12 @@ func main() {
 	}
 	srv := NewServer(config)
 
+	// Run preflight checks before starting services
+	if err := preflightCheck(config); err != nil {
+		println("mcp-memory: preflight check failed:", err.Error())
+		os.Exit(1)
+	}
+
 	// Phase 1: Start internal services (llama.cpp, Cognee, health monitor)
 	println("mcp-memory: starting services...")
 	if err := srv.Start(); err != nil {
@@ -133,8 +139,6 @@ func main() {
 // backendEnvFile returns the backend-specific .env filename based on BACKEND.
 func backendEnvFile() string {
 	switch os.Getenv("BACKEND") {
-	case "cognee-python":
-		return ".env.cognee"
 	case "cognee-rust":
 		return ".env.cognee-rust"
 	default:

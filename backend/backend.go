@@ -23,7 +23,7 @@ type Backend interface {
 	// Health checks backend connectivity. Returns nil if healthy.
 	Health(ctx context.Context) error
 
-	// Name returns the backend name (e.g., "cognee-python", "cognee-rust").
+	// Name returns the backend name (e.g., "cognee-rust").
 	Name() string
 
 	// Forget removes a specific memory. Optional — may return ErrNotSupported.
@@ -33,7 +33,7 @@ type Backend interface {
 // BackendConfig is the flat configuration struct passed to the New factory.
 // It avoids circular imports by not referencing the main package's Config.
 type BackendConfig struct {
-	Backend               string // "cognee-python", "cognee-rust"
+	Backend               string // "cognee-rust"
 	CogneePort            string
 	BackendRetainTimeout  time.Duration
 	BackendRecallTimeout  time.Duration
@@ -50,10 +50,9 @@ type BackendConfig struct {
 // New creates the appropriate Backend based on the config.
 func New(cfg BackendConfig) Backend {
 	switch cfg.Backend {
-	case "cognee-python", "cognee-rust":
+	case "cognee-rust":
 		return newCogneeBackend(cfg)
 	default:
-		// Default to cognee-python for backward compatibility
 		return newCogneeBackend(cfg)
 	}
 }

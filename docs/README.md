@@ -74,7 +74,7 @@ All via environment variables. See `.env.example` for full reference.
 
 | Key groups | Examples |
 |-----------|---------|
-| Server | `MCP_PORT=8899`, `MCP_HOST=0.0.0.0` |
+| Server | `MCP_PORT=8899`, `MCP_HOST=127.0.0.1` |
 | llama.cpp | `LLAMA_PATH=./bin/llama/llama-server`, `LLAMA_PORT=8080`, `LLAMA_MODEL_PATH=...`, `LLAMA_GPU_LAYERS=999` |
 | Cognee | `COGNEE_PORT=8888`, `COGNEE_BACKEND_URL=...` |
 | Queue | `QUEUE_DB_PATH=./data/queue.db`, `QUEUE_MAX_PENDING=1000` |

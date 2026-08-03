@@ -6,13 +6,12 @@ import (
 )
 
 // Backend is an enum for the memory backend type.
-// Valid values: "cognee-python", "cognee-rust".
-// Default is "cognee-python".
+// Valid value: "cognee-rust".
+// Default is "cognee-rust".
 type Backend string
 
 const (
-	BackendCogneePython Backend = "cognee-python"
-	BackendCogneeRust   Backend = "cognee-rust"
+	BackendCogneeRust Backend = "cognee-rust"
 )
 
 type ServiceState string
