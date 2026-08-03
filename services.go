@@ -400,7 +400,7 @@ func (svc *services) startLlama() error {
 	return nil
 }
 
-// cogneeBaseEnv returns shared env vars common to both Cognee Python and Rust.
+// cogneeBaseEnv returns shared env vars for the Cognee Rust backend.
 func (svc *services) cogneeBaseEnv() []string {
 	return append(os.Environ(),
 		// LLM config
