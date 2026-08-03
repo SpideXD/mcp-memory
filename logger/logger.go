@@ -130,7 +130,7 @@ func redact(msg string) string {
 		if len(idx) < 4 {
 			return match
 		}
-		return match[:idx[2]] + "=***REDACTED***"
+		return match[:idx[3]] + "=***REDACTED***"
 	})
 }
 
@@ -142,6 +142,14 @@ type redactingHandler struct {
 func (h *redactingHandler) Handle(ctx context.Context, r slog.Record) error {
 	r.Message = redact(r.Message)
 	return h.Handler.Handle(ctx, r)
+}
+
+func (h *redactingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &redactingHandler{Handler: h.Handler.WithAttrs(attrs)}
+}
+
+func (h *redactingHandler) WithGroup(name string) slog.Handler {
+	return &redactingHandler{Handler: h.Handler.WithGroup(name)}
 }
 
 // parseLevel returns an error for unknown levels.

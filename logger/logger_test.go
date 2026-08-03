@@ -1180,3 +1180,74 @@ func BenchmarkLoggerBufInfo(b *testing.B) {
 	b.StopTimer()
 	buf.Reset()
 }
+
+// --- redact tests ---
+
+func TestRedact_LLM_API_KEY_Unquoted(t *testing.T) {
+	result := redact("LLM_API_KEY=sk-abc123")
+	if result != "LLM_API_KEY=***REDACTED***" {
+		t.Fatalf("got %q, want LLM_API_KEY=***REDACTED***", result)
+	}
+}
+
+func TestRedact_LLM_API_KEY_Quoted(t *testing.T) {
+	result := redact(`LLM_API_KEY="sk-abc123"`)
+	if result != "LLM_API_KEY=***REDACTED***" {
+		t.Fatalf("got %q", result)
+	}
+}
+
+func TestRedact_EMBEDDING_API_KEY(t *testing.T) {
+	result := redact("EMBEDDING_API_KEY=secret-key")
+	if result != "EMBEDDING_API_KEY=***REDACTED***" {
+		t.Fatalf("got %q", result)
+	}
+}
+
+func TestRedact_MultipleKeys(t *testing.T) {
+	result := redact("LLM_API_KEY=abc EMBEDDING_API_KEY=xyz")
+	if result != "LLM_API_KEY=***REDACTED*** EMBEDDING_API_KEY=***REDACTED***" {
+		t.Fatalf("got %q", result)
+	}
+}
+
+func TestRedact_NoKeyPassthrough(t *testing.T) {
+	result := redact("normal log message without secrets")
+	if result != "normal log message without secrets" {
+		t.Fatalf("got %q", result)
+	}
+}
+
+func TestRedact_PartialKeyStillRedacted(t *testing.T) {
+	// LLM_API_KEY anywhere in the string should be redacted - it IS an API key
+	result := redact("MY_LLM_API_KEY=abc")
+	if result != "MY_LLM_API_KEY=***REDACTED***" {
+		t.Fatalf("got %q", result)
+	}
+}
+
+func TestRedact_EmptyValue(t *testing.T) {
+	result := redact("LLM_API_KEY=")
+	// Empty value should still be redacted (pattern matches \S+ which requires 1+ chars...
+	// empty value means no match, so passthrough is correct)
+	if result != "LLM_API_KEY=" {
+		t.Fatalf("got %q", result)
+	}
+}
+
+func TestRedactingHandler_RedactsMessage(t *testing.T) {
+	var buf bytes.Buffer
+	logger, err := NewBuf("test", "info", &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Key in the message string itself — this is what the handler redacts
+	logger.Info("LLM_API_KEY=sk-secret-123 retry failed")
+	out := buf.String()
+	if strings.Contains(out, "sk-secret-123") {
+		t.Fatalf("API key leaked in log output: %s", out)
+	}
+	if !strings.Contains(out, "LLM_API_KEY=***REDACTED***") {
+		t.Fatalf("key not redacted in log output: %s", out)
+	}
+}

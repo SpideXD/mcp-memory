@@ -23,7 +23,7 @@ func isClientError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "HTTP error (4")
 }
 
-// CogneeBackend implements the Backend interface for Cognee (Python and Rust).
+// CogneeBackend implements the Backend interface for Cognee Rust.
 // Both variants expose identical REST APIs — only the subprocess binary differs.
 type CogneeBackend struct {
 	baseURL         string
